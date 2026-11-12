@@ -48,9 +48,10 @@ jobs:
     env:
       # The UI is built once by the `ui` job.
       BISONBASE_SKIP_UI_BUILD: '1'
-      # Vendored OpenSSL needs a native Windows perl, not Git Bash's.
-      OPENSSL_SRC_PERL: ${{ runner.os == 'Windows' && 'C:\Strawberry\perl\bin\perl.exe' || '' }}
     steps:
+      # Vendored OpenSSL needs a native Windows perl, not Git Bash's.
+      - if: runner.os == 'Windows'
+        run: echo 'OPENSSL_SRC_PERL=C:\Strawberry\perl\bin\perl.exe' >> "$GITHUB_ENV"
       - uses: actions/checkout@v5
       - uses: actions/download-artifact@v5
         with:
