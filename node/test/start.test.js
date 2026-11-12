@@ -87,6 +87,12 @@ test('the CLI starts and stops on SIGTERM', async () => {
   assert.match(out, /signup\?invite=/)
   assert.equal((await fetch(`${url}/login`)).status, 200)
   child.kill('SIGTERM')
-  const [code] = await new Promise((r) => child.on('exit', (...a) => r(a)))
-  assert.equal(code, 0)
+  const [code, signal] = await new Promise((r) => child.on('exit', (...a) => r(a)))
+  if (process.platform === 'win32') {
+    // Windows has no signals: kill() is TerminateProcess, so the graceful
+    // handler never runs and the child reports the signal instead of a code.
+    assert.equal(signal, 'SIGTERM')
+  } else {
+    assert.equal(code, 0)
+  }
 })
