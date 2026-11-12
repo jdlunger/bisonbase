@@ -111,33 +111,3 @@ npm run typecheck   # includes the type tests in test/types.test.ts
 npm test            # unit tests, plus end-to-end tests if ../node has been built
 npm run build       # dist/
 ```
-
-## Publish
-
-Both packages are published from GitHub Actions with npm trusted publishing when a version tag is
-pushed. Run these from the repo root, with `patch` swapped for `minor`, `major` or an exact version
-as needed. To check a build without publishing, use Actions → client (or node) → Run workflow.
-
-### Client
-
-Publishes [`bisonbase`](https://www.npmjs.com/package/bisonbase) via [.github/workflows/client.yml](../.github/workflows/client.yml).
-
-```sh
-v=$(cd client && npm version patch --no-git-tag-version) && v=${v#v}
-git commit -am "bisonbase v$v"
-git tag "client-v$v"
-git push origin main "client-v$v"
-```
-
-### Server
-
-Publishes [`@bisonbase/server`](https://www.npmjs.com/package/@bisonbase/server) and the `@bisonbase/binding-*` packages via
-[.github/workflows/node.yml](../.github/workflows/node.yml). The version bump also updates
-`node/npm/*/package.json`.
-
-```sh
-v=$(cd node && npm version patch --no-git-tag-version) && v=${v#v}
-git commit -am "@bisonbase/server v$v"
-git tag "server-v$v"
-git push origin main "server-v$v"
-```
