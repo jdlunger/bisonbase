@@ -1,0 +1,46 @@
+@import "tailwindcss";
+
+/* Colors as tokens (bg-card, text-muted, border-line, …), swapped for dark mode below. */
+@theme {
+  --color-bg: #f7f7f8;
+  --color-fg: #1d1d1f;
+  --color-muted: #6b6b73;
+  --color-card: #fff;
+  --color-line: #dedee3;
+  --color-accent: #2f6fde;
+  --color-danger: #c4372f;
+  --color-ok: #e8f5ec;
+  --color-err: #fbeaea;
+  --color-code: #f0f0f3;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-bg: #17171a;
+    --color-fg: #e8e8ec;
+    --color-muted: #9a9aa3;
+    --color-card: #202024;
+    --color-line: #34343a;
+    --color-accent: #6b9cf0;
+    --color-danger: #ef6b62;
+    --color-ok: #1d3325;
+    --color-err: #3a2020;
+    --color-code: #2a2a30;
+  }
+}
+
+@layer base {
+  :root { color-scheme: light dark; }
+  body { @apply bg-bg text-[15px] text-fg; }
+  a { @apply text-accent hover:underline; }
+  h1 { @apply mt-2 mb-4 text-[22px] font-bold; }
+  h2 { @apply mb-3 text-[17px] font-bold; }
+  h3 { @apply mb-2 font-semibold; }
+  p, ul, pre, table { @apply my-3 first:mt-0 last:mb-0; }
+  code, pre, textarea { @apply font-mono text-[13px]; }
+  code { @apply rounded bg-code px-1; }
+  input:not([type=checkbox], [type=radio]), textarea, select, fieldset {
+    @apply rounded-md border border-line bg-card px-2.5 py-1.5;
+  }
+  button { @apply cursor-pointer rounded-md bg-accent px-2.5 py-1.5 text-white disabled:cursor-default disabled:opacity-60; }
+  summary { @apply cursor-pointer; }
+}

@@ -1,0 +1,21 @@
+{
+  // Only for editors and type checking: Node and the servers strip the types without it.
+  "compilerOptions": {
+    "target": "esnext",
+    "module": "nodenext",
+    "lib": ["esnext", "dom", "dom.iterable"],
+    "types": ["node"],
+    "jsx": "react-jsx",
+    "allowImportingTsExtensions": true,
+    "paths": {
+      "bisonbase": ["../../client/src/index.ts"],
+      "bisonbase/react": ["../../client/src/react.tsx"]
+    },
+    "strict": true,
+    "noEmit": true,
+    "erasableSyntaxOnly": true,
+    "verbatimModuleSyntax": true,
+    "skipLibCheck": true
+  },
+  "include": ["**/*.ts", "**/*.tsx"]
+}
