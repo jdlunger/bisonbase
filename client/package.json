@@ -1,6 +1,6 @@
 {
   "name": "bisonbase",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "TypeScript and React client for bisonbase: sign-in, typed tables and live queries from the browser",
   "license": "MIT",
   "repository": {
