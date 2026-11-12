@@ -16,8 +16,8 @@ jobs:
   ui:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -26,7 +26,7 @@ jobs:
         working-directory: ui
       - run: npm run build
         working-directory: ui
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ui-dist
           path: ui/dist
@@ -52,12 +52,12 @@ jobs:
       # Vendored OpenSSL needs a native Windows perl, not Git Bash's.
       - if: runner.os == 'Windows'
         run: echo 'OPENSSL_SRC_PERL=C:\Strawberry\perl\bin\perl.exe' >> "$GITHUB_ENV"
-      - uses: actions/checkout@v5
-      - uses: actions/download-artifact@v5
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
         with:
           name: ui-dist
           path: ui/dist
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm
@@ -72,7 +72,7 @@ jobs:
         working-directory: node
       - run: npm run build -- --target ${{ matrix.target }} ${{ matrix.flags }}
         working-directory: node
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: bindings-${{ matrix.target }}
           path: node/bisonbase.*.node
@@ -90,11 +90,11 @@ jobs:
           - { target: x86_64-pc-windows-msvc, os: windows-latest }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           name: bindings-${{ matrix.target }}
           path: node
@@ -109,8 +109,8 @@ jobs:
       contents: read
       id-token: write # npm trusted publishing (OIDC), no token needed
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-node@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 24
       - run: npm install -g npm@^11.5.1 # trusted publishing needs npm >= 11.5.1
@@ -124,7 +124,7 @@ jobs:
           fi
       - run: npm ci --no-audit --no-fund
         working-directory: node
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           pattern: bindings-*
           path: node/artifacts
