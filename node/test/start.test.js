@@ -22,7 +22,7 @@ test('starts on a free port and serves the UI and API', async () => {
 
     const login = await fetch(`${server.url}/login`)
     assert.equal(login.status, 200)
-    assert.match(await login.text(), /passkey/i)
+    assert.match(await login.text(), /<title>bisonbase<\/title>/)
 
     const api = await fetch(`${server.url}/api/v1/files/`)
     assert.equal(api.status, 401)

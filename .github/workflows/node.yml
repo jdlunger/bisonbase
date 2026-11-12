@@ -1,0 +1,136 @@
+# Builds the @bisonbase/server native addon for every platform and, on a `server-v*` tag,
+# publishes @bisonbase/server plus the @bisonbase/binding-* platform packages to npm.
+# Run it by hand (Actions tab → node → Run workflow) to build and test without publishing.
+name: node
+
+on:
+  push:
+    tags: ['server-v*']
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: ui
+      - run: npm run build
+        working-directory: ui
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ui-dist
+          path: ui/dist
+          if-no-files-found: error
+
+  build:
+    needs: ui
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux builds use napi's glibc 2.17 toolchain so they load on old distros too.
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest, flags: --use-napi-cross }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-latest, flags: --use-napi-cross }
+          - { target: x86_64-apple-darwin, os: macos-latest }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+    runs-on: ${{ matrix.os }}
+    env:
+      # The UI is built once by the `ui` job.
+      BISONBASE_SKIP_UI_BUILD: '1'
+      # Vendored OpenSSL needs a native Windows perl, not Git Bash's.
+      OPENSSL_SRC_PERL: ${{ runner.os == 'Windows' && 'C:\Strawberry\perl\bin\perl.exe' || '' }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v5
+        with:
+          name: ui-dist
+          path: ui/dist
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: node/package-lock.json
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: npm ci --no-audit --no-fund
+        working-directory: node
+      - run: npm run build -- --target ${{ matrix.target }} ${{ matrix.flags }}
+        working-directory: node
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bindings-${{ matrix.target }}
+          path: node/bisonbase.*.node
+          if-no-files-found: error
+
+  test:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-24.04-arm }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - uses: actions/download-artifact@v5
+        with:
+          name: bindings-${{ matrix.target }}
+          path: node
+      - run: npm test
+        working-directory: node
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/server-v')
+    needs: [build, test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # npm trusted publishing (OIDC), no token needed
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - run: npm install -g npm@^11.5.1 # trusted publishing needs npm >= 11.5.1
+      - name: Check the tag matches package.json
+        working-directory: node
+        run: |
+          version=$(node -p 'require("./package.json").version')
+          if [ "server-v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME doesn't match node/package.json version $version"
+            exit 1
+          fi
+      - run: npm ci --no-audit --no-fund
+        working-directory: node
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: bindings-*
+          path: node/artifacts
+          merge-multiple: true
+      - name: Move binaries into npm/<platform>/
+        working-directory: node
+        run: npx napi artifacts && ls -l npm/*
+      # prepublishOnly publishes each npm/<platform> package first, then this one.
+      - run: npm publish
+        working-directory: node

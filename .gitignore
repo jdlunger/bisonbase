@@ -5,7 +5,6 @@
 *.db-shm
 /node/node_modules
 /node/*.node
-/node/npm
 /node/artifacts
 /examples/.data
 /examples/ts/node_modules

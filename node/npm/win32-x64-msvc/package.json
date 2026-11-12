@@ -1,0 +1,37 @@
+{
+  "name": "@bisonbase/binding-win32-x64-msvc",
+  "version": "0.1.0",
+  "cpu": [
+    "x64"
+  ],
+  "main": "bisonbase.win32-x64-msvc.node",
+  "files": [
+    "bisonbase.win32-x64-msvc.node"
+  ],
+  "description": "Backend-as-a-service in a box: per-user files and SQLite databases over HTTP, with a web UI and passkey auth",
+  "keywords": [
+    "sqlite",
+    "backend",
+    "passkeys",
+    "webauthn",
+    "self-hosted",
+    "napi"
+  ],
+  "homepage": "https://github.com/jdlunger/bisonbase#readme",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jdlunger/bisonbase.git",
+    "directory": "node"
+  },
+  "bugs": "https://github.com/jdlunger/bisonbase/issues",
+  "publishConfig": {
+    "access": "public"
+  },
+  "os": [
+    "win32"
+  ]
+}

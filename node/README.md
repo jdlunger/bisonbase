@@ -54,4 +54,4 @@ npm run build   # writes bisonbase.<platform>.node
 npm test
 ```
 
-Releases are built by `.github/workflows/node.yml`. Pushing a `v*` tag builds every platform and publishes `bisonbase` along with the `@bisonbase/binding-*` packages. That needs an `NPM_TOKEN` secret.
+Releases are built by [`.github/workflows/node.yml`](https://github.com/jdlunger/bisonbase/blob/main/.github/workflows/node.yml). Pushing a `server-v*` tag builds every platform and publishes `@bisonbase/server` along with the `@bisonbase/binding-*` packages.

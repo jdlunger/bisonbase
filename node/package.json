@@ -10,7 +10,14 @@
   },
   "homepage": "https://github.com/jdlunger/bisonbase#readme",
   "bugs": "https://github.com/jdlunger/bisonbase/issues",
-  "keywords": ["sqlite", "backend", "passkeys", "webauthn", "self-hosted", "napi"],
+  "keywords": [
+    "sqlite",
+    "backend",
+    "passkeys",
+    "webauthn",
+    "self-hosted",
+    "napi"
+  ],
   "main": "index.js",
   "types": "index.d.ts",
   "bin": {
@@ -41,9 +48,13 @@
     "build": "napi build --platform --release --js native.js --dts native.d.ts",
     "build:debug": "napi build --platform --js native.js --dts native.d.ts",
     "test": "node --test",
-    "prepublishOnly": "napi prepublish -t npm --no-gh-release"
+    "prepublishOnly": "napi prepublish -t npm --no-gh-release",
+    "version": "napi version && git add npm"
   },
   "devDependencies": {
     "@napi-rs/cli": "^3.0.0"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
