@@ -442,6 +442,7 @@ impl UserStore {
     pub async fn mkdir(&self, p: &SafePath) -> AppResult<()> {
         let fp = self.resolve(p).await?;
         tokio::fs::create_dir_all(fp).await?;
+        self.notify(p, None);
         Ok(())
     }
 

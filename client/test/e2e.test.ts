@@ -36,7 +36,7 @@ function appToken(appId = APP, admin = false): string {
     db.prepare('INSERT INTO users(id, username, is_admin, created_at) VALUES (?, ?, ?, ?)').run(user, 'u' + user.slice(0, 8), admin === '1' ? 1 : 0, now)
     const token = 'wfs_' + randomBytes(32).toString('hex')
     db.prepare("INSERT INTO api_tokens(user_id, name, token_hash, scopes, created_at, client_id, app_id) " +
-      "VALUES (?, 'test', ?, 'db:write', ?, 'http://localhost:3000', ?)")
+      "VALUES (?, 'test', ?, 'files:write db:write', ?, 'http://localhost:3000', ?)")
       .run(user, createHash('sha256').update(token).digest('hex'), now, appId)
     db.close()
     process.stdout.write(token)`
@@ -158,8 +158,8 @@ test('live queries follow changes made elsewhere', opts, async () => {
   let updates = 0
   const stop = open.subscribe(() => updates++)
   await until(open, (s) => !s.loading)
-  for (let i = 0; i < 250 && !here._live; i++) await new Promise((r) => setTimeout(r, 20))
-  assert.ok(here._live, 'change stream connected')
+  for (let i = 0; i < 250 && !here._feed.live; i++) await new Promise((r) => setTimeout(r, 20))
+  assert.ok(here._feed.live, 'change stream connected')
 
   await theirTodos.insert({ content: 'from there' })
   assert.deepEqual((await until(open, (s) => s.rows.length === 1)).rows.map((t) => t.content), ['from there'])
@@ -178,7 +178,7 @@ test('live queries follow changes made elsewhere', opts, async () => {
   stopNotes()
 
   stop()
-  assert.equal(here._live, false, 'stream closes when nothing is subscribed')
+  assert.equal(here._feed.live, false, 'stream closes when nothing is subscribed')
 })
 
 test('a revoked token signs the user out', opts, async () => {
@@ -273,5 +273,95 @@ test('transact: all of its writes take effect, or none do', opts, async () => {
   )
   assert.deepEqual(await mine.select(), [])
   assert.deepEqual(await db.transact(() => []), [])
-  await assert.rejects(db.transact((tx) => [tx.insert(other, { x: 'a' })]), /isn't in database "tx"/)
+  await assert.rejects(db.transact((tx) => [tx.insert(other, { x: 'a' })]), /isn't in database "tx.db"/)
+})
+
+test('files: write, read, list, move, delete', opts, async () => {
+  const bb = new BisonBase(APP, 'Test', { url: server.url, token: appToken() })
+  const files = bb.files
+  assert.deepEqual(await files.list(), [])
+
+  const w = await files.write('notes/hello.txt', 'héllo')
+  assert.deepEqual([w.name, w.path, w.type, w.size, typeof w.etag], ['hello.txt', 'notes/hello.txt', 'file', 6, 'string'])
+  assert.equal(await files.readText('notes/hello.txt'), 'héllo')
+  const notes = files.folder('notes')
+  assert.equal(await notes.readText('hello.txt'), 'héllo')
+  await files.write('pic.bin', new Uint8Array([0, 1, 255]))
+  assert.deepEqual([...new Uint8Array(await (await files.read('pic.bin')).arrayBuffer())], [0, 1, 255])
+
+  assert.deepEqual((await files.list()).map((e) => [e.path, e.type]), [['notes', 'dir'], ['pic.bin', 'file']])
+  const [entry] = await files.list('notes')
+  assert.equal(entry.path, 'notes/hello.txt')
+  assert.ok(Math.abs(entry.modified - Date.now()) < 60_000)
+  assert.deepEqual(await files.list('nowhere'), [])
+
+  // Versions: write only if unchanged, or only if new.
+  const { etag } = await files.readFile('notes/hello.txt')
+  assert.equal(etag, w.etag)
+  const w2 = await files.write('notes/hello.txt', 'v2', { ifMatch: etag })
+  await assert.rejects(files.write('notes/hello.txt', 'v3', { ifMatch: etag }), (e) => e instanceof ApiError && e.status === 412)
+  await assert.rejects(files.write('notes/hello.txt', 'v3', { create: true }), (e) => e instanceof ApiError && e.status === 409)
+  assert.notEqual(w2.etag, etag)
+
+  await notes.move('hello.txt', 'archive/hello.txt')
+  assert.equal(await files.readText('notes/archive/hello.txt'), 'v2')
+  await files.mkdir('empty')
+  await files.delete('empty')
+  await assert.rejects(files.delete('notes'), ApiError)
+  await files.delete('notes', { recursive: true })
+  assert.deepEqual((await files.list()).map((e) => e.path), ['pic.bin'])
+
+  // Paths can't leave the folder, and the app can't reach outside its own.
+  assert.throws(() => files.folder('../x'), /"\.\."/)
+  await assert.rejects(files.read('a/../../b'), /"\.\."/)
+
+  // A database is a file in the folder.
+  const db = notes.db('todos.db')
+  assert.equal(db, bb.files.folder('notes').db('todos.db'))
+  assert.equal(db.path, `apps/${APP}/notes/todos.db`)
+  const t = db.createTable('t', { x: 'text' })
+  await t.insert({ x: 'a' })
+  assert.deepEqual((await files.list('notes')).map((e) => e.name), ['todos.db'])
+  await files.delete('notes', { recursive: true })
+})
+
+test('folder listings stay up to date', opts, async () => {
+  const token = appToken()
+  const here = new BisonBase(APP, 'Test', { url: server.url, token })
+  const there = new BisonBase(APP, 'Test', { url: server.url, token })
+  const live = here.files.liveList('live')
+  const stop = live.subscribe(() => {})
+  await until(live, (s) => !s.loading && s.rows.length === 0)
+  // Written here: reloads straight away.
+  await here.files.write('live/a.txt', 'a')
+  await until(live, (s) => s.rows.length === 1)
+  // Written elsewhere: the change stream says so.
+  const feed = live.feed
+  for (let i = 0; i < 250 && !feed.live; i++) await new Promise((r) => setTimeout(r, 20))
+  assert.ok(feed.live, 'change stream connected')
+  await there.files.write('live/b.txt', 'b')
+  assert.deepEqual((await until(live, (s) => s.rows.length === 2)).rows.map((e) => e.name), ['a.txt', 'b.txt'])
+  await there.files.delete('live/a.txt')
+  await until(live, (s) => s.rows.length === 1)
+  await there.files.delete('live', { recursive: true })
+  await until(live, (s) => s.rows.length === 0)
+  stop()
+})
+
+test('app storage: everyone reads, owners write', opts, async () => {
+  const app = randomUUID()
+  const admin = new BisonBase(app, 'Shared', { url: server.url, token: appToken(app, true) })
+  // Registers the app on first use, as databases do.
+  await admin.appFiles.write('welcome.txt', 'hi all')
+  const user = new BisonBase(app, 'Shared', { url: server.url, token: appToken(app) })
+  assert.deepEqual((await user.appFiles.list()).map((e) => e.name), ['welcome.txt'])
+  assert.equal(await user.appFiles.readText('welcome.txt'), 'hi all')
+  await assert.rejects(user.appFiles.write('mine.txt', 'x'), (e) => e instanceof ApiError && e.status === 403)
+  await assert.rejects(user.appFiles.delete('welcome.txt'), (e) => e instanceof ApiError && e.status === 403)
+
+  // App databases live there too, next to the files.
+  const posts = admin.appFiles.folder('data').db('board.db').createTable('posts', { body: 'text' }, { sharing: 'shared' })
+  await posts.insert({ body: 'p' })
+  assert.deepEqual((await user.appFiles.list('data')).map((e) => e.name), ['board.db'])
+  assert.equal(admin.createAppDb('board'), admin.appFiles.db('board.db'))
 })

@@ -1,7 +1,7 @@
-// The client: BisonBase (sign-in and the connection to the server), UserDb (one SQLite file
-// per user), AppDb (one SQLite file in the app's own storage, shared by all its users, where
-// each row belongs to a user) and Table (typed select / insert / update / delete, plus live
-// queries that the server keeps up to date).
+// The client: BisonBase (sign-in and the connection to the server), Folder (files, in each
+// user's own account or in the app's own storage; see files.ts), UserDb and AppDb (a SQLite file
+// in one of those folders) and Table (typed select / insert / update / delete, plus live queries
+// that the server keeps up to date).
 
 import { revoke, startSignIn, takeSignInResponse } from './auth.ts'
 import { deleteRequest, insertRequest, selectRequest, updateRequest } from './ops.ts'
@@ -10,6 +10,7 @@ import { checkName, parseTable, type Sharing, type TableDef } from './table.ts'
 import type { Columns, InsertFor, RowFor, SelectOptions, UpdateFor, Where, Wire } from './types.ts'
 import { decode } from './values.ts'
 import { watch } from './watch.ts'
+import { Folder } from './files.ts'
 
 export interface BisonBaseOptions {
   /** The bisonbase server. Default: `/bb` on the current origin. */
@@ -67,7 +68,7 @@ interface Rows {
   truncated?: boolean
 }
 
-/** The state of a live query, as `useSelectState` returns it. */
+/** The state of a live query, as `useSelectState` and `useListState` return it. */
 export interface QueryState<R> {
   /** Empty while signed out or before the first load. Kept (stale) while reloading or after an error. */
   rows: readonly R[]
@@ -81,6 +82,12 @@ interface Hooks {
   useQuery<R>(query: LiveQuery<R>): QueryState<R>
 }
 let hooks: Hooks | null = null
+
+/** @internal Subscribe a component to a live query; needs `bisonbase/react`. */
+export function useLiveQuery<R>(query: LiveQuery<R>, what: string): QueryState<R> {
+  if (!hooks) throw new Error(`${what} needs React: add \`import "bisonbase/react"\` to your app`)
+  return hooks.useQuery(query)
+}
 /** @internal */
 export function setHooks(h: Hooks): void {
   hooks = h
@@ -99,8 +106,8 @@ function storage(): Storage | null {
   }
 }
 
-/** JSON with object keys sorted, so equal options give equal cache keys. */
-function stableKey(value: unknown): string {
+/** @internal JSON with object keys sorted, so equal options give equal cache keys. */
+export function stableKey(value: unknown): string {
   return JSON.stringify(value, (_, v) =>
     v && typeof v === 'object' && !Array.isArray(v) && !(v instanceof Uint8Array)
       ? Object.fromEntries(Object.entries(v).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
@@ -129,7 +136,21 @@ export class BisonBase {
   #epoch = 0
   #authListeners = new Set<() => void>()
   #dbs = new Map<string, Database>()
+  #feeds = new Set<ChangeFeed>()
   #queries = new Map<string, LiveQuery<any>>()
+  #registering: Promise<void> | null = null
+
+  /**
+   * The app's folder in the signed-in user's own account, `apps/<appId>/`: only that user can
+   * read or change what's in it.
+   */
+  readonly files: Folder<UserDb>
+  /**
+   * The app's own storage on the server, shared by everyone who uses the app. Anyone signed in
+   * can list and read its files; only the app's owners (and admins) can add, change or delete
+   * them. Databases in it hold rows that belong to each user (see `AppDb`).
+   */
+  readonly appFiles: Folder<AppDb>
 
   /**
    * @param appId A UUID that identifies the app and never changes; the app's files live in
@@ -146,6 +167,8 @@ export class BisonBase {
     if (!base) throw new Error('Pass options.url: there is no current page to default to')
     this.url = base.replace(/\/+$/, '')
     this.#persist = options.token === undefined
+    this.files = new Folder(this, 'user', '')
+    this.appFiles = new Folder(this, 'app', '')
 
     if (BisonBase.instance) {
       console.warn('BisonBase: more than one instance was created; React helpers use the latest one')
@@ -195,7 +218,7 @@ export class BisonBase {
 
   /** Send the browser to the server to sign in; it comes back to the current page. */
   signIn(): Promise<void> {
-    return startSignIn({ server: this.url, appId: this.appId, appName: this.appName, scope: 'db:write' })
+    return startSignIn({ server: this.url, appId: this.appId, appName: this.appName, scope: 'files:write db:write' })
   }
 
   /** Forget the token here and revoke it on the server. */
@@ -206,29 +229,66 @@ export class BisonBase {
   }
 
   /**
-   * A database that each user gets their own copy of, stored as `apps/<appId>/<name>.db`
-   * in their account. Only that user can read or change it.
+   * Shorthand for `bb.files.db(name + ".db")`: a database that each user gets their own copy of,
+   * stored as `apps/<appId>/<name>.db` in their account. Only that user can read or change it.
    */
   createUserDb(name: string): UserDb {
-    return this.#addDb(`user:${name}`, new UserDb(this, name))
+    return this.files.db(`${checkDbName(name)}.db`)
   }
 
   /**
-   * A database in the app's own storage, shared by everyone who uses the app. Each row belongs
-   * to the user who inserted it: users read their own rows (and every row of tables declared
-   * `shared`), and only change their own. The app must be registered by a server admin (it is
-   * registered automatically when an admin signs in to it), and only the app's owners can create
-   * the database and change its tables, which happens when one of them signs in.
+   * Shorthand for `bb.appFiles.db(name + ".db")`: a database in the app's own storage, shared by
+   * everyone who uses the app. Each row belongs to the user who inserted it: users read their own
+   * rows (and every row of tables declared `shared`), and only change their own. The app must be
+   * registered by a server admin (it is registered automatically when an admin signs in to it),
+   * and only the app's owners can create the database and change its tables, which happens when
+   * one of them signs in.
    */
   createAppDb(name: string): AppDb {
-    return this.#addDb(`app:${name}`, new AppDb(this, name))
+    return this.appFiles.db(`${checkDbName(name)}.db`)
   }
 
-  #addDb<D extends Database>(key: string, db: D): D {
-    if (!/^[A-Za-z0-9_-]+$/.test(db.name)) throw new Error(`Database name "${db.name}" must be letters, digits, "_" and "-"`)
-    if (this.#dbs.has(key)) throw new Error(`Database "${db.name}" was already created`)
-    this.#dbs.set(key, db)
-    return db
+  /** @internal The database at `key` (its API path), made by `make` the first time. */
+  _db<D extends Database>(key: string, make: () => D): D {
+    let db = this.#dbs.get(key)
+    if (!db) {
+      db = make()
+      this.#dbs.set(key, db)
+    }
+    return db as D
+  }
+
+  /** @internal Follow `feed` (it resets when the user changes). */
+  _addFeed(feed: ChangeFeed) {
+    this.#feeds.add(feed)
+  }
+
+  /**
+   * @internal Run `fn` against the app's storage. If the app isn't registered yet, register it
+   * (which works when the signed-in user is an admin) and run `fn` again.
+   */
+  async _inAppStorage<T>(fn: () => Promise<T>): Promise<T> {
+    try {
+      return await fn()
+    } catch (e) {
+      if (!(e instanceof ApiError && e.code === 'app_not_registered')) throw e
+    }
+    this.#registering ??= this.#register().finally(() => (this.#registering = null))
+    await this.#registering
+    return fn()
+  }
+
+  async #register() {
+    try {
+      await this._request(`apps/${this.appId}`, 'register', { name: this.appName })
+    } catch (r) {
+      if (r instanceof ApiError && r.status === 403) {
+        throw new ApiError(404, 'app_not_registered', `${this.appName} isn't registered with the server yet; an admin needs to sign in to it once, or register it under Admin`)
+      }
+      // A conflict means it was registered meanwhile, e.g. by another tab, or by this page's
+      // other requests while signing in.
+      if (!(r instanceof ApiError && r.status === 409)) throw r
+    }
   }
 
   /** The app's registration, and what the signed-in user may do with its storage. */
@@ -253,31 +313,36 @@ export class BisonBase {
     if (!changed) return
     this.#epoch++
     for (const db of this.#dbs.values()) db._reset()
+    for (const feed of this.#feeds) feed.reset()
     for (const q of this.#queries.values()) q._authChanged()
   }
 
   #refreshAll() {
-    for (const q of this.#queries.values()) if (!q.table.db._live) q._invalidate()
+    for (const q of this.#queries.values()) if (!q.feed.live) q._invalidate()
   }
 
-  /** @internal A cached live query, shared by everything that asks for the same rows. */
-  _liveQuery<R>(key: string, run: () => Promise<R[]>, table: Table<any, any>): LiveQuery<R> {
+  /**
+   * @internal A cached live query, shared by everything that asks for the same rows. `scope`
+   * and `table` say which writes make it stale (see `_invalidate`); `feed` is the change stream
+   * that keeps it up to date while it's in use.
+   */
+  _liveQuery<R>(key: string, run: () => Promise<R[]>, feed: ChangeFeed, scope: object, table?: string): LiveQuery<R> {
     let q = this.#queries.get(key)
     if (!q) {
-      q = new LiveQuery(this, run, table, () => this.#queries.delete(key))
+      q = new LiveQuery(this, run, feed, scope, table, () => this.#queries.delete(key))
       this.#queries.set(key, q)
     }
     return q
   }
 
   /**
-   * @internal Mark live queries on `tables` of `db` (by name, or every table) stale, and reload
-   * the ones in use.
+   * @internal Mark live queries in `scope` (a database, or a storage area's file listings) on
+   * `tables` (by name, or all of them) stale, and reload the ones in use.
    */
-  _invalidate(db: Database, tables?: readonly string[]) {
+  _invalidate(scope: object, tables?: readonly string[]) {
     const names = tables && new Set(tables.map((t) => t.toLowerCase()))
     for (const q of this.#queries.values()) {
-      if (q.table.db === db && (!names || names.has(q.table.name.toLowerCase()))) q._invalidate()
+      if (q.scope === scope && (!names || !q.table || names.has(q.table.toLowerCase()))) q._invalidate()
     }
   }
 
@@ -293,35 +358,122 @@ export class BisonBase {
 
   /**
    * @internal Call the API (`path` is relative to `/api/v1/`) after any pending sign-in: POST an
-   * op by default.
+   * op by default. Returns the JSON response.
    */
   async _request(path: string, op: string | null, body?: unknown, method = 'POST'): Promise<any> {
-    const res = await this._fetch(path, op, { method, body })
-    const json = await res.json().catch(() => ({}))
-    if (!res.ok) {
-      const code = json.error?.code ?? 'unknown'
-      const message = json.error?.message ?? res.statusText
-      if (code === 'schema_mismatch') throw new SchemaError(`${path}: ${message}`)
-      throw new ApiError(res.status, code, message)
-    }
-    return json
+    const res = await this._send(path, op, { method, body })
+    return res.json().catch(() => ({}))
   }
 
-  /** @internal Call the API with the token, signing out if the server rejects it. */
-  async _fetch(path: string, op: string | null, init: { method: string; body?: unknown; signal?: AbortSignal }): Promise<Response> {
+  /** @internal Like `_fetch`, but an error response throws `ApiError` (or `SchemaError`). */
+  async _send(path: string, query: Query, init: FetchInit): Promise<Response> {
+    const res = await this._fetch(path, query, init)
+    if (res.ok || res.status === 304) return res
+    const json = await res.json().catch(() => ({}))
+    const code = json.error?.code ?? 'unknown'
+    const message = json.error?.message ?? res.statusText
+    if (code === 'schema_mismatch') throw new SchemaError(`${path}: ${message}`)
+    throw new ApiError(res.status, code, message)
+  }
+
+  /**
+   * @internal Call the API with the token, signing out if the server rejects it. `query` is an
+   * op, or query parameters (undefined ones are left out). `body` is sent as JSON, `raw` as is.
+   */
+  async _fetch(path: string, query: Query, init: FetchInit): Promise<Response> {
     await this.#settled
     const token = this.#token
     if (!token) throw new NotSignedInError()
-    const headers: Record<string, string> = { authorization: `Bearer ${token}` }
+    const headers: Record<string, string> = { ...init.headers, authorization: `Bearer ${token}` }
     if (init.body !== undefined) headers['content-type'] = 'application/json'
-    const res = await fetch(`${this.url}/api/v1/${path}${op ? `?op=${op}` : ''}`, {
+    const params = new URLSearchParams()
+    for (const [k, v] of Object.entries(typeof query === 'string' ? { op: query } : (query ?? {}))) {
+      if (v !== undefined) params.set(k, v)
+    }
+    const qs = params.size ? `?${params}` : ''
+    const res = await fetch(`${this.url}/api/v1/${path}${qs}`, {
       method: init.method,
       headers,
-      body: init.body === undefined ? undefined : JSON.stringify(init.body),
+      body: init.body !== undefined ? JSON.stringify(init.body) : init.raw,
       signal: init.signal,
     })
     if (res.status === 401 && this.#token === token) this.#setToken(null, EXPIRED)
     return res
+  }
+}
+
+/** @internal An op, or query parameters. */
+type Query = string | null | Record<string, string | undefined>
+/** @internal */
+interface FetchInit {
+  method: string
+  body?: unknown
+  raw?: BodyInit
+  headers?: Record<string, string>
+  signal?: AbortSignal
+}
+
+function checkDbName(name: string): string {
+  if (!/^[A-Za-z0-9_-]+$/.test(name)) throw new Error(`Database name "${name}" must be letters, digits, "_" and "-"`)
+  return name
+}
+
+/**
+ * @internal A server change stream (`?op=watch`) on one path. It's open while live queries that
+ * use it are, and reconnects when the user changes.
+ */
+export class ChangeFeed {
+  #bb: BisonBase
+  #open: (signal: AbortSignal) => Promise<Response>
+  #onEvent: (event: string, data: any) => void
+  /** How many live queries using this stream are in use. */
+  #watchers = 0
+  #stop: (() => void) | null = null
+  /** Whether the stream is connected. */
+  live = false
+
+  constructor(bb: BisonBase, open: (signal: AbortSignal) => Promise<Response>, onEvent: (event: string, data: any) => void) {
+    this.#bb = bb
+    this.#open = open
+    this.#onEvent = onEvent
+    bb._addFeed(this)
+  }
+
+  /** A live query using this stream is in use. */
+  retain() {
+    if (this.#watchers++ === 0) this.#start()
+  }
+
+  /** A live query using this stream is no longer in use. */
+  release() {
+    if (--this.#watchers === 0) this.#end()
+  }
+
+  /** Reconnect (the user changed). */
+  reset() {
+    this.#end()
+    if (this.#watchers > 0) this.#start()
+  }
+
+  #start() {
+    if (this.#stop || !this.#bb._active) return
+    const stop = watch({
+      open: this.#open,
+      // Signed out, or the tables can't be set up: retrying won't help.
+      fatal: (e) => e instanceof NotSignedInError || e instanceof SchemaError,
+      onEvent: this.#onEvent,
+      onLive: (live) => {
+        // A stream that was already stopped may report late; only the current one counts.
+        if (this.#stop === stop) this.live = live
+      },
+    })
+    this.#stop = stop
+  }
+
+  #end() {
+    this.#stop?.()
+    this.#stop = null
+    this.live = false
   }
 }
 
@@ -336,11 +488,19 @@ export class LiveQuery<R> {
   #running = false
   #again = false
   #gc: ReturnType<typeof setTimeout> | undefined
-  readonly table: Table<any, any>
+  /** @internal The change stream that keeps it up to date. */
+  readonly feed: ChangeFeed
+  /** @internal What it reads: a database, or a storage area's files. */
+  readonly scope: object
+  /** @internal The table it reads, if any. */
+  readonly table: string | undefined
 
-  constructor(bb: BisonBase, run: () => Promise<R[]>, table: Table<any, any>, dispose: () => void) {
+  /** @internal */
+  constructor(bb: BisonBase, run: () => Promise<R[]>, feed: ChangeFeed, scope: object, table: string | undefined, dispose: () => void) {
     this.#bb = bb
     this.#run = run
+    this.feed = feed
+    this.scope = scope
     this.table = table
     this.#dispose = dispose
     this.#state = bb._active ? LOADING : SIGNED_OUT
@@ -349,8 +509,8 @@ export class LiveQuery<R> {
   /** For `useSyncExternalStore`. */
   subscribe = (listener: () => void): (() => void) => {
     if (this.#listeners.has(listener)) return () => {}
-    // While anything is subscribed, the database's change stream stays open.
-    if (this.#listeners.size === 0) this.table.db._retain()
+    // While anything is subscribed, the change stream stays open.
+    if (this.#listeners.size === 0) this.feed.retain()
     this.#listeners.add(listener)
     clearTimeout(this.#gc)
     if (this.#stale) void this.#load()
@@ -358,7 +518,7 @@ export class LiveQuery<R> {
       if (!this.#listeners.delete(listener)) return
       // Keep the rows a little while in case the same query is used again soon.
       if (this.#listeners.size === 0) {
-        this.table.db._release()
+        this.feed.release()
         this.#gc = setTimeout(this.#dispose, 30_000)
         // In Node, don't keep the process alive just for this.
         ;(this.#gc as { unref?: () => void }).unref?.()
@@ -419,20 +579,31 @@ export class LiveQuery<R> {
 /** What `UserDb` and `AppDb` have in common: tables, set-up, and the change stream. */
 export abstract class Database {
   readonly bb: BisonBase
+  /** Its path in the folder it was made from, e.g. `todos.db`. */
   readonly name: string
   /** @internal Where the API serves it, relative to `/api/v1/`. */
-  abstract readonly _api: string
+  readonly _api: string
   #tables = new Map<string, Table<any, any>>()
   #ready: Promise<void> | null = null
-  /** How many live queries on this database are in use. */
-  #watchers = 0
-  #stopWatch: (() => void) | null = null
-  /** @internal Whether the change stream is connected. */
-  _live = false
+  /** @internal The change stream, which reloads live queries on the tables that change. */
+  readonly _feed: ChangeFeed
 
-  constructor(bb: BisonBase, name: string) {
+  constructor(bb: BisonBase, name: string, api: string) {
     this.bb = bb
     this.name = name
+    this._api = api
+    this._feed = new ChangeFeed(
+      bb,
+      async (signal) => {
+        await this._ensure()
+        return this.bb._fetch(this._api, 'watch', { method: 'GET', signal })
+      },
+      (event, data) => {
+        // `ready` comes first on every (re)connection: changes may have been missed before it.
+        if (event === 'ready') this.bb._invalidate(this)
+        else if (event === 'change') this.bb._invalidate(this, data?.tables ?? undefined)
+      },
+    )
   }
 
   /** @internal */
@@ -450,53 +621,9 @@ export abstract class Database {
   /** @internal Create the database if need be. */
   protected abstract _create(): Promise<void>
 
-  /** @internal Forget that the schema was set up, and reconnect the change stream (the user changed). */
+  /** @internal Forget that the schema was set up (the user changed). */
   _reset() {
     this.#ready = null
-    this.#unwatch()
-    if (this.#watchers > 0) this.#watch()
-  }
-
-  /** @internal A live query on this database is in use. */
-  _retain() {
-    if (this.#watchers++ === 0) this.#watch()
-  }
-
-  /** @internal A live query on this database is no longer in use. */
-  _release() {
-    if (--this.#watchers === 0) this.#unwatch()
-  }
-
-  /** Follow the server's change stream, reloading live queries on the tables that change. */
-  #watch() {
-    if (this.#stopWatch || !this.bb._active) return
-    const stop = watch({
-      open: async (signal) => {
-        await this._ensure()
-        return this.bb._fetch(this._api, 'watch', { method: 'GET', signal })
-      },
-      // Signed out, or the tables can't be set up: retrying won't help.
-      fatal: (e) => e instanceof NotSignedInError || e instanceof SchemaError,
-      onEvent: (event, data) => {
-        // `ready` comes first on every (re)connection: changes may have been missed before it.
-        if (event === 'ready') this.bb._invalidate(this)
-        else if (event === 'change') {
-          const tables = (data as { tables?: string[] | null }).tables
-          this.bb._invalidate(this, tables ?? undefined)
-        }
-      },
-      onLive: (live) => {
-        // A stream that was already stopped may report late; only the current one counts.
-        if (this.#stopWatch === stop) this._live = live
-      },
-    })
-    this.#stopWatch = stop
-  }
-
-  #unwatch() {
-    this.#stopWatch?.()
-    this.#stopWatch = null
-    this._live = false
   }
 
   /** @internal Create the database and bring its tables up to date, once per sign-in. */
@@ -605,17 +732,18 @@ const TX: Tx = {
   },
 }
 
-/** A database each signed-in user has their own copy of. Make one with `bb.createUserDb`. */
+/**
+ * A database each signed-in user has their own copy of, in their own account. Make one with
+ * `bb.files.db(path)` (or `bb.createUserDb`).
+ */
 export class UserDb extends Database {
   /** Path within the user's files, e.g. `apps/<appId>/todos.db`. */
   readonly path: string
-  readonly _api: string
 
-  /** @internal Use `bb.createUserDb`. */
-  constructor(bb: BisonBase, name: string) {
-    super(bb, name)
-    this.path = `apps/${bb.appId}/${name}.db`
-    this._api = `files/${this.path}`
+  /** @internal Use `bb.files.db`. `path` is in the user's files, `name` in the folder. */
+  constructor(bb: BisonBase, name: string, path: string, api: string) {
+    super(bb, name, api)
+    this.path = path
   }
 
   /**
@@ -647,18 +775,17 @@ export interface AppTableOptions {
 export type OwnedRow<C> = RowFor<C> & { _owner: string }
 
 /**
- * A database in the app's own storage, shared by all its users. Make one with `bb.createAppDb`.
+ * A database in the app's own storage, shared by all its users. Make one with
+ * `bb.appFiles.db(path)` (or `bb.createAppDb`).
  */
 export class AppDb extends Database {
   /** Path within the app's storage, e.g. `todos.db`. */
   readonly path: string
-  readonly _api: string
 
-  /** @internal Use `bb.createAppDb`. */
-  constructor(bb: BisonBase, name: string) {
-    super(bb, name)
-    this.path = `${name}.db`
-    this._api = `apps/${bb.appId}/files/${this.path}`
+  /** @internal Use `bb.appFiles.db`. `path` is in the app's storage, `name` in the folder. */
+  constructor(bb: BisonBase, name: string, path: string, api: string) {
+    super(bb, name, api)
+    this.path = path
   }
 
   /**
@@ -675,23 +802,7 @@ export class AppDb extends Database {
   }
 
   protected async _create() {
-    try {
-      await this.bb._request(this._api, 'mkdb')
-    } catch (e) {
-      if (!(e instanceof ApiError && e.code === 'app_not_registered')) throw e
-      // Registering works when the signed-in user is an admin; otherwise say what's needed.
-      try {
-        await this.bb._request(`apps/${this.bb.appId}`, 'register', { name: this.bb.appName })
-      } catch (r) {
-        if (r instanceof ApiError && r.status === 403) {
-          throw new ApiError(404, 'app_not_registered', `${this.bb.appName} isn't registered with the server yet; an admin needs to sign in to it once, or register it under Admin`)
-        }
-        // A conflict means it was registered meanwhile, e.g. by another tab, or by this page's
-        // other requests while signing in.
-        if (!(r instanceof ApiError && r.status === 409)) throw r
-      }
-      await this.bb._request(this._api, 'mkdb')
-    }
+    await this.bb._inAppStorage(() => this.bb._request(this._api, 'mkdb'))
   }
 }
 
@@ -767,10 +878,10 @@ export class Table<C extends Columns, R = RowFor<C>> {
 
   /** The live query for these options, shared with every other user of the same options. */
   liveQuery(options?: SelectOptions<R>): LiveQuery<R> {
-    const key = stableKey([this.db.name, this.name, options ?? {}])
+    const key = stableKey(['select', this.db._api, this.name, options ?? {}])
     // Validate now so mistakes throw where the query is written, not later in a fetch.
     selectRequest(this.def, options)
-    return this.db.bb._liveQuery(key, () => this.select(options), this)
+    return this.db.bb._liveQuery(key, () => this.select(options), this.db._feed, this.db, this.name)
   }
 
   /**
@@ -783,8 +894,7 @@ export class Table<C extends Columns, R = RowFor<C>> {
 
   /** React hook: like `useSelect`, plus whether it's loading and the last error. */
   useSelectState(options?: SelectOptions<R>): QueryState<R> {
-    if (!hooks) throw new Error('useSelect needs React: add `import "bisonbase/react"` to your app')
-    return hooks.useQuery(this.liveQuery(options))
+    return useLiveQuery(this.liveQuery(options), 'useSelect')
   }
 }
 

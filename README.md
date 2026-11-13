@@ -20,8 +20,8 @@ const bb = new BisonBase("todo_app", "My Todo App");
 
 // Creates (or updates) database & table if signed in with admin account
 // Rows owned by individual users by default
-// To create a separate DB for every user (if not sharing), createUserDb()
-const todos = bb.createAppDb("todos").createTable("todos", {
+// For a separate DB in every user's own files (if not sharing), bb.files.db("todos.db")
+const todos = bb.appFiles.db("todos.db").createTable("todos", {
   content: "text",
   done: ["boolean", false],
 });
@@ -49,11 +49,13 @@ function App() {
 }
 ```
 
-This works now, with `createAppDb` (shared storage, rows owned by users) and `createUserDb` (a
-database in each user's own account): see [client/](client) (the `bisonbase` package),
+This works now. Files are the main API: `bb.files` is the app's folder in each user's own account,
+and `bb.appFiles` the app's own storage, shared by its users. A database is a file in either:
+`bb.appFiles.db("todos.db")` (shared storage, rows owned by users) or `bb.files.db("todos.db")`
+(a database in each user's own account). See [client/](client) (the `bisonbase` package),
 [examples/ts/react-todo](examples/ts/react-todo), and
 [examples/ts/react-workspace](examples/ts/react-workspace), a multi-user workspace (tasks, a
-calendar and notes, each private or shared) that uses every part of the client.
+calendar and notes, each private or shared) that uses the client's databases.
 
 ### App-owned storage
 
@@ -96,6 +98,11 @@ database's schema, and values are always bound parameters.
 | `schema` | GET | db:read | none: tables and columns |
 | `watch` | GET | db:read | none: server-sent events, `ready` then `change` with `{"tables": [...]}` (`null` for anything) |
 
+`watch` also works on any other path, with files:read: a folder (even one that doesn't exist
+yet) or a plain file. Its `change` events are `{"path": ...}` when a file or folder at, inside or
+above it is written, created, moved or deleted (`null` if the stream fell behind); rows changing
+inside a database aren't reported there.
+
 `where` is `{"col": value}`, `{"col": null}` for NULL, or operators: `{"col": {"$gte": 1, "$in":
 [...], "$ne": ...}}`. Blobs travel as `{"$base64": "..."}`. Unknown keys are refused, and
 `update` and `delete` need a `where` (`{}` for every row).
@@ -104,7 +111,7 @@ database's schema, and values are always bound parameters.
 
  - Per-file ownership for files in app storage (for now only an app's owners can write files there)
  - Admin features - first user is super admin, then can set other users as app admins (done: app owners)
- - TS & React library, with auth, file, and db APIs (started in [client/](client): auth, per-user and app dbs)
+ - TS & React library, with auth, file, and db APIs (started in [client/](client): auth, files, per-user and app dbs)
  - Schema creations & migrations
 
 ## LLM Usage

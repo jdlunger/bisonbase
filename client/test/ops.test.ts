@@ -163,6 +163,8 @@ test('watch retries failures until stopped, and stops on fatal errors', async ()
   const stream = (text: string) => new Response(new TextEncoder().encode(text), { headers: { 'content-type': 'text/event-stream' } })
   let attempts = 0
   const got: string[] = []
+  // watch's retry timers don't keep Node running; this does, until the test ends.
+  const alive = setInterval(() => {}, 1000)
   await new Promise<void>((resolve) => {
     const stop = watch({
       async open() {
@@ -194,4 +196,5 @@ test('watch retries failures until stopped, and stops on fatal errors', async ()
   })
   await new Promise((r) => setTimeout(r, 1500))
   assert.equal(tries, 1)
+  clearInterval(alive)
 })

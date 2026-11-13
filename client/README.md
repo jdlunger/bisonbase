@@ -1,11 +1,12 @@
 # bisonbase
 
 TypeScript and React client for [bisonbase](../README.md). Users sign in with their bisonbase
-account; the app declares typed tables and reads and writes them without writing SQL.
+account; the app reads and writes files, and SQLite databases among them, through typed tables
+and without writing SQL.
 
-> **Status: early.** Two kinds of databases: `createAppDb`, one SQLite file in the app's own
-> storage, shared by all its users, where each row belongs to the user who created it; and
-> `createUserDb`, a separate SQLite file for each user in `apps/<appId>/` in their own account.
+> **Status: early.** An app has two folders: `bb.files`, `apps/<appId>/` in each user's own
+> account, which only that user can reach; and `bb.appFiles`, the app's own storage on the
+> server, shared by all its users. A database is a file in one of them: `bb.files.db("todos.db")`.
 
 ```tsx
 import { BisonBase, type RowOf } from 'bisonbase'
@@ -16,7 +17,7 @@ const bb = new BisonBase('f1487da1-14ff-4998-a2c4-90b6353fe8c3', 'My Todo App', 
   url: 'https://bisonbase.example.com', // default: /bb on the page's origin
 })
 
-const todos = bb.createUserDb('todos').createTable('todos', {
+const todos = bb.files.db('todos.db').createTable('todos', {
   content: 'text',
   done: ['boolean', false], // [type, default]
 })
@@ -35,6 +36,56 @@ function App() {
 [examples/ts/react-todo](../examples/ts/react-todo) is a complete app, and
 [examples/ts/react-workspace](../examples/ts/react-workspace) a bigger one that uses all of the
 library: tasks, a calendar and notes, each private or shared with other users.
+
+## Files
+
+`bb.files` is the app's folder in the signed-in user's account; `bb.appFiles` is the app's own
+storage (see [App storage](#app-storage)). Paths are relative to the folder, and can't leave it.
+
+```ts
+await bb.files.write('notes/today.md', '# Today')          // string, Blob, ArrayBuffer or bytes
+const text = await bb.files.readText('notes/today.md')
+const blob = await bb.files.read('photos/cat.jpg')         // a Blob
+await bb.files.list('notes')        // [{ name, path, type: 'file' | 'dir', size, modified }]
+await bb.files.move('notes/today.md', 'archive/today.md')  // { overwrite: true } to replace a file
+await bb.files.mkdir('drafts')
+await bb.files.delete('archive', { recursive: true })
+
+const notes = bb.files.folder('notes') // a folder inside; paths are relative to it
+```
+
+Writing creates the folders a file is in. Listing a folder that doesn't exist gives `[]`.
+
+To change a file only if nobody else has since you read it, pass its version back:
+
+```ts
+const { blob, etag } = await bb.files.readFile('doc.json')
+await bb.files.write('doc.json', updated, { ifMatch: etag }) // else a 412 ApiError
+await bb.files.write('new.json', '{}', { create: true })    // only if it doesn't exist, else 409
+```
+
+In React, `folder.useList(path?)` is a folder's listing, kept up to date: it reloads after writes
+from this page, and the server tells it about changes made anywhere else.
+
+```tsx
+function Notes() {
+  const entries = bb.files.useList('notes') // [] until signed in and loaded
+  return <ul>{entries.map((e) => <li key={e.path}>{e.name}</li>)}</ul>
+}
+```
+
+## Databases
+
+`folder.db(path)` is the SQLite database at `path` in that folder; it's created when it's first
+used. It's still a file, so it shows up in listings, and can be moved or deleted like one.
+
+```ts
+const todos = bb.files.db('todos.db')         // each user's own copy (a UserDb)
+const board = bb.appFiles.db('data/board.db') // shared by everyone (an AppDb; see below)
+```
+
+`bb.createUserDb('todos')` and `bb.createAppDb('board')` are shorthand for
+`bb.files.db('todos.db')` and `bb.appFiles.db('board.db')`.
 
 ## Tables
 
@@ -58,13 +109,16 @@ adds columns that are new in the code (a new non-nullable column needs a default
 changes a column's type, drops a column or deletes data: if the database doesn't match the
 code in one of those ways, operations fail with a `SchemaError` that says what's different.
 
-## App databases
+## App storage
 
-`bb.createAppDb(name)` is a database in the app's own storage on the server, shared by everyone
-who uses the app. Its tables take a third argument:
+`bb.appFiles` is the app's own storage on the server, shared by everyone who uses the app.
+Everyone signed in can list and read its files; only the app's owners (and bisonbase admins) can
+write, move or delete them, e.g. to publish content or templates to every user.
+
+Its databases are shared too. Their tables take a third argument:
 
 ```ts
-const db = bb.createAppDb('board')
+const db = bb.appFiles.db('board.db')
 const notes = db.createTable('notes', { text: 'text' })                        // private
 const posts = db.createTable('posts', { body: 'text' }, { sharing: 'shared' }) // everyone reads
 type Post = RowOf<typeof posts> // { id: number; body: string; _owner: string }
@@ -104,7 +158,7 @@ do. The results come back in order, typed: the stored row (or rows) for an inser
 changed for an update or delete.
 
 ```ts
-const db = bb.createAppDb('workspace')
+const db = bb.appFiles.db('workspace.db')
 const mine = db.createTable('tasks', { title: 'text' })
 const shared = db.createTable('shared_tasks', { title: 'text' }, { sharing: 'shared' })
 

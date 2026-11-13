@@ -66,6 +66,7 @@ pub async fn create_db(state: &AppState, store: &UserStore, p: &SafePath) -> App
     let r = tokio::task::spawn_blocking(move || UserConn::open(&path, true, sl).map(|_| ())).await;
     store.invalidate_usage();
     r??;
+    store.notify(p, None);
     Ok(true)
 }
 
@@ -283,22 +284,28 @@ pub async fn migrate(
 /// How often an open change stream checks that its token is still valid.
 const RECHECK_TOKEN: Duration = Duration::from_secs(60);
 
-/// A server-sent event stream of changes to the database at `p`. It starts with a `ready`
-/// event, then sends `change` events with data `{"tables": [...]}`, or `{"tables": null}` when
+/// A server-sent event stream of changes at `p`. It starts with a `ready` event, then sends
+/// `change` events. For a database, their data is `{"tables": [...]}`, or `{"tables": null}` when
 /// anything may have changed (the file was replaced, the schema changed, or the stream fell
-/// behind). It ends when the token stops working or the server shuts down; clients reconnect
-/// and should treat `ready` as "reload everything".
+/// behind). For any other path (a folder, a plain file, or nothing yet), it is `{"path": ...}`:
+/// a file or folder at, under or above `p` was written, created, moved or deleted (`null` when
+/// the stream fell behind). Rows changing inside a database aren't reported to folder watchers.
+/// The stream ends when the token stops working or the server shuts down; clients reconnect and
+/// should treat `ready` as "reload everything".
 pub async fn watch(state: &AppState, auth: &ApiAuth, t: &Target) -> AppResult<Response> {
-    auth.scopes.require(auth.scopes.db_read, "db:read")?;
     let (store, p) = (&t.store, &t.path);
     // Subscribe before checking, so no change between the check and the stream is missed.
     let rx = store.changes.subscribe();
-    if !is_sqlite(&store.resolve(p).await?).await {
-        return Err(AppError::not_found("database not found"));
+    let db = is_sqlite(&store.resolve(p).await?).await;
+    if db {
+        auth.scopes.require(auth.scopes.db_read, "db:read")?;
+    } else {
+        auth.scopes.require(auth.scopes.files_read, "files:read")?;
     }
     struct Watch {
         rx: broadcast::Receiver<DbChange>,
         path: SafePath,
+        db: bool,
         state: AppState,
         token: String,
         recheck: tokio::time::Interval,
@@ -307,6 +314,7 @@ pub async fn watch(state: &AppState, auth: &ApiAuth, t: &Target) -> AppResult<Re
     let w = Watch {
         rx,
         path: p.clone(),
+        db,
         state: state.clone(),
         token: auth.token.clone(),
         recheck: tokio::time::interval_at(
@@ -315,11 +323,7 @@ pub async fn watch(state: &AppState, auth: &ApiAuth, t: &Target) -> AppResult<Re
         ),
         started: false,
     };
-    let change = |tables: Option<&[String]>| {
-        Event::default()
-            .event("change")
-            .data(json!({ "tables": tables }).to_string())
-    };
+    let change = |data: serde_json::Value| Event::default().event("change").data(data.to_string());
     let stream = futures_util::stream::unfold(w, move |mut w| async move {
         if !w.started {
             w.started = true;
@@ -331,9 +335,18 @@ pub async fn watch(state: &AppState, auth: &ApiAuth, t: &Target) -> AppResult<Re
         loop {
             tokio::select! {
                 r = w.rx.recv() => match r {
-                    Ok(c) if c.affects(&w.path) => return Some((Ok(change(c.tables.as_deref())), w)),
+                    Ok(c) if w.db && c.affects(&w.path) => {
+                        return Some((Ok(change(json!({ "tables": c.tables.as_deref() }))), w));
+                    }
+                    Ok(c) if !w.db && c.tables.is_none()
+                        && (c.path.starts_with(&w.path) || w.path.starts_with(&c.path)) => {
+                        return Some((Ok(change(json!({ "path": c.path.to_string() }))), w));
+                    }
                     Ok(_) => {}
-                    Err(RecvError::Lagged(_)) => return Some((Ok(change(None)), w)),
+                    Err(RecvError::Lagged(_)) => {
+                        let all = if w.db { json!({ "tables": null }) } else { json!({ "path": null }) };
+                        return Some((Ok(change(all)), w));
+                    }
                     Err(RecvError::Closed) => return None,
                 },
                 _ = w.recheck.tick() => {

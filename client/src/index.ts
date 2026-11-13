@@ -20,6 +20,7 @@ export {
   type Tx,
   type TxResults,
 } from './client.ts'
+export { Folder, type FileData, type FileEntry, type ReadFile, type WriteOptions, type WrittenFile } from './files.ts'
 export type { Sharing } from './table.ts'
 export type {
   ColumnSpec,

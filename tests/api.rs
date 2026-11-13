@@ -307,7 +307,7 @@ async fn users_are_isolated() {
         &e,
         req(
             "GET",
-            "/api/v1/files/private.db?op=watch",
+            "/api/v1/files/private.db?op=schema",
             &tb,
             Body::empty(),
         ),
@@ -2844,7 +2844,7 @@ async fn watch_streams_changes() {
         ]
     );
 
-    // Watching needs db:read, and a database.
+    // Watching a database needs db:read; anything else is watched as files, which needs files:read.
     let none = token(&e, u, "files:read").await;
     let (s, _, _) = call(
         &e,
@@ -2857,7 +2857,7 @@ async fn watch_streams_changes() {
         req("GET", "/api/v1/files/nope.db?op=watch", &r, Body::empty()),
     )
     .await;
-    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert_eq!(s, StatusCode::FORBIDDEN);
 
     // Shutting down ends open streams.
     e.state.closing.cancel();
@@ -3499,4 +3499,105 @@ async fn ui_app_storage() {
     )
     .await;
     assert_eq!(s, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn watch_folders() {
+    let e = env();
+    let u = user(&e, "alice").await;
+    let t = token(&e, u, "files:write db:write").await;
+    let r = token(&e, u, "files:read").await;
+
+    // A folder may be watched before it exists.
+    let res = e
+        .app
+        .clone()
+        .oneshot(req("GET", "/api/v1/files/docs?op=watch", &r, Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let mut body = res.into_body();
+    assert_eq!(sse_events(&mut body, 1).await[0].0, "ready");
+
+    // Changes elsewhere aren't sent; nor are rows changing in a database in the folder.
+    call(&e, req("PUT", "/api/v1/files/other.txt", &t, "x")).await;
+    call(
+        &e,
+        req("POST", "/api/v1/files/docs/d.db?op=mkdb", &t, Body::empty()),
+    )
+    .await;
+    let spec =
+        json!({"tables": [{"name": "items", "columns": [{"name": "x", "type": "integer"}]}]});
+    call(&e, db_op("docs/d.db", "migrate", &t, spec)).await;
+    call(
+        &e,
+        db_op(
+            "docs/d.db",
+            "insert",
+            &t,
+            json!({"table": "items", "rows": [{"x": 1}]}),
+        ),
+    )
+    .await;
+    call(&e, req("PUT", "/api/v1/files/docs/a/b.txt", &t, "b")).await;
+    call(
+        &e,
+        req("POST", "/api/v1/files/docs/sub?op=mkdir", &t, Body::empty()),
+    )
+    .await;
+    call(
+        &e,
+        req(
+            "POST",
+            "/api/v1/files/docs/a/b.txt?op=move&to=moved.txt",
+            &t,
+            Body::empty(),
+        ),
+    )
+    .await;
+    call(
+        &e,
+        req(
+            "DELETE",
+            "/api/v1/files/docs?recursive=true",
+            &t,
+            Body::empty(),
+        ),
+    )
+    .await;
+    let events = sse_events(&mut body, 6).await;
+    let paths: Vec<Value> = events
+        .iter()
+        .map(|(ev, d)| {
+            assert_eq!(ev, "change");
+            d["path"].clone()
+        })
+        .collect();
+    // mkdb, migrate (the schema changed), write, mkdir, move (from; "to" is elsewhere), delete.
+    assert_eq!(
+        paths,
+        [
+            "docs/d.db",
+            "docs/d.db",
+            "docs/a/b.txt",
+            "docs/sub",
+            "docs/a/b.txt",
+            "docs"
+        ]
+        .map(|p| json!(p))
+    );
+
+    // Watching a folder needs files:read.
+    let db_only = token(&e, u, "db:read").await;
+    let (s, _, _) = call(
+        &e,
+        req(
+            "GET",
+            "/api/v1/files/docs?op=watch",
+            &db_only,
+            Body::empty(),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
 }
