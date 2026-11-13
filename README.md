@@ -98,7 +98,6 @@ Compile bisonbase as a Node add-on, install example's dependencies, and run full
 node examples/ts/react-todo/server.ts
 ```
 
-
 ## Publish
 
 Both packages are published from GitHub Actions with npm trusted publishing when a version tag is
