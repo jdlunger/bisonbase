@@ -16,6 +16,9 @@ pub enum AppError {
     Forbidden(String),
     #[error("{0}")]
     NotFound(String),
+    /// An app's own storage was asked for, but no admin has registered the app.
+    #[error("{0}")]
+    AppNotRegistered(String),
     #[error("{0}")]
     Conflict(String),
     /// A database's tables don't match what the app declares, and can't be changed to match
@@ -38,7 +41,7 @@ impl AppError {
             AppError::BadRequest(_) => StatusCode::BAD_REQUEST,
             AppError::Unauthorized => StatusCode::UNAUTHORIZED,
             AppError::Forbidden(_) => StatusCode::FORBIDDEN,
-            AppError::NotFound(_) => StatusCode::NOT_FOUND,
+            AppError::NotFound(_) | AppError::AppNotRegistered(_) => StatusCode::NOT_FOUND,
             AppError::Conflict(_) | AppError::SchemaMismatch(_) => StatusCode::CONFLICT,
             AppError::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             AppError::QuotaExceeded(_) => StatusCode::INSUFFICIENT_STORAGE,
@@ -52,6 +55,7 @@ impl AppError {
             AppError::Unauthorized => "unauthorized",
             AppError::Forbidden(_) => "forbidden",
             AppError::NotFound(_) => "not_found",
+            AppError::AppNotRegistered(_) => "app_not_registered",
             AppError::Conflict(_) => "conflict",
             AppError::SchemaMismatch(_) => "schema_mismatch",
             AppError::PayloadTooLarge(_) => "payload_too_large",

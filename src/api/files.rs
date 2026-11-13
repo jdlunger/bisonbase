@@ -10,15 +10,13 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio_util::io::ReaderStream;
 
-use super::db;
+use super::{db, target::Target};
 use crate::{
     auth::ApiAuth,
     error::{AppError, AppResult},
     state::AppState,
     storage::fs::{Entry, SafePath, UserStore, etag, is_sqlite},
 };
-
-pub const PREFIX: &str = "/api/v1/files";
 
 /// Extract the wildcard file path following `prefix` from the request URI.
 pub fn wild_path(uri: &Uri, prefix: &str) -> AppResult<SafePath> {
@@ -98,26 +96,27 @@ pub async fn get(
     headers: HeaderMap,
     Query(q): Query<GetQuery>,
 ) -> AppResult<Response> {
-    let p = wild_path(&uri, PREFIX)?;
-    auth.check_path(&p)?;
+    let t = Target::resolve(&state, &auth, &uri).await?;
     match q.op.as_deref() {
         None => {}
-        Some("schema") => return db::schema(&state, &auth, &p).await,
-        Some("watch") => return db::watch(&state, &auth, &p).await,
+        Some("schema") => return db::schema(&state, &auth, &t).await,
+        Some("watch") => return db::watch(&state, &auth, &t).await,
         Some(other) => return Err(AppError::bad(format!("unknown op '{other}'"))),
     }
     auth.scopes.require(auth.scopes.files_read, "files:read")?;
-    let store = state.store(auth.user.id);
+    let (store, p) = (&t.store, &t.path);
     store.ensure().await?;
-    let entry = store.stat(&p).await?;
+    let entry = store.stat(p).await?;
     if entry.is_dir() {
-        let entries = store.list(&p).await?;
+        let entries = store.list(p).await?;
         return Ok(Json(json!({ "path": p.to_string(), "entries": entries })).into_response());
     }
-    if is_sqlite(&store.resolve(&p).await?).await {
-        return db::snapshot_response(&state, &store, &p, None).await;
+    if is_sqlite(&store.resolve(p).await?).await {
+        // A whole app database holds every user's rows.
+        t.require_manage("download databases")?;
+        return db::snapshot_response(&state, store, p, None).await;
     }
-    serve_file(&store, &p, &entry, &headers, None).await
+    serve_file(store, p, &entry, &headers, None).await
 }
 
 pub async fn put(
@@ -129,12 +128,12 @@ pub async fn put(
 ) -> AppResult<Response> {
     auth.scopes
         .require(auth.scopes.files_write, "files:write")?;
-    let p = wild_path(&uri, PREFIX)?;
-    auth.check_path(&p)?;
-    let store = state.store(auth.user.id);
+    let t = Target::resolve(&state, &auth, &uri).await?;
+    t.require_manage("add or change files")?;
+    let (store, p) = (&t.store, &t.path);
     store.ensure().await?;
 
-    let existing = store.stat(&p).await.ok();
+    let existing = store.stat(p).await.ok();
     if let Some(cond) = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
@@ -158,13 +157,12 @@ pub async fn put(
         }
     }
 
-    let limits = &state.cfg.limits;
     let entry = store
         .write_stream(
-            &p,
+            p,
             body.into_data_stream(),
-            limits.max_upload_bytes,
-            limits.user_quota_bytes,
+            state.cfg.limits.max_upload_bytes,
+            store.quota,
         )
         .await?;
     let status = if existing.is_some() {
@@ -190,9 +188,9 @@ pub async fn delete(
 ) -> AppResult<StatusCode> {
     auth.scopes
         .require(auth.scopes.files_write, "files:write")?;
-    let p = wild_path(&uri, PREFIX)?;
-    auth.check_path(&p)?;
-    state.store(auth.user.id).delete(&p, q.recursive).await?;
+    let t = Target::resolve(&state, &auth, &uri).await?;
+    t.require_manage("delete files")?;
+    t.store.delete(&t.path, q.recursive).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -212,34 +210,36 @@ pub async fn post(
     Query(q): Query<PostQuery>,
     body: Bytes,
 ) -> AppResult<Response> {
-    let p = wild_path(&uri, PREFIX)?;
-    auth.check_path(&p)?;
+    let t = Target::resolve(&state, &auth, &uri).await?;
     match q.op.as_str() {
-        "mkdb" => return db::mkdb(&state, &auth, &p).await,
-        "select" => return db::select(&state, &auth, &p, &body).await,
+        "mkdb" => return db::mkdb(&state, &auth, &t).await,
+        "select" => return db::select(&state, &auth, &t, &body).await,
         op @ ("insert" | "update" | "delete") => {
-            return db::write(&state, &auth, &p, op, &body).await;
+            return db::write(&state, &auth, &t, op, &body).await;
         }
-        "transact" => return db::transact(&state, &auth, &p, &body).await,
-        "migrate" => return db::migrate(&state, &auth, &p, &body).await,
+        "transact" => return db::transact(&state, &auth, &t, &body).await,
+        "migrate" => return db::migrate(&state, &auth, &t, &body).await,
         _ => {}
     }
     auth.scopes
         .require(auth.scopes.files_write, "files:write")?;
-    let store = state.store(auth.user.id);
+    t.require_manage("add or change files")?;
+    let (store, p) = (&t.store, &t.path);
     store.ensure().await?;
     match q.op.as_str() {
         "mkdir" => {
-            store.mkdir(&p).await?;
-            Ok((StatusCode::CREATED, Json(store.stat(&p).await?)).into_response())
+            store.mkdir(p).await?;
+            Ok((StatusCode::CREATED, Json(store.stat(p).await?)).into_response())
         }
         "move" => {
             let to = SafePath::parse(
                 q.to.as_deref()
                     .ok_or_else(|| AppError::bad("missing 'to'"))?,
             )?;
-            auth.check_path(&to)?;
-            store.rename(&p, &to, q.overwrite).await?;
+            if t.app.is_none() {
+                auth.check_path(&to)?;
+            }
+            store.rename(p, &to, q.overwrite).await?;
             Ok(Json(store.stat(&to).await?).into_response())
         }
         other => Err(AppError::bad(format!("unknown op '{other}'"))),

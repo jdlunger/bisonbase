@@ -131,13 +131,24 @@ pub struct Page {
     pub more: bool,
 }
 
-/// One page of a table or view, ordered by row key so paging is stable.
-pub fn page(conn: &Connection, t: &TableSchema, page: i64, size: i64) -> AppResult<Page> {
+/// One page of a table or view, ordered by row key so paging is stable. With `only`, just the
+/// rows whose column has that value.
+pub fn page(
+    conn: &Connection,
+    t: &TableSchema,
+    page: i64,
+    size: i64,
+    only: Option<(&str, &Value)>,
+) -> AppResult<Page> {
     let key = KeyKind::of(t);
+    let filter = match only {
+        Some((col, _)) => format!(" WHERE {} = ?1", quote_ident(col)),
+        None => String::new(),
+    };
     let (sql, nkey) = if key == KeyKind::None {
         (
             format!(
-                "SELECT * FROM {} LIMIT {} OFFSET {}",
+                "SELECT * FROM {}{filter} LIMIT {} OFFSET {}",
                 quote_ident(&t.name),
                 size + 1,
                 page * size
@@ -148,7 +159,7 @@ pub fn page(conn: &Connection, t: &TableSchema, page: i64, size: i64) -> AppResu
         let k = key.select_list();
         (
             format!(
-                "SELECT {k}, {} FROM {} ORDER BY {k} LIMIT {} OFFSET {}",
+                "SELECT {k}, {} FROM {}{filter} ORDER BY {k} LIMIT {} OFFSET {}",
                 column_list(t),
                 quote_ident(&t.name),
                 size + 1,
@@ -158,6 +169,9 @@ pub fn page(conn: &Connection, t: &TableSchema, page: i64, size: i64) -> AppResu
         )
     };
     let mut st = conn.prepare(&sql).map_err(sql_err)?;
+    if let Some((_, v)) = only {
+        st.raw_bind_parameter(1, v).map_err(sql_err)?;
+    }
     let columns: Vec<String> = st
         .column_names()
         .into_iter()
@@ -472,7 +486,7 @@ mod tests {
         assert!(insert(&c, &tb, &[("g".into(), Value::Integer(1))]).is_err());
         assert!(insert(&c, &tb, &[("nope".into(), Value::Integer(1))]).is_err());
 
-        let p = page(&c, &tb, 0, 10).unwrap();
+        let p = page(&c, &tb, 0, 10, None).unwrap();
         assert_eq!(p.columns, vec!["rowid", "n", "b", "g"]);
         let (key, vals) = &p.rows[0];
         let key = key.clone().unwrap();
@@ -512,7 +526,7 @@ mod tests {
         let c = db("CREATE TABLE kv(k BLOB PRIMARY KEY, v) WITHOUT ROWID;
              INSERT INTO kv VALUES (x'00ff', 'a'), (x'01', 'b');");
         let tb = t(&c, "kv");
-        let p = page(&c, &tb, 0, 1).unwrap();
+        let p = page(&c, &tb, 0, 1, None).unwrap();
         assert!(p.more);
         assert_eq!(p.columns, vec!["k", "v"]);
         let key = p.rows[0].0.clone().unwrap();

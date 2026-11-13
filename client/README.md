@@ -3,8 +3,9 @@
 TypeScript and React client for [bisonbase](../README.md). Users sign in with their bisonbase
 account; the app declares typed tables and reads and writes them without writing SQL.
 
-> **Status: early.** Only per-user databases (`createUserDb`) exist so far: each signed-in user
-> gets their own SQLite file in `apps/<appId>/` in their account. Shared app databases come later.
+> **Status: early.** Two kinds of databases: `createAppDb`, one SQLite file in the app's own
+> storage, shared by all its users, where each row belongs to the user who created it; and
+> `createUserDb`, a separate SQLite file for each user in `apps/<appId>/` in their own account.
 
 ```tsx
 import { BisonBase, type RowOf } from 'bisonbase'
@@ -54,6 +55,30 @@ When a signed-in user first touches a database, the library creates it and its t
 adds columns that are new in the code (a new non-nullable column needs a default). It never
 changes a column's type, drops a column or deletes data: if the database doesn't match the
 code in one of those ways, operations fail with a `SchemaError` that says what's different.
+
+## App databases
+
+`bb.createAppDb(name)` is a database in the app's own storage on the server, shared by everyone
+who uses the app. Its tables take a third argument:
+
+```ts
+const db = bb.createAppDb('board')
+const notes = db.createTable('notes', { text: 'text' })                        // private
+const posts = db.createTable('posts', { body: 'text' }, { sharing: 'shared' }) // everyone reads
+type Post = RowOf<typeof posts> // { id: number; body: string; _owner: string }
+```
+
+Every row has an `_owner`, the id of the user who inserted it, set by the server. Users read
+only their own rows of `private` tables (the default) and every row of `shared` ones, and only
+ever change or delete their own: an update or delete simply doesn't match other users' rows.
+`(await bb.appInfo()).user.id` is the signed-in user's id, e.g. to filter `{ _owner: id }`.
+
+The app needs registering by a bisonbase admin first. When an admin signs in to the app, it
+registers itself (with the page's origin, which from then on is the only one allowed to use the
+app's id); admins can also register apps under Apps in bisonbase. Only the app's owners (and
+admins) can create the database or change its tables, so the first sign-in after a schema change
+should be an owner's; for anyone else the tables must already match, or operations fail with a
+403 `ApiError`.
 
 ## Reading and writing
 

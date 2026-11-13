@@ -23,6 +23,8 @@ pub struct Config {
 #[derive(Debug, Clone)]
 pub struct Limits {
     pub user_quota_bytes: u64,
+    /// Storage for each registered app's own databases and files (shared by its users).
+    pub app_quota_bytes: u64,
     pub max_upload_bytes: u64,
     pub max_db_bytes: u64,
     pub query_timeout_ms: u64,
@@ -48,6 +50,7 @@ impl Default for Limits {
     fn default() -> Self {
         Self {
             user_quota_bytes: 1 << 30,
+            app_quota_bytes: 1 << 30,
             max_upload_bytes: 100 << 20,
             max_db_bytes: 256 << 20,
             query_timeout_ms: 5000,

@@ -25,22 +25,22 @@ const APP = randomUUID()
  * Make a user and an app token for APP, the way an OAuth sign-in would. Runs in a child
  * process: two copies of SQLite in one process break each other's file locks.
  */
-function appToken(appId = APP): string {
+function appToken(appId = APP, admin = false): string {
   const script = `
     const { DatabaseSync } = require('node:sqlite')
     const { createHash, randomBytes, randomUUID } = require('node:crypto')
-    const [file, appId] = process.argv.slice(1)
+    const [file, appId, admin] = process.argv.slice(1)
     const db = new DatabaseSync(file)
     const user = randomUUID()
     const now = Math.floor(Date.now() / 1000)
-    db.prepare('INSERT INTO users(id, username, is_admin, created_at) VALUES (?, ?, 0, ?)').run(user, 'u' + user.slice(0, 8), now)
+    db.prepare('INSERT INTO users(id, username, is_admin, created_at) VALUES (?, ?, ?, ?)').run(user, 'u' + user.slice(0, 8), admin === '1' ? 1 : 0, now)
     const token = 'wfs_' + randomBytes(32).toString('hex')
     db.prepare("INSERT INTO api_tokens(user_id, name, token_hash, scopes, created_at, client_id, app_id) " +
       "VALUES (?, 'test', ?, 'db:write', ?, 'http://localhost:3000', ?)")
       .run(user, createHash('sha256').update(token).digest('hex'), now, appId)
     db.close()
     process.stdout.write(token)`
-  return execFileSync(process.execPath, ['-e', script, join(dataDir, 'system.db'), appId], { encoding: 'utf8' })
+  return execFileSync(process.execPath, ['-e', script, join(dataDir, 'system.db'), appId, admin ? '1' : '0'], { encoding: 'utf8' })
 }
 
 before(async () => {
@@ -190,4 +190,52 @@ test('a revoked token signs the user out', opts, async () => {
   await assert.rejects(todos.select(), (e) => e instanceof ApiError && e.status === 401)
   assert.equal(bb.auth.status, 'signed-out')
   assert.match((bb.auth as { error?: string }).error ?? '', /expired or was revoked/)
+})
+
+test('app databases are shared, and each row belongs to a user', opts, async () => {
+  const app = randomUUID()
+  const declare = (token: string, extra = false) => {
+    const bb = new BisonBase(app, 'Shared', { url: server.url, token })
+    const db = bb.createAppDb('shared')
+    const todos = db.createTable('todos', extra ? { content: 'text', done: ['boolean', false] } : { content: 'text' })
+    const posts = db.createTable('posts', { body: 'text' }, { sharing: 'shared' })
+    return { bb, todos, posts }
+  }
+
+  // Until an admin registers the app, it has no storage of its own.
+  const a = declare(appToken(app))
+  await assert.rejects(a.todos.select(), (e) => e instanceof ApiError && e.code === 'app_not_registered')
+  // An admin signing in registers it and, as an owner, creates the tables.
+  const admin = declare(appToken(app, true))
+  const row = await admin.todos.insert({ content: 'admin' })
+  assert.equal(typeof row._owner, 'string')
+  const info = await admin.bb.appInfo()
+  assert.equal(info.owner, true)
+  assert.equal(info.origin, 'http://localhost:3000')
+  assert.equal(row._owner, info.user.id)
+
+  // Other users only see their own rows of private tables, and everyone's of shared ones.
+  await a.todos.insert({ content: 'a' })
+  await a.posts.insert({ body: 'hello from a' })
+  const b = declare(appToken(app))
+  assert.deepEqual(await b.todos.select(), [])
+  const aId = (await a.bb.appInfo()).user.id
+  assert.equal((await a.bb.appInfo()).owner, false)
+  assert.deepEqual(
+    (await b.posts.select()).map((p) => [p._owner, p.body]),
+    [[aId, 'hello from a']],
+  )
+  assert.equal((await b.posts.select({ where: { _owner: aId } })).length, 1)
+  // ...but can't change them.
+  assert.equal(await b.posts.update({}, { body: 'hijacked' }), 0)
+  assert.equal(await b.posts.delete({}), 0)
+  assert.equal((await a.posts.select())[0].body, 'hello from a')
+  await assert.rejects(b.todos.insert({ content: 'x', _owner: aId } as any), /set by the server/)
+
+  // Only owners can change tables; for everyone else they must already match.
+  const later = declare(appToken(app), true)
+  await assert.rejects(later.todos.select(), (e) => e instanceof ApiError && e.status === 403 && /owners/.test(e.message))
+  const adminLater = declare(appToken(app, true), true)
+  await adminLater.todos.select()
+  assert.deepEqual((await later.todos.select()).map((t) => [t.content, t.done]), [])
 })

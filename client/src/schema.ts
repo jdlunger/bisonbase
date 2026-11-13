@@ -9,6 +9,8 @@ export interface MigrateRequest {
   tables: {
     name: string
     columns: { name: string; type: ColumnType; nullable: boolean; default?: Wire }[]
+    /** App databases only. */
+    sharing?: 'private' | 'shared'
   }[]
 }
 
@@ -27,6 +29,7 @@ export function migrateRequest(tables: Iterable<TableDef>): MigrateRequest {
         nullable: c.nullable,
         ...(c.default ? { default: encode(c.type, c.nullable, c.default.value, c.name) } : {}),
       })),
+      ...(t.owned ? { sharing: t.owned.sharing } : {}),
     })),
   }
 }

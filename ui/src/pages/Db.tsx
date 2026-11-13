@@ -17,24 +17,28 @@ import {
   type TableView,
 } from '../api.ts'
 import { act, buttonLink, flash, Loading, Note, TextButton, toolbar, useTitle } from '../components.tsx'
-import { fmtSize, quoteIdent, rawHref } from '../format.ts'
+import { fmtSize, quoteIdent, rawHref, type Tree } from '../format.ts'
 import { Link, navigate, useHref } from '../router.tsx'
 import { ApiPath } from './Files.tsx'
 
-type Source = { kind: 'file'; owner: string | null; path: string } | { kind: 'system' }
+/** `rowsOnly`: an app database the viewer sees only their own rows of (no SQL console). */
+type Source = { kind: 'file'; tree: Tree; path: string; rowsOnly: boolean } | { kind: 'system' }
 
-/** A database file in a user's tree. */
-export function FileDb({ owner, path, size }: { owner: string | null; path: string; size: number }) {
+/** A database file in a user's tree or an app's storage. */
+export function FileDb({ tree, path, size, rowsOnly }: { tree: Tree; path: string; size: number; rowsOnly: boolean }) {
   return (
     <>
       <div className={toolbar}>
-        <a className={buttonLink} href={rawHref(owner, path)}>
-          Download
-        </a>
+        {!rowsOnly && (
+          <a className={buttonLink} href={rawHref(tree, path)}>
+            Download
+          </a>
+        )}
         <span className="text-muted">{fmtSize(size)} · SQLite database</span>
       </div>
-      <ApiPath path={path} />
-      <Browser src={{ kind: 'file', owner, path }} />
+      <ApiPath tree={tree} path={path} />
+      {rowsOnly && <Note kind="note">Showing only the rows you own.</Note>}
+      <Browser src={{ kind: 'file', tree, path, rowsOnly }} />
     </>
   )
 }
@@ -68,14 +72,14 @@ export function TableCrumb() {
 /** Where to fetch and post for a source. */
 function endpoints(src: Source) {
   const base = src.kind === 'system' ? '/ui/sysdb' : '/ui/db'
-  const where = src.kind === 'system' ? {} : { path: src.path, owner: src.owner }
+  const where = src.kind === 'system' ? {} : { path: src.path, owner: src.tree.owner, app: src.tree.app }
   return {
     view: (table: string | null, page: number) => `${base}${query({ ...where, table, page: page || null })}`,
     form: (table: string, key: string | null) => `${base}/row${query({ ...where, table, key })}`,
     row: `${base}/row`,
     sql: `${base}/sql`,
     /** Fields every post carries. */
-    body: src.kind === 'system' ? {} : { path: src.path, owner: src.owner },
+    body: src.kind === 'system' ? {} : { path: src.path, owner: src.tree.owner, app: src.tree.app },
   }
 }
 
@@ -137,15 +141,17 @@ function BrowserAt({ src }: { src: Source }) {
       </aside>
       <section className="min-w-0">
         {showForm && <RowEditor src={src} table={t.name} rowKey={edit} done={here} />}
-        <Console
-          src={src}
-          initial={table ? `SELECT * FROM ${quoteIdent(table)} LIMIT 100;` : ''}
-          writable={d.writable}
-          onResult={(r) => {
-            setResult(r)
-            v.setData({ ...d, tables: r.tables })
-          }}
-        />
+        {!(src.kind === 'file' && src.rowsOnly) && (
+          <Console
+            src={src}
+            initial={table ? `SELECT * FROM ${quoteIdent(table)} LIMIT 100;` : ''}
+            writable={d.writable}
+            onResult={(r) => {
+              setResult(r)
+              v.setData({ ...d, tables: r.tables })
+            }}
+          />
+        )}
         {result ? (
           <>
             {result.message && <Note kind="ok">{result.message}</Note>}

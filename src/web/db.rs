@@ -11,14 +11,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use uuid::Uuid;
 
-use super::{JsonResult, files::Tree};
+use super::{
+    JsonResult,
+    files::{Tree, TreeRef},
+};
 use crate::{
     api::db::with_db,
     auth::{AdminUser, SessionUser},
     error::{AppError, AppResult},
     state::AppState,
     storage::{
-        fs::SafePath,
+        fs::{SafePath, UserStore},
+        rel,
         rows::{self, KeyKind, RowKey},
         sql::{self, ConsoleOutcome, QueryResult, TableSchema},
     },
@@ -37,30 +41,58 @@ const PREVIEW_ROWS: i64 = 10;
 /// Which database a request is about.
 #[derive(Clone)]
 pub enum Source {
-    /// A database file in `owner`'s tree. Only the owner gets `editable`.
+    /// A database file in a user's tree (only the owner gets `editable`) or an app's storage
+    /// (only the app's owners do).
     File {
-        owner: Uuid,
+        store: UserStore,
         path: SafePath,
         editable: bool,
+        /// App databases, for viewers who don't manage the app: only tables with an `_owner`
+        /// column are shown, and only this user's rows of them.
+        rows_of: Option<String>,
     },
     /// The server's own system.db (admins only).
     System,
 }
 
 impl Source {
-    /// A database in a user's tree, as seen by `viewer`.
-    async fn file(
-        state: &AppState,
-        viewer: User,
-        owner: Option<Uuid>,
-        path: &str,
-    ) -> AppResult<Self> {
-        let tree = Tree::resolve(state, viewer, owner).await?;
+    /// A database in a user's tree or an app's storage, as seen by `viewer`.
+    async fn file(state: &AppState, viewer: User, r: TreeRef, path: &str) -> AppResult<Self> {
+        let tree = Tree::resolve(state, viewer, r).await?;
         Ok(Source::File {
-            owner: tree.owner.id,
+            store: tree.store,
             path: SafePath::parse(path)?,
             editable: tree.editable,
+            rows_of: tree.rows_of,
         })
+    }
+
+    /// The user whose rows alone are shown, if limited to one.
+    fn rows_of(&self) -> Option<&str> {
+        match self {
+            Source::File { rows_of, .. } => rows_of.as_deref(),
+            Source::System => None,
+        }
+    }
+
+    /// Whether a table is shown: limited viewers only see tables of owned rows.
+    fn shows(&self, t: &TableSchema) -> bool {
+        self.rows_of().is_none()
+            || (t.kind == "table"
+                && !rel::is_internal(&t.name)
+                && t.columns
+                    .iter()
+                    .any(|c| c.name.eq_ignore_ascii_case(rel::OWNER_COLUMN)))
+    }
+
+    /// Refuse what limited viewers can't do: `what` names it.
+    fn require_all_rows(&self, what: &str) -> AppResult<()> {
+        if self.rows_of().is_some() {
+            return Err(AppError::forbidden(format!(
+                "only the app's owners can {what} in its databases"
+            )));
+        }
+        Ok(())
     }
 
     fn editable(&self) -> bool {
@@ -110,9 +142,8 @@ where
     F: FnOnce(&Connection, usize) -> AppResult<T> + Send + 'static,
 {
     match src {
-        Source::File { owner, path, .. } => {
-            let store = state.store(*owner);
-            with_db(state, &store, path, move |c| {
+        Source::File { store, path, .. } => {
+            with_db(state, store, path, move |c| {
                 let max_rows = c.max_rows();
                 c.guarded(|conn| f(conn, max_rows))
             })
@@ -330,6 +361,7 @@ pub struct ViewQuery {
     #[serde(default)]
     path: String,
     owner: Option<Uuid>,
+    app: Option<Uuid>,
     table: Option<String>,
     #[serde(default)]
     page: i64,
@@ -349,19 +381,25 @@ async fn view_source(
         previews: Vec<(String, AppResult<rows::Page>)>,
     }
     let tname = table.clone();
+    let s2 = src.clone();
     let data = with_conn(state, &src, move |c, _| {
-        let tables = sql::schema(c)?;
+        let mut tables = sql::schema(c)?;
+        tables.retain(|t| s2.shows(t));
+        let only = s2
+            .rows_of()
+            .map(|u| (rel::OWNER_COLUMN, Value::Text(u.to_string())));
+        let only = only.as_ref().map(|(c, v)| (*c, v));
         // Views aren't previewed: running one can take arbitrarily long.
         let previews = tables
             .iter()
             .filter(|t| tname.is_none() && t.kind == "table")
             .take(PREVIEW_TABLES)
-            .map(|t| (t.name.clone(), rows::page(c, t, 0, PREVIEW_ROWS)))
+            .map(|t| (t.name.clone(), rows::page(c, t, 0, PREVIEW_ROWS, only)))
             .collect();
         let page = tname
             .as_ref()
             .and_then(|n| tables.iter().find(|x| &x.name == n))
-            .map(|t| rows::page(c, t, page, PAGE_SIZE));
+            .map(|t| rows::page(c, t, page, PAGE_SIZE, only));
         Ok(Data {
             tables,
             page,
@@ -442,7 +480,16 @@ pub async fn view(
     SessionUser(user): SessionUser,
     Query(q): Query<ViewQuery>,
 ) -> JsonResult<DbView> {
-    let src = Source::file(&state, user, q.owner, &q.path).await?;
+    let src = Source::file(
+        &state,
+        user,
+        TreeRef {
+            owner: q.owner,
+            app: q.app,
+        },
+        &q.path,
+    )
+    .await?;
     view_source(&state, src, q.table, q.page).await
 }
 
@@ -603,6 +650,7 @@ pub struct RowQuery {
     #[serde(default)]
     path: String,
     owner: Option<Uuid>,
+    app: Option<Uuid>,
     table: String,
     /// The row to edit; without one, the form inserts a new row.
     key: Option<String>,
@@ -660,7 +708,17 @@ pub async fn row_form(
     SessionUser(user): SessionUser,
     Query(q): Query<RowQuery>,
 ) -> JsonResult<RowForm> {
-    let src = Source::file(&state, user, q.owner, &q.path).await?;
+    let src = Source::file(
+        &state,
+        user,
+        TreeRef {
+            owner: q.owner,
+            app: q.app,
+        },
+        &q.path,
+    )
+    .await?;
+    src.require_all_rows("open rows")?;
     row_form_source(&state, src, q.table, q.key).await
 }
 
@@ -707,6 +765,7 @@ pub struct SqlForm {
     #[serde(default)]
     path: String,
     owner: Option<Uuid>,
+    app: Option<Uuid>,
     sql: String,
 }
 
@@ -759,7 +818,17 @@ pub async fn console(
     SessionUser(user): SessionUser,
     Json(f): Json<SqlForm>,
 ) -> JsonResult<ConsoleResult> {
-    let src = Source::file(&state, user, f.owner, &f.path).await?;
+    let src = Source::file(
+        &state,
+        user,
+        TreeRef {
+            owner: f.owner,
+            app: f.app,
+        },
+        &f.path,
+    )
+    .await?;
+    src.require_all_rows("run SQL")?;
     run_sql(&state, src, f.sql).await
 }
 
@@ -786,6 +855,8 @@ pub struct FieldValue {
 
 #[derive(Deserialize)]
 pub struct RowEdit {
+    #[serde(default)]
+    app: Option<Uuid>,
     #[serde(default)]
     path: String,
     table: String,
@@ -862,16 +933,19 @@ fn grid_row(c: &Connection, src: &Source, t: &TableSchema, key: RowKey) -> AppRe
     })
 }
 
-/// Insert, update or delete a row in one of the user's own databases.
+/// Insert, update or delete a row in one of the user's own databases, or in an app's database
+/// the user manages.
 pub async fn edit_row(
     State(state): State<AppState>,
     SessionUser(user): SessionUser,
     Json(e): Json<RowEdit>,
 ) -> JsonResult<EditResult> {
+    let tree = Tree::writable(&state, user, e.app).await?;
     let src = Source::File {
-        owner: user.id,
+        store: tree.store,
         path: SafePath::parse(&e.path)?,
         editable: true,
+        rows_of: None,
     };
     let values = parse_values(&e.values)?;
     let s2 = src.clone();

@@ -102,6 +102,23 @@ test('update and delete', () => {
   assert.deepEqual(deleteRequest(todos, {}), { table: 'todos', where: {} })
 })
 
+test('app tables: sharing and _owner', () => {
+  const posts = parseTable('posts', { body: 'text' }, { sharing: 'shared' })
+  assert.equal(migrateRequest([posts]).tables[0].sharing, 'shared')
+  assert.equal(migrateRequest([todos]).tables[0].sharing, undefined)
+  assert.deepEqual(selectRequest(posts, { where: { _owner: 'u1' }, orderBy: '_owner' }), {
+    table: 'posts',
+    where: { _owner: 'u1' },
+    order_by: ['_owner asc'],
+  })
+  assert.throws(() => insertRequest(posts, [{ body: 'x', _owner: 'u1' }]), /set by the server/)
+  assert.throws(() => updateRequest(posts, {}, { _owner: 'u1' }), /can't be changed/)
+  // Only app tables have an owner.
+  assert.throws(() => selectRequest(todos, { where: { _owner: 'u1' } }), /no column "_owner"/)
+  assert.throws(() => parseTable('t', { _owner: 'text' }, { sharing: 'private' }), /automatically/)
+  assert.throws(() => parseTable('_bisonbase_x', { a: 'text' }), /reserved/)
+})
+
 test('values', () => {
   const bytes = new Uint8Array(70000).map((_, i) => i % 256)
   assert.deepEqual(fromBase64(toBase64(bytes)), bytes)

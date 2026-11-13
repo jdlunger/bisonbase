@@ -10,12 +10,20 @@ export interface ColumnDef {
   default?: { value: unknown }
 }
 
+/** Who may read a table's rows in an app database (only a row's owner may change it). */
+export type Sharing = 'private' | 'shared'
+
 export interface TableDef {
   name: string
-  /** Every column except `id`, in declaration order. */
+  /** Every column except `id` (and `_owner`), in declaration order. */
   columns: ColumnDef[]
   byName: Map<string, ColumnDef>
+  /** In an app database: rows have an `_owner`, set by the server. */
+  owned?: { sharing: Sharing }
 }
+
+/** The column holding a row's owner (a user id) in app databases. */
+export const OWNER = '_owner'
 
 const TYPES: readonly ColumnType[] = ['text', 'integer', 'real', 'boolean', 'blob', 'json']
 const IDENT = /^[A-Za-z_][A-Za-z0-9_]*$/
@@ -26,6 +34,7 @@ export function checkName(kind: string, name: string): void {
     throw new Error(`${kind} name "${name}" must be letters, digits and underscores, not starting with a digit`)
   }
   if (name.toLowerCase().startsWith('sqlite_')) throw new Error(`${kind} name "${name}" is reserved by SQLite`)
+  if (name.toLowerCase().startsWith('_bisonbase')) throw new Error(`${kind} name "${name}" is reserved by bisonbase`)
 }
 
 function parseColumn(name: string, spec: ColumnSpec): ColumnDef {
@@ -40,9 +49,15 @@ function parseColumn(name: string, spec: ColumnSpec): ColumnDef {
   return { name, type, nullable, ...(hasDefault ? { default: { value } } : {}) }
 }
 
-export function parseTable(name: string, columns: Columns): TableDef {
+export function parseTable(name: string, columns: Columns, owned?: { sharing: Sharing }): TableDef {
   checkName('Table', name)
+  if (owned && Object.keys(columns).some((c) => c.toLowerCase() === OWNER)) {
+    throw new Error(`Every table in an app database gets an "${OWNER}" column automatically; don't declare one`)
+  }
+  if (owned && owned.sharing !== 'private' && owned.sharing !== 'shared') {
+    throw new Error(`Table "${name}": sharing must be "private" or "shared"`)
+  }
   const defs = Object.entries(columns).map(([col, spec]) => parseColumn(col, spec))
   const byName = new Map(defs.map((c) => [c.name, c]))
-  return { name, columns: defs, byName }
+  return { name, columns: defs, byName, ...(owned ? { owned } : {}) }
 }

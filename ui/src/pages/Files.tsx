@@ -1,45 +1,55 @@
-// A user's file tree: folders, text and image files, and (through Db.tsx) databases. Users
-// change their own tree; admins can look at anyone's, read-only.
+// A file tree: folders, text and image files, and (through Db.tsx) databases. Users change their
+// own tree; admins can look at anyone's, read-only. A registered app's own storage is a tree too:
+// its owners change it, and everyone else sees plain files and the database rows they own.
 
 import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent, type ReactNode } from 'react'
 import { post, postForm, query, useApi, type Browse, type DirNode, type FileNode, type ListEntry } from '../api.ts'
 import { act, actionsCell, AppTag, buttonLink, Copyable, flash, listTable, Loading, Note, TextButton, toolbar, useTitle } from '../components.tsx'
-import { appFolderId, fmtSize, fmtTime, rawHref, treeBase, treeHref } from '../format.ts'
+import { apiPath, appFolderId, fmtSize, fmtTime, rawHref, treeBase, treeHref, type Tree } from '../format.ts'
 import { Link, navigate } from '../router.tsx'
 import { FileDb, TableCrumb } from './Db.tsx'
 
-/** Whose tree: null for the viewer's own. */
-type Owner = string | null
+const browseUrl = (tree: Tree, path: string) => `/ui/files${query({ path, owner: tree.owner, app: tree.app })}`
 
-const browseUrl = (owner: Owner, path: string) => `/ui/files${query({ path, owner })}`
+/** Fields that tell the server which tree a change is in. */
+export const treeBody = (tree: Tree) => (tree.app ? { app: tree.app } : {})
 
-export function Files({ owner, path }: { owner: Owner; path: string }) {
-  const b = useApi<Browse>(browseUrl(owner, path))
-  useTitle(path.split('/').pop() || 'Files')
+export function Files({ tree, path }: { tree: Tree; path: string }) {
+  const b = useApi<Browse>(browseUrl(tree, path))
+  useTitle(path.split('/').pop() || b.data?.app?.name || 'Files')
   if (!b.data) return <Loading error={b.error} />
   const d = b.data
   return (
     <>
-      <Crumbs browse={d} owner={owner} after={d.kind === 'db' && <TableCrumb />} />
-      {owner && <Note kind="note">Viewing {d.owner.username}'s files as an admin (read-only).</Note>}
-      {d.kind === 'dir' && <Dir browse={d} owner={owner} reload={b.reload} />}
-      {d.kind === 'file' && <File browse={d} owner={owner} />}
-      {d.kind === 'db' && <FileDb owner={owner} path={d.path} size={d.size} />}
+      <Crumbs browse={d} tree={tree} after={d.kind === 'db' && <TableCrumb />} />
+      {tree.owner && <Note kind="note">Viewing {d.owner.username}'s files as an admin (read-only).</Note>}
+      {d.app &&
+        !path &&
+        (d.app.manage ? (
+          <Note kind="note">
+            {d.app.name}'s own storage, shared by everyone who uses the app. Each user reaches only their own rows of its
+            databases through the app; as an owner, you see and can change everything here.
+          </Note>
+        ) : (
+          <Note kind="note">Your data in {d.app.name}: the rows of its databases that you own, and its files (read-only).</Note>
+        ))}
+      {d.kind === 'dir' && <Dir browse={d} tree={tree} reload={b.reload} />}
+      {d.kind === 'file' && <File browse={d} tree={tree} />}
+      {d.kind === 'db' && <FileDb tree={tree} path={d.path} size={d.size} rowsOnly={d.rows_only} />}
     </>
   )
 }
 
 /** The path to a page, each part a link; app folders show the app's name. */
-export function Crumbs({ browse, owner, after }: { browse: Browse; owner: Owner; after?: ReactNode }) {
+export function Crumbs({ browse, tree, after }: { browse: Browse; tree: Tree; after?: ReactNode }) {
   const parts = browse.path ? browse.path.split('/') : []
-  const crumbs: { name: ReactNode; href: string; title?: string }[] = [
-    { name: owner ? `${browse.owner.username}'s files` : 'Files', href: treeBase(owner), title: '/' },
-  ]
+  const root = browse.app ? <AppTag app={browse.app} /> : tree.owner ? `${browse.owner.username}'s files` : 'Files'
+  const crumbs: { name: ReactNode; href: string; title?: string }[] = [{ name: root, href: treeBase(tree), title: '/' }]
   parts.forEach((name, i) => {
     const p = parts.slice(0, i + 1).join('/')
     const app = appFolderId(p)
     const label = app && browse.apps[app]
-    crumbs.push({ name: label ? <AppTag app={label} /> : name, href: treeHref(owner, p), title: `/${p}` })
+    crumbs.push({ name: label ? <AppTag app={label} /> : name, href: treeHref(tree, p), title: `/${p}` })
   })
   const links = crumbs.map((c, i) => (
     <span key={c.href}>
@@ -51,9 +61,14 @@ export function Crumbs({ browse, owner, after }: { browse: Browse; owner: Owner;
   ))
   return (
     <nav className="mt-1 mb-3 text-base">
-      {owner && (
+      {tree.owner && (
         <>
           <Link href="/admin">Admin</Link> /{' '}
+        </>
+      )}
+      {tree.app && (
+        <>
+          <Link href="/apps">Apps</Link> /{' '}
         </>
       )}
       {parts.length ? <Copyable text={`/${browse.path}`}>{links}</Copyable> : <span>{links}</span>}
@@ -63,8 +78,8 @@ export function Crumbs({ browse, owner, after }: { browse: Browse; owner: Owner;
 }
 
 /** Shown under the crumbs of files and databases. */
-export function ApiPath({ path }: { path: string }) {
-  const p = `/api/v1/files/${path}`
+export function ApiPath({ tree, path }: { tree: Tree; path: string }) {
+  const p = apiPath(tree, path)
   return (
     <p className="text-muted">
       API path:{' '}
@@ -77,7 +92,7 @@ export function ApiPath({ path }: { path: string }) {
 
 // ---- folders ----
 
-function Dir({ browse, owner, reload }: { browse: Browse & DirNode; owner: Owner; reload: () => void }) {
+function Dir({ browse, tree, reload }: { browse: Browse & DirNode; tree: Tree; reload: () => void }) {
   const dir = browse.path
   const [dragging, setDragging] = useState(false)
   const [name, setName] = useState('')
@@ -94,6 +109,7 @@ function Dir({ browse, owner, reload }: { browse: Browse & DirNode; owner: Owner
     if (!files?.length) return
     act(async () => {
       const body = new FormData()
+      if (tree.app) body.append('app', tree.app)
       body.append('dir', dir)
       for (const f of files) body.append('file', f)
       try {
@@ -132,10 +148,10 @@ function Dir({ browse, owner, reload }: { browse: Browse & DirNode; owner: Owner
   const create = (e: FormEvent) => {
     e.preventDefault()
     act(async () => {
-      const r = await post<{ path: string }>('/ui/new', { dir, name, kind })
+      const r = await post<{ path: string }>('/ui/new', { ...treeBody(tree), dir, name, kind })
       setName('')
       if (kind === 'folder') changed()
-      else navigate(treeHref(owner, r.path))
+      else navigate(treeHref(tree, r.path))
     })
   }
 
@@ -186,7 +202,7 @@ function Dir({ browse, owner, reload }: { browse: Browse & DirNode; owner: Owner
           </tr>
         </thead>
         <tbody>
-          <Rows listing={browse} owner={owner} depth={0} version={version} changed={changed} />
+          <Rows listing={browse} tree={tree} depth={0} version={version} changed={changed} />
         </tbody>
       </table>
     </>
@@ -195,7 +211,7 @@ function Dir({ browse, owner, reload }: { browse: Browse & DirNode; owner: Owner
 
 interface RowsProps {
   listing: Browse & DirNode
-  owner: Owner
+  tree: Tree
   depth: number
   /** Changes when the tree changed. */
   version: number
@@ -230,7 +246,7 @@ const expand = 'inline-block w-[18px] text-muted!'
 const icons = { dir: '📁', db: '🗄️', file: '📄' }
 
 /** A folder's row can expand to show its entries right below it. */
-function Row({ entry: e, listing, owner, depth, version, changed }: RowsProps & { entry: ListEntry }) {
+function Row({ entry: e, listing, tree, depth, version, changed }: RowsProps & { entry: ListEntry }) {
   const path = listing.path ? `${listing.path}/${e.name}` : e.name
   const app = appFolderId(path)
   const label = app ? listing.apps[app] : undefined
@@ -240,7 +256,7 @@ function Row({ entry: e, listing, owner, depth, version, changed }: RowsProps & 
   useEffect(() => {
     if (!expanded) return
     let live = true
-    fetch(browseUrl(owner, path), { credentials: 'same-origin' })
+    fetch(browseUrl(tree, path), { credentials: 'same-origin' })
       .then(async (r) => {
         if (r.status === 401) return location.reload()
         const data = await r.json()
@@ -251,13 +267,13 @@ function Row({ entry: e, listing, owner, depth, version, changed }: RowsProps & 
     return () => {
       live = false
     }
-  }, [expanded, version, owner, path])
+  }, [expanded, version, tree, path])
 
   const rename = () => {
     const name = prompt('New name', e.name)
     if (!name || name === e.name) return
     act(async () => {
-      await post('/ui/rename', { path, new_name: name })
+      await post('/ui/rename', { ...treeBody(tree), path, new_name: name })
       changed()
     })
   }
@@ -265,7 +281,7 @@ function Row({ entry: e, listing, owner, depth, version, changed }: RowsProps & 
     const what = label ? `${label.name}’s folder` : e.name
     if (!confirm(`Delete ${what}${e.kind === 'dir' ? ' and everything in it' : ''}?`)) return
     act(async () => {
-      await post('/ui/delete', { path })
+      await post('/ui/delete', { ...treeBody(tree), path })
       flash('ok', `Deleted ${e.name}`)
       changed()
     })
@@ -293,7 +309,7 @@ function Row({ entry: e, listing, owner, depth, version, changed }: RowsProps & 
           )}
           <Copyable text={`/${path}`}>
             {icons[e.kind]}{' '}
-            <Link href={treeHref(owner, path)} title={`/${path}`}>
+            <Link href={treeHref(tree, path)} title={`/${path}`}>
               {label ? <AppTag app={label} /> : e.name}
             </Link>
           </Copyable>
@@ -324,7 +340,7 @@ function Row({ entry: e, listing, owner, depth, version, changed }: RowsProps & 
             </td>
           </tr>
         ) : (
-          <Rows listing={children} owner={owner} depth={depth + 1} version={version} changed={changed} />
+          <Rows listing={children} tree={tree} depth={depth + 1} version={version} changed={changed} />
         ))}
     </>
   )
@@ -334,8 +350,8 @@ function Row({ entry: e, listing, owner, depth, version, changed }: RowsProps & 
 
 const preview = 'max-w-full overflow-auto rounded-lg border border-line bg-card p-3'
 
-function File({ browse, owner }: { browse: Browse & FileNode; owner: Owner }) {
-  const raw = rawHref(owner, browse.path)
+function File({ browse, tree }: { browse: Browse & FileNode; tree: Tree }) {
+  const raw = rawHref(tree, browse.path)
   const [info, setInfo] = useState({ etag: browse.etag, size: browse.size, modified: browse.modified })
   // Textareas use \n line endings whatever the file had; `crlf` puts them back on save.
   const [text, setText] = useState(browse.text ?? '')
@@ -347,7 +363,7 @@ function File({ browse, owner }: { browse: Browse & FileNode; owner: Owner }) {
     setSaving(true)
     act(async () => {
       const content = browse.crlf ? text.replace(/\r?\n/g, '\r\n') : text
-      const r = await post<typeof info>('/ui/save', { path: browse.path, content, etag: info.etag })
+      const r = await post<typeof info>('/ui/save', { ...treeBody(tree), path: browse.path, content, etag: info.etag })
       setInfo(r)
       flash('ok', 'Saved')
     }).finally(() => setSaving(false))
@@ -369,7 +385,7 @@ function File({ browse, owner }: { browse: Browse & FileNode; owner: Owner }) {
           {fmtSize(info.size)} · {browse.mime} · modified {fmtTime(info.modified)}
         </span>
       </div>
-      <ApiPath path={browse.path} />
+      <ApiPath tree={tree} path={browse.path} />
       {browse.is_image && <img className={preview} src={`${raw}?inline=1`} alt={browse.path.split('/').pop()} />}
       {browse.text != null ? (
         browse.editable ? (

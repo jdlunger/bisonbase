@@ -49,8 +49,31 @@ function App() {
 }
 ```
 
-The first part of this works now with per-user databases: see [client/](client) (the `bisonbase`
-package) and [examples/ts/react-todo](examples/ts/react-todo).
+This works now, with `createAppDb` (shared storage, rows owned by users) and `createUserDb` (a
+database in each user's own account): see [client/](client) (the `bisonbase` package) and
+[examples/ts/react-todo](examples/ts/react-todo).
+
+### App-owned storage
+
+An admin registers an app (under Apps in the UI, or just by signing in to it: the client
+registers it then), which gives it storage of its own, outside every user's files, shared by
+everyone who uses it. Only the app's registered origin can sign in with its id. Admins can make
+other users owners of the app.
+
+- Each table of an app database has an `_owner` column, which the server fills in with the id of
+  the user who inserted the row. Users only reach their own rows: a table's `sharing` is
+  `private` (the default; reads see only your rows) or `shared` (reads see every row). Either
+  way, only a row's owner can update or delete it, and `_owner` can't be set or changed.
+- Only owners (and admins) can create databases and tables, add columns or change sharing, and
+  add, change or delete plain files there; anyone else can check that the tables match, list and
+  read plain files, and use the databases through the API above.
+- In the UI, users see their own rows of each app's databases (read-only) under Apps; owners see
+  and can change everything. Deleting a user deletes their rows from every app.
+
+App storage is served at `/api/v1/apps/<app id>/files/<path>`, with the same ops as above.
+`GET /api/v1/apps/<app id>` describes the app and whether the user owns it, and an admin can
+`POST /api/v1/apps/<app id>?op=register` with `{"name", "origin"}` (an app's own token needs
+neither origin nor name).
 
 ### Database API
 
@@ -77,9 +100,9 @@ database's schema, and values are always bound parameters.
 
 ## TODO
 
- - App registration & -instanced databases, with per-row user ownership
- - Admin features - first user is super admin, then can set other users as app admins
- - TS & React library, with auth, file, and db APIs (started in [client/](client): auth and per-user dbs)
+ - Per-file ownership for files in app storage (for now only an app's owners can write files there)
+ - Admin features - first user is super admin, then can set other users as app admins (done: app owners)
+ - TS & React library, with auth, file, and db APIs (started in [client/](client): auth, per-user and app dbs)
  - Schema creations & migrations
 
 ## LLM Usage

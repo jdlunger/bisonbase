@@ -495,7 +495,7 @@ pub struct DeleteUserForm {
     confirm: String,
 }
 
-/// Delete a user's account and all their files and databases.
+/// Delete a user's account and all their files and databases, and their rows in apps' databases.
 pub async fn delete_user(
     State(state): State<AppState>,
     AdminUser(admin): AdminUser,
@@ -512,6 +512,7 @@ pub async fn delete_user(
     }
     state.sys.delete_user(&admin, &user).await?;
     state.store(user.id).remove_all().await?;
+    crate::api::apps::purge_user(&state, user.id).await?;
     state.locks.remove(user.id);
     tracing::info!(username = %user.username, by = %admin.username, "user deleted");
     Ok(ok())

@@ -2870,3 +2870,633 @@ async fn watch_streams_changes() {
     .await;
     assert!(end.is_ok(), "stream didn't end on shutdown");
 }
+
+// ---- app-owned storage ----
+
+/// Register an app (as an admin's personal token) and return its storage's API base.
+async fn register(e: &Env, admin_tok: &str, id: &str, origin: &str) -> String {
+    let (s, _, b) = call(
+        e,
+        json_req(
+            "POST",
+            &format!("/api/v1/apps/{id}?op=register"),
+            admin_tok,
+            json!({"name": "Shared Todo", "origin": origin}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{}", String::from_utf8_lossy(&b));
+    format!("/api/v1/apps/{id}/files")
+}
+
+fn app_op(base: &str, db: &str, op: &str, tok: &str, body: Value) -> Request<Body> {
+    json_req("POST", &format!("{base}/{db}?op={op}"), tok, body)
+}
+
+fn todo_spec(extra: Option<Value>) -> Value {
+    let mut cols = vec![json!({"name": "content", "type": "text"})];
+    cols.extend(extra);
+    json!({"tables": [
+        {"name": "todos", "columns": cols},
+        {"name": "posts", "sharing": "shared", "columns": [{"name": "body", "type": "text"}]},
+    ]})
+}
+
+#[tokio::test]
+async fn app_storage_needs_registration_by_an_admin() {
+    let e = env();
+    let a = admin(&e, "root").await;
+    let u = user(&e, "alice").await;
+    let at = token(&e, a, "files:write db:write").await;
+    let ut = token(&e, u, "files:write db:write").await;
+    let id = "6f3c3c55-6a51-4d55-9a8e-1b8f1d0b7a01";
+
+    let (s, _, b) = call(
+        &e,
+        req("GET", &format!("/api/v1/apps/{id}"), &ut, Body::empty()),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    assert_eq!(j(&b)["error"]["code"], "app_not_registered");
+    let (s, _, b) = call(
+        &e,
+        app_op(
+            &format!("/api/v1/apps/{id}/files"),
+            "t.db",
+            "mkdb",
+            &ut,
+            json!({}),
+        ),
+    )
+    .await;
+    assert_eq!(j(&b)["error"]["code"], "app_not_registered", "{s}");
+
+    // Only admins can register, with a proper origin.
+    let reg = |tok: &str, body: Value| {
+        json_req("POST", &format!("/api/v1/apps/{id}?op=register"), tok, body)
+    };
+    let (s, _, _) = call(
+        &e,
+        reg(&ut, json!({"name": "X", "origin": "https://x.example"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _, _) = call(
+        &e,
+        reg(&at, json!({"name": "X", "origin": "http://x.example"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, _, _) = call(&e, reg(&at, json!({"name": "X"}))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    register(&e, &at, id, "https://x.example").await;
+    // Registering again from the same origin is fine; from another, it's taken.
+    let (s, _, _) = call(
+        &e,
+        reg(&at, json!({"name": "X", "origin": "https://x.example"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _, _) = call(
+        &e,
+        reg(&at, json!({"name": "X", "origin": "https://y.example"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT);
+
+    let (s, _, b) = call(
+        &e,
+        req("GET", &format!("/api/v1/apps/{id}"), &ut, Body::empty()),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let b = j(&b);
+    assert_eq!(b["name"], "Shared Todo");
+    assert_eq!(b["owner"], false);
+    assert_eq!(b["user"]["username"], "alice");
+}
+
+#[tokio::test]
+async fn app_rows_belong_to_users() {
+    let e = env();
+    let root = admin(&e, "root").await;
+    let alice = user(&e, "alice").await;
+    let bob = user(&e, "bob").await;
+    let rt = token(&e, root, "files:write db:write").await;
+    let at = token(&e, alice, "files:write db:write").await;
+    let bt = token(&e, bob, "files:write db:write").await;
+    let id = "6f3c3c55-6a51-4d55-9a8e-1b8f1d0b7a02";
+    let base = register(&e, &rt, id, "https://x.example").await;
+    let root_user = e.state.sys.user_by_id(root).await.unwrap().unwrap();
+    let alice_user = e.state.sys.user_by_id(alice).await.unwrap().unwrap();
+    e.state
+        .sys
+        .set_app_owner(&root_user, id.parse().unwrap(), &alice_user, true)
+        .await
+        .unwrap();
+
+    // Only owners create databases and change tables; others may check them.
+    let (s, _, _) = call(&e, app_op(&base, "t.db", "mkdb", &bt, json!({}))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _, _) = call(&e, app_op(&base, "t.db", "mkdb", &at, json!({}))).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let (s, _, b) = call(&e, app_op(&base, "t.db", "mkdb", &bt, json!({}))).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(j(&b)["created"], false);
+    let (s, _, b) = call(&e, app_op(&base, "t.db", "migrate", &bt, todo_spec(None))).await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{}", String::from_utf8_lossy(&b));
+    let (s, _, b) = call(&e, app_op(&base, "t.db", "migrate", &at, todo_spec(None))).await;
+    assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+    let (s, _, b) = call(&e, app_op(&base, "t.db", "migrate", &bt, todo_spec(None))).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(j(&b)["applied"], json!([]));
+    let more = Some(json!({"name": "done", "type": "boolean", "default": false}));
+    let (s, _, _) = call(
+        &e,
+        app_op(&base, "t.db", "migrate", &bt, todo_spec(more.clone())),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    // `_owner` can't be declared, and internal tables can't be named.
+    let bad = json!({"tables": [{"name": "x", "columns": [{"name": "_owner", "type": "text"}]}]});
+    let (s, _, _) = call(&e, app_op(&base, "t.db", "migrate", &at, bad)).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let bad = json!({"tables": [{"name": "_bisonbase_x", "columns": []}]});
+    let (s, _, _) = call(&e, app_op(&base, "t.db", "migrate", &at, bad)).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    // Sharing is only for app databases.
+    let (s, _, _) = call(
+        &e,
+        req("POST", "/api/v1/files/u.db?op=mkdb", &at, Body::empty()),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED);
+    let (s, _, _) = call(&e, db_op("u.db", "migrate", &at, todo_spec(None))).await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+
+    // Each user inserts rows; the server sets `_owner`.
+    for (tok, who) in [(&at, "alice"), (&bt, "bob")] {
+        let (s, _, b) = call(
+            &e,
+            app_op(
+                &base,
+                "t.db",
+                "insert",
+                tok,
+                json!({"table": "todos", "rows": [{"content": who}]}),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+        let b = j(&b);
+        assert_eq!(b["columns"], json!(["id", "_owner", "content"]));
+        let (s, _, _) = call(
+            &e,
+            app_op(
+                &base,
+                "t.db",
+                "insert",
+                tok,
+                json!({"table": "posts", "rows": [{"body": who}]}),
+            ),
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK);
+    }
+    let rows = |b: &[u8]| -> Vec<Value> {
+        j(b)["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r[2].clone())
+            .collect()
+    };
+    // Private tables: your own rows only. Shared: everyone's.
+    let (_, _, b) = call(
+        &e,
+        app_op(&base, "t.db", "select", &bt, json!({"table": "todos"})),
+    )
+    .await;
+    assert_eq!(rows(&b), [json!("bob")]);
+    let (_, _, b) = call(
+        &e,
+        app_op(
+            &base,
+            "t.db",
+            "select",
+            &bt,
+            json!({"table": "todos", "where": {"_owner": alice.to_string()}}),
+        ),
+    )
+    .await;
+    assert!(rows(&b).is_empty());
+    let (_, _, b) = call(
+        &e,
+        app_op(
+            &base,
+            "t.db",
+            "select",
+            &bt,
+            json!({"table": "posts", "order_by": ["id"]}),
+        ),
+    )
+    .await;
+    assert_eq!(rows(&b), [json!("alice"), json!("bob")]);
+    // Even owners only reach their own rows through the API.
+    let (_, _, b) = call(
+        &e,
+        app_op(&base, "t.db", "select", &at, json!({"table": "todos"})),
+    )
+    .await;
+    assert_eq!(rows(&b), [json!("alice")]);
+
+    // Nobody changes or deletes another user's rows, even in shared tables.
+    for (table, col) in [("todos", "content"), ("posts", "body")] {
+        let set = json!({"table": table, "where": {}, "set": {col: "x"}});
+        let (s, _, b) = call(&e, app_op(&base, "t.db", "update", &bt, set)).await;
+        assert_eq!(j(&b)["changes"], 1, "{s}");
+        let (_, _, b) = call(
+            &e,
+            app_op(
+                &base,
+                "t.db",
+                "delete",
+                &bt,
+                json!({"table": table, "where": {}}),
+            ),
+        )
+        .await;
+        assert_eq!(j(&b)["changes"], 1);
+    }
+    let (_, _, b) = call(
+        &e,
+        app_op(&base, "t.db", "select", &at, json!({"table": "posts"})),
+    )
+    .await;
+    assert_eq!(rows(&b), [json!("alice")]);
+
+    // `_owner` is the server's to set.
+    let (s, _, _) = call(
+        &e,
+        app_op(
+            &base,
+            "t.db",
+            "insert",
+            &bt,
+            json!({"table": "todos", "rows": [{"content": "x", "_owner": alice.to_string()}]}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, _, _) = call(
+        &e,
+        app_op(
+            &base,
+            "t.db",
+            "update",
+            &bt,
+            json!({"table": "todos", "where": {}, "set": {"_owner": alice.to_string()}}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    // The same goes inside transactions.
+    let (s, _, _) = call(
+        &e,
+        app_op(&base, "t.db", "transact", &bt, json!({"ops": [{"op": "delete", "table": "todos", "where": {"_owner": alice.to_string()}}]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (_, _, b) = call(
+        &e,
+        app_op(&base, "t.db", "select", &at, json!({"table": "todos"})),
+    )
+    .await;
+    assert_eq!(rows(&b), [json!("alice")]);
+
+    // The policy table is hidden.
+    let (_, _, b) = call(
+        &e,
+        req("GET", &format!("{base}/t.db?op=schema"), &bt, Body::empty()),
+    )
+    .await;
+    let names: Vec<_> = j(&b)["tables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].clone())
+        .collect();
+    assert_eq!(names, [json!("posts"), json!("todos")]);
+    let (s, _, _) = call(
+        &e,
+        app_op(
+            &base,
+            "t.db",
+            "select",
+            &bt,
+            json!({"table": "_bisonbase_tables"}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+
+    // Plain files: everyone reads, owners write. Whole databases: owners only.
+    let (s, _, _) = call(&e, req("PUT", &format!("{base}/logo.txt"), &bt, "x")).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _, _) = call(&e, req("PUT", &format!("{base}/logo.txt"), &at, "logo")).await;
+    assert_eq!(s, StatusCode::CREATED);
+    let (s, _, b) = call(
+        &e,
+        req("GET", &format!("{base}/logo.txt"), &bt, Body::empty()),
+    )
+    .await;
+    assert_eq!((s, b.as_slice()), (StatusCode::OK, b"logo".as_slice()));
+    let (s, _, _) = call(
+        &e,
+        req("DELETE", &format!("{base}/logo.txt"), &bt, Body::empty()),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _, _) = call(&e, req("GET", &format!("{base}/t.db"), &bt, Body::empty())).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _, _) = call(&e, req("GET", &format!("{base}/t.db"), &at, Body::empty())).await;
+    assert_eq!(s, StatusCode::OK);
+
+    // Deleting a user removes their rows from app databases.
+    let (s, _) = ui_post(
+        &e,
+        &session(&e, root).await,
+        "/ui/admin/users/delete",
+        json!({"id": bob, "confirm": "bob"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let db = e
+        .state
+        .app_store(id.parse().unwrap())
+        .files_dir()
+        .join("t.db");
+    let c = rusqlite::Connection::open(db).unwrap();
+    let n: i64 = c
+        .query_row(
+            "SELECT count(*) FROM todos WHERE _owner = ?1",
+            [bob.to_string()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 0);
+    let n: i64 = c
+        .query_row("SELECT count(*) FROM todos", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 1);
+}
+
+#[tokio::test]
+async fn app_tokens_reach_only_their_own_app_storage() {
+    let e = env();
+    let root = admin(&e, "root").await;
+    let rt = token(&e, root, "files:write db:write").await;
+    let u = user(&e, "alice").await;
+    let cookie = session(&e, u).await;
+    let other = "6f3c3c55-6a51-4d55-9a8e-1b8f1d0b7a03";
+    register(&e, &rt, other, "https://other.example").await;
+
+    // Before the app is registered, its token can't use app storage; an admin's can register it.
+    let t = app_token(&e, &cookie, &[("scope", "db:write")]).await;
+    let (s, _, b) = call(
+        &e,
+        req("GET", &format!("/api/v1/apps/{APP_ID}"), &t, Body::empty()),
+    )
+    .await;
+    assert_eq!(
+        (s, j(&b)["error"]["code"].clone()),
+        (StatusCode::NOT_FOUND, json!("app_not_registered"))
+    );
+    let (s, _, _) = call(
+        &e,
+        req(
+            "POST",
+            &format!("/api/v1/apps/{APP_ID}?op=register"),
+            &t,
+            Body::empty(),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let admin_cookie = session(&e, root).await;
+    let admin_app = app_token(&e, &admin_cookie, &[("scope", "db:write")]).await;
+    let (s, _, b) = call(
+        &e,
+        req(
+            "POST",
+            &format!("/api/v1/apps/{APP_ID}?op=register"),
+            &admin_app,
+            Body::empty(),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CREATED, "{}", String::from_utf8_lossy(&b));
+    let b = j(&b);
+    assert_eq!(b["origin"], APP);
+    assert_eq!(b["name"], APP_NAME);
+
+    let (s, _, _) = call(
+        &e,
+        req("GET", &format!("/api/v1/apps/{APP_ID}"), &t, Body::empty()),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _, _) = call(
+        &e,
+        req("GET", &format!("/api/v1/apps/{other}"), &t, Body::empty()),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _, _) = call(
+        &e,
+        app_op(
+            &format!("/api/v1/apps/{other}/files"),
+            "t.db",
+            "select",
+            &t,
+            json!({"table": "x"}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+
+    // Once registered, only the registered origin can sign in with the id.
+    let (s, b) = consent(&e, &cookie, &[("app_id", other)]).await;
+    assert_eq!(s, StatusCode::OK);
+    let to = b["redirect"].as_str().unwrap_or_else(|| panic!("{b}"));
+    assert_eq!(query_param(to, "error").as_deref(), Some("invalid_request"));
+}
+
+#[tokio::test]
+async fn ui_app_storage() {
+    let e = env();
+    let root = admin(&e, "root").await;
+    let alice = user(&e, "alice").await;
+    let bob = user(&e, "bob").await;
+    let rc = session(&e, root).await;
+    let ac = session(&e, alice).await;
+    let bc = session(&e, bob).await;
+
+    // Admins register apps and pick owners.
+    let (s, b) = ui_post(
+        &e,
+        &ac,
+        "/ui/admin/apps/create",
+        json!({"name": "T", "origin": "https://t.example"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN, "{b}");
+    let (s, b) = ui_post(
+        &e,
+        &rc,
+        "/ui/admin/apps/create",
+        json!({"name": "T", "origin": "https://t.example/"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let id = b["id"].as_str().unwrap().to_string();
+    let (s, _) = ui_post(
+        &e,
+        &rc,
+        "/ui/admin/apps/owner",
+        json!({"id": id, "username": "alice", "owner": true}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (_, b) = ui_get(&e, &rc, "/ui/apps").await;
+    assert_eq!(b["apps"][0]["origin"], "https://t.example");
+    assert_eq!(b["apps"][0]["owners"][0]["username"], "alice");
+    let (_, b) = ui_get(&e, &ac, "/ui/apps").await;
+    assert_eq!(b["apps"][0]["manage"], true);
+    assert!(b["apps"][0].get("owners").is_none());
+    // Bob hasn't signed in to it, so it isn't listed for him (but he can still open it).
+    let (_, b) = ui_get(&e, &bc, "/ui/apps").await;
+    assert_eq!(b["apps"], json!([]));
+
+    // The owner creates a database and fills it through the API.
+    let at = token(&e, alice, "db:write").await;
+    let bt = token(&e, bob, "db:write").await;
+    let base = format!("/api/v1/apps/{id}/files");
+    call(&e, app_op(&base, "t.db", "mkdb", &at, json!({}))).await;
+    let (s, _, _) = call(&e, app_op(&base, "t.db", "migrate", &at, todo_spec(None))).await;
+    assert_eq!(s, StatusCode::OK);
+    for (tok, who) in [(&at, "alice"), (&bt, "bob")] {
+        call(
+            &e,
+            app_op(
+                &base,
+                "t.db",
+                "insert",
+                tok,
+                json!({"table": "todos", "rows": [{"content": who}]}),
+            ),
+        )
+        .await;
+    }
+
+    // Others see their own rows, read-only, and only tables of owned rows.
+    let (s, b) = ui_get(&e, &bc, &format!("/ui/files?app={id}")).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    assert_eq!(b["editable"], false);
+    assert_eq!(b["rows_only"], true);
+    assert_eq!(b["app"]["name"], "T");
+    let (s, b) = ui_get(&e, &bc, &format!("/ui/db?app={id}&path=t.db&table=todos")).await;
+    assert_eq!(s, StatusCode::OK, "{b}");
+    let tables: Vec<_> = b["tables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].clone())
+        .collect();
+    assert_eq!(tables, [json!("posts"), json!("todos")]);
+    let cells: Vec<_> = b["table"]["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["cells"][2]["text"].clone())
+        .collect();
+    assert_eq!(cells, [json!("bob")]);
+    assert_eq!(b["writable"], false);
+    let (s, _) = ui_post(
+        &e,
+        &bc,
+        "/ui/db/sql",
+        json!({"app": id, "path": "t.db", "sql": "SELECT * FROM todos"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _) = ui_get(
+        &e,
+        &bc,
+        &format!("/ui/db/row?app={id}&path=t.db&table=todos&key=%5B1%5D"),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _, _) = get_page(&e, &bc, &format!("/apps/{id}/raw/t.db")).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _) = ui_post(
+        &e,
+        &bc,
+        "/ui/new",
+        json!({"app": id, "dir": "", "name": "x", "kind": "folder"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+
+    // Owners see and change everything.
+    let (_, b) = ui_get(&e, &ac, &format!("/ui/db?app={id}&path=t.db&table=todos")).await;
+    assert_eq!(b["table"]["rows"].as_array().unwrap().len(), 2);
+    assert_eq!(b["writable"], true);
+    let (s, b) = ui_post(
+        &e,
+        &ac,
+        "/ui/db/sql",
+        json!({"app": id, "path": "t.db", "sql": "SELECT count(*) FROM todos"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(b["result"]["rows"][0][0]["text"], "2");
+    let (s, _) = ui_post(
+        &e,
+        &ac,
+        "/ui/new",
+        json!({"app": id, "dir": "", "name": "x", "kind": "folder"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _, _) = get_page(&e, &ac, &format!("/apps/{id}/raw/t.db")).await;
+    assert_eq!(s, StatusCode::OK);
+    // ...and it didn't land in alice's own files.
+    let (_, b) = ui_get(&e, &ac, "/ui/files").await;
+    assert_eq!(b["entries"], json!([]));
+
+    // Deleting the app takes its storage with it.
+    let (s, _) = ui_post(
+        &e,
+        &rc,
+        "/ui/admin/apps/delete",
+        json!({"id": id, "confirm": "nope"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, _) = ui_post(
+        &e,
+        &rc,
+        "/ui/admin/apps/delete",
+        json!({"id": id, "confirm": "T"}),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(!e.state.app_store(id.parse().unwrap()).root.exists());
+    let (s, _, _) = call(
+        &e,
+        app_op(&base, "t.db", "select", &bt, json!({"table": "todos"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+}

@@ -9,12 +9,15 @@ import '../style.css'
 
 declare const BISONBASE_URL: string // filled in by server.ts
 
-// The app's id never changes: each user's data lives in apps/f1487da1-…/ in their account.
-// By default BisonBase looks for the server at /bb on the page's origin; here it's on port 8080.
+// The app's id never changes. By default BisonBase looks for the server at /bb on the page's
+// origin; here it's on port 8080.
 const bb = new BisonBase('f1487da1-14ff-4998-a2c4-90b6353fe8c3', 'React Todo', { url: BISONBASE_URL })
 
-// Created (or given new columns) in the user's own database when they sign in.
-const todos = bb.createUserDb('todos').createTable('todos', {
+// One database in the app's own storage, shared by everyone who uses it. Each row belongs to the
+// user who added it, and users only see their own (the table is private). The first time an
+// admin signs in, the app is registered and the table created (or given new columns later).
+// For a separate database in each user's own account instead, use bb.createUserDb('todos').
+const todos = bb.createAppDb('todos').createTable('todos', {
   content: 'text',
   done: ['boolean', false],
 })

@@ -1,8 +1,9 @@
 import { useEffect, type ReactNode } from 'react'
 import { toLogin, useApi, type Me, type Session } from './api.ts'
 import { ErrorPage, Flash, Header, Loading, type Section } from './components.tsx'
-import { decodePath } from './format.ts'
+import { appTree, decodePath, OWN_TREE, userTree } from './format.ts'
 import { Admin } from './pages/Admin.tsx'
+import { Apps } from './pages/Apps.tsx'
 import { Authorize } from './pages/Authorize.tsx'
 import { Files } from './pages/Files.tsx'
 import { Login, Recover, Signup } from './pages/Account.tsx'
@@ -30,6 +31,8 @@ function route(path: string, session: Session): Route | null {
       return { section: 'settings', auth: 'user', render: () => <Settings /> }
     case '/admin':
       return { section: 'admin', auth: 'admin', render: (me) => <Admin me={me} /> }
+    case '/apps':
+      return { section: 'apps', auth: 'user', render: (me) => <Apps me={me} /> }
     case '/admin/db':
       return { section: 'admin', auth: 'admin', render: () => <SystemDb /> }
     case '/oauth/authorize':
@@ -37,7 +40,7 @@ function route(path: string, session: Session): Route | null {
   }
   if (path === '/files' || path.startsWith('/files/')) {
     const p = decodePath(path.slice('/files'.length))
-    return { section: 'files', auth: 'user', render: () => <Files owner={null} path={p} /> }
+    return { section: 'files', auth: 'user', render: () => <Files tree={OWN_TREE} path={p} /> }
   }
   const m = /^\/admin\/users\/([^/]+)\/files(\/.*)?$/.exec(path)
   if (m) {
@@ -45,8 +48,13 @@ function route(path: string, session: Session): Route | null {
     return {
       section: 'admin',
       auth: 'admin',
-      render: (me) => (m[1] === me.id ? <Redirect to={`/files/${m[2]?.slice(1) ?? ''}`} /> : <Files owner={m[1]} path={p} />),
+      render: (me) => (m[1] === me.id ? <Redirect to={`/files/${m[2]?.slice(1) ?? ''}`} /> : <Files tree={userTree(m[1])} path={p} />),
     }
+  }
+  const a = /^\/apps\/([^/]+)\/files(\/.*)?$/.exec(path)
+  if (a) {
+    const p = decodePath(a[2] ?? '')
+    return { section: 'apps', auth: 'user', render: () => <Files tree={appTree(a[1])} path={p} /> }
   }
   return null
 }

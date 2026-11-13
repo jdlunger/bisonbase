@@ -51,3 +51,22 @@ test('row types', () => {
   }
   void check
 })
+
+test('app table row types', () => {
+  const bb = new BisonBase('00000000-0000-4000-8000-000000000000', 'Types', { url: 'http://x', token: 't' })
+  const posts = bb.createAppDb('types').createTable('posts', { body: 'text' }, { sharing: 'shared' })
+  type Post = RowOf<typeof posts>
+  assertType<Equal<Post, { id: number; body: string } & { _owner: string }>>()
+  type NewPost = InsertOf<typeof posts>
+  assertType<Equal<keyof NewPost, 'id' | 'body'>>()
+  const check = () => {
+    void posts.select({ where: { _owner: 'u' }, orderBy: '_owner' })
+    // @ts-expect-error _owner is set by the server
+    void posts.insert({ body: 'a', _owner: 'u' })
+    // @ts-expect-error _owner can't be changed
+    void posts.update({}, { _owner: 'u' })
+    // @ts-expect-error sharing is private or shared
+    bb.createAppDb('types2').createTable('t', { a: 'text' }, { sharing: 'public' })
+  }
+  void check
+})

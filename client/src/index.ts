@@ -1,17 +1,23 @@
 export {
   ApiError,
+  AppDb,
   BisonBase,
+  Database,
   LiveQuery,
   NotSignedInError,
   SchemaError,
   Table,
   UserDb,
+  type AppInfo,
+  type AppTableOptions,
   type AuthState,
+  type OwnedRow,
   type BisonBaseOptions,
   type QueryState,
   type InsertOf,
   type RowOf,
 } from './client.ts'
+export type { Sharing } from './table.ts'
 export type {
   ColumnSpec,
   ColumnType,

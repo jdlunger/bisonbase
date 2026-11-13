@@ -1,11 +1,12 @@
 // The client: BisonBase (sign-in and the connection to the server), UserDb (one SQLite file
-// per user) and Table (typed select / insert / update / delete, plus live queries that the
-// server keeps up to date).
+// per user), AppDb (one SQLite file in the app's own storage, shared by all its users, where
+// each row belongs to a user) and Table (typed select / insert / update / delete, plus live
+// queries that the server keeps up to date).
 
 import { revoke, startSignIn, takeSignInResponse } from './auth.ts'
 import { deleteRequest, insertRequest, selectRequest, updateRequest } from './ops.ts'
 import { migrateRequest, SchemaError } from './schema.ts'
-import { checkName, parseTable, type TableDef } from './table.ts'
+import { checkName, parseTable, type Sharing, type TableDef } from './table.ts'
 import type { Columns, InsertFor, RowFor, SelectOptions, UpdateFor, Where, Wire } from './types.ts'
 import { decode } from './values.ts'
 import { watch } from './watch.ts'
@@ -45,6 +46,18 @@ export class NotSignedInError extends Error {
   constructor() {
     super('Not signed in')
   }
+}
+
+/** A registered app, and what the signed-in user may do with its storage. */
+export interface AppInfo {
+  id: string
+  name: string
+  /** The only origin that may sign in with the app's id. */
+  origin: string
+  /** The user may create databases and change tables in the app's storage. */
+  owner: boolean
+  /** The signed-in user. Rows they own have this `_owner`. */
+  user: { id: string; username: string }
 }
 
 /** Rows as the server sends them: column names, then values in wire form. */
@@ -115,7 +128,7 @@ export class BisonBase {
   /** Bumped whenever the token changes, so results fetched with an old token are dropped. */
   #epoch = 0
   #authListeners = new Set<() => void>()
-  #dbs = new Map<string, UserDb>()
+  #dbs = new Map<string, Database>()
   #queries = new Map<string, LiveQuery<any>>()
 
   /**
@@ -197,11 +210,30 @@ export class BisonBase {
    * in their account. Only that user can read or change it.
    */
   createUserDb(name: string): UserDb {
-    if (!/^[A-Za-z0-9_-]+$/.test(name)) throw new Error(`Database name "${name}" must be letters, digits, "_" and "-"`)
-    if (this.#dbs.has(name)) throw new Error(`Database "${name}" was already created`)
-    const db = new UserDb(this, name)
-    this.#dbs.set(name, db)
+    return this.#addDb(`user:${name}`, new UserDb(this, name))
+  }
+
+  /**
+   * A database in the app's own storage, shared by everyone who uses the app. Each row belongs
+   * to the user who inserted it: users read their own rows (and every row of tables declared
+   * `shared`), and only change their own. The app must be registered by a server admin (it is
+   * registered automatically when an admin signs in to it), and only the app's owners can create
+   * the database and change its tables, which happens when one of them signs in.
+   */
+  createAppDb(name: string): AppDb {
+    return this.#addDb(`app:${name}`, new AppDb(this, name))
+  }
+
+  #addDb<D extends Database>(key: string, db: D): D {
+    if (!/^[A-Za-z0-9_-]+$/.test(db.name)) throw new Error(`Database name "${db.name}" must be letters, digits, "_" and "-"`)
+    if (this.#dbs.has(key)) throw new Error(`Database "${db.name}" was already created`)
+    this.#dbs.set(key, db)
     return db
+  }
+
+  /** The app's registration, and what the signed-in user may do with its storage. */
+  async appInfo(): Promise<AppInfo> {
+    return this._request(`apps/${this.appId}`, null, undefined, 'GET')
   }
 
   #setAuth(state: AuthState) {
@@ -229,7 +261,7 @@ export class BisonBase {
   }
 
   /** @internal A cached live query, shared by everything that asks for the same rows. */
-  _liveQuery<R>(key: string, run: () => Promise<R[]>, table: Table<any>): LiveQuery<R> {
+  _liveQuery<R>(key: string, run: () => Promise<R[]>, table: Table<any, any>): LiveQuery<R> {
     let q = this.#queries.get(key)
     if (!q) {
       q = new LiveQuery(this, run, table, () => this.#queries.delete(key))
@@ -242,7 +274,7 @@ export class BisonBase {
    * @internal Mark live queries on `tables` of `db` (by name, or every table) stale, and reload
    * the ones in use.
    */
-  _invalidate(db: UserDb, tables?: readonly string[]) {
+  _invalidate(db: Database, tables?: readonly string[]) {
     const names = tables && new Set(tables.map((t) => t.toLowerCase()))
     for (const q of this.#queries.values()) {
       if (q.table.db === db && (!names || names.has(q.table.name.toLowerCase()))) q._invalidate()
@@ -259,9 +291,12 @@ export class BisonBase {
     return this.#auth.status !== 'signed-out'
   }
 
-  /** @internal POST an op to the files API, after any pending sign-in. */
-  async _request(path: string, op: string, body?: unknown): Promise<any> {
-    const res = await this._fetch(path, op, { method: 'POST', body })
+  /**
+   * @internal Call the API (`path` is relative to `/api/v1/`) after any pending sign-in: POST an
+   * op by default.
+   */
+  async _request(path: string, op: string | null, body?: unknown, method = 'POST'): Promise<any> {
+    const res = await this._fetch(path, op, { method, body })
     const json = await res.json().catch(() => ({}))
     if (!res.ok) {
       const code = json.error?.code ?? 'unknown'
@@ -272,14 +307,14 @@ export class BisonBase {
     return json
   }
 
-  /** @internal Call the files API with the token, signing out if the server rejects it. */
-  async _fetch(path: string, op: string, init: { method: string; body?: unknown; signal?: AbortSignal }): Promise<Response> {
+  /** @internal Call the API with the token, signing out if the server rejects it. */
+  async _fetch(path: string, op: string | null, init: { method: string; body?: unknown; signal?: AbortSignal }): Promise<Response> {
     await this.#settled
     const token = this.#token
     if (!token) throw new NotSignedInError()
     const headers: Record<string, string> = { authorization: `Bearer ${token}` }
     if (init.body !== undefined) headers['content-type'] = 'application/json'
-    const res = await fetch(`${this.url}/api/v1/files/${path}?op=${op}`, {
+    const res = await fetch(`${this.url}/api/v1/${path}${op ? `?op=${op}` : ''}`, {
       method: init.method,
       headers,
       body: init.body === undefined ? undefined : JSON.stringify(init.body),
@@ -301,9 +336,9 @@ export class LiveQuery<R> {
   #running = false
   #again = false
   #gc: ReturnType<typeof setTimeout> | undefined
-  readonly table: Table<any>
+  readonly table: Table<any, any>
 
-  constructor(bb: BisonBase, run: () => Promise<R[]>, table: Table<any>, dispose: () => void) {
+  constructor(bb: BisonBase, run: () => Promise<R[]>, table: Table<any, any>, dispose: () => void) {
     this.#bb = bb
     this.#run = run
     this.table = table
@@ -381,13 +416,13 @@ export class LiveQuery<R> {
   }
 }
 
-/** A database each signed-in user has their own copy of. Make one with `bb.createUserDb`. */
-export class UserDb {
+/** What `UserDb` and `AppDb` have in common: tables, set-up, and the change stream. */
+export abstract class Database {
   readonly bb: BisonBase
   readonly name: string
-  /** Path within the user's files, e.g. `apps/<appId>/todos.db`. */
-  readonly path: string
-  #tables = new Map<string, Table<any>>()
+  /** @internal Where the API serves it, relative to `/api/v1/`. */
+  abstract readonly _api: string
+  #tables = new Map<string, Table<any, any>>()
   #ready: Promise<void> | null = null
   /** How many live queries on this database are in use. */
   #watchers = 0
@@ -395,31 +430,25 @@ export class UserDb {
   /** @internal Whether the change stream is connected. */
   _live = false
 
-  /** @internal Use `bb.createUserDb`. */
   constructor(bb: BisonBase, name: string) {
     this.bb = bb
     this.name = name
-    this.path = `apps/${bb.appId}/${name}.db`
   }
 
-  /**
-   * Declare a table. It's created, or new columns are added, the first time it's used after
-   * signing in. Every table also has an `id` integer primary key.
-   *
-   * ```ts
-   * const todos = db.createTable("todos", { content: "text", done: ["boolean", false] })
-   * ```
-   */
-  createTable<const C extends Columns>(name: string, columns: C): Table<C> {
-    checkName('Table', name)
-    if ([...this.#tables.keys()].some((t) => t.toLowerCase() === name.toLowerCase())) {
-      throw new Error(`Table "${name}" was already created in ${this.name}`)
+  /** @internal */
+  _addTable<C extends Columns, R>(def: TableDef): Table<C, R> {
+    checkName('Table', def.name)
+    if ([...this.#tables.keys()].some((t) => t.toLowerCase() === def.name.toLowerCase())) {
+      throw new Error(`Table "${def.name}" was already created in ${this.name}`)
     }
-    const table = new Table<C>(this, parseTable(name, columns))
-    this.#tables.set(name, table)
+    const table = new Table<C, R>(this, def)
+    this.#tables.set(def.name, table)
     this.#ready = null
     return table
   }
+
+  /** @internal Create the database if need be. */
+  protected abstract _create(): Promise<void>
 
   /** @internal Forget that the schema was set up, and reconnect the change stream (the user changed). */
   _reset() {
@@ -444,7 +473,7 @@ export class UserDb {
     const stop = watch({
       open: async (signal) => {
         await this._ensure()
-        return this.bb._fetch(this.path, 'watch', { method: 'GET', signal })
+        return this.bb._fetch(this._api, 'watch', { method: 'GET', signal })
       },
       // Signed out, or the tables can't be set up: retrying won't help.
       fatal: (e) => e instanceof NotSignedInError || e instanceof SchemaError,
@@ -483,25 +512,113 @@ export class UserDb {
   }
 
   async #setUp(): Promise<void> {
-    await this.bb._request(this.path, 'mkdb')
-    await this.bb._request(this.path, 'migrate', migrateRequest([...this.#tables.values()].map((t) => t.def)))
+    await this._create()
+    await this.bb._request(this._api, 'migrate', migrateRequest([...this.#tables.values()].map((t) => t.def)))
   }
 
   /** @internal Run a relational op once the tables are set up. */
   async _op(op: 'select' | 'insert' | 'update' | 'delete', body: unknown): Promise<any> {
     await this._ensure()
-    return this.bb._request(this.path, op, body)
+    return this.bb._request(this._api, op, body)
   }
 }
 
-/** A table in a database. Make one with `db.createTable`. */
-export class Table<C extends Columns> {
-  readonly db: UserDb
+/** A database each signed-in user has their own copy of. Make one with `bb.createUserDb`. */
+export class UserDb extends Database {
+  /** Path within the user's files, e.g. `apps/<appId>/todos.db`. */
+  readonly path: string
+  readonly _api: string
+
+  /** @internal Use `bb.createUserDb`. */
+  constructor(bb: BisonBase, name: string) {
+    super(bb, name)
+    this.path = `apps/${bb.appId}/${name}.db`
+    this._api = `files/${this.path}`
+  }
+
+  /**
+   * Declare a table. It's created, or new columns are added, the first time it's used after
+   * signing in. Every table also has an `id` integer primary key.
+   *
+   * ```ts
+   * const todos = db.createTable("todos", { content: "text", done: ["boolean", false] })
+   * ```
+   */
+  createTable<const C extends Columns>(name: string, columns: C): Table<C> {
+    return this._addTable<C, RowFor<C>>(parseTable(name, columns))
+  }
+
+  protected async _create() {
+    await this.bb._request(this._api, 'mkdb')
+  }
+}
+
+export interface AppTableOptions {
+  /**
+   * Who may read the table's rows: `"private"` (the default), only the user who owns each row;
+   * `"shared"`, everyone who uses the app. Either way only a row's owner may change or delete it.
+   */
+  sharing?: Sharing
+}
+
+/** A row of an app database's table: its columns, plus `_owner`, the id of the user it belongs to. */
+export type OwnedRow<C> = RowFor<C> & { _owner: string }
+
+/**
+ * A database in the app's own storage, shared by all its users. Make one with `bb.createAppDb`.
+ */
+export class AppDb extends Database {
+  /** Path within the app's storage, e.g. `todos.db`. */
+  readonly path: string
+  readonly _api: string
+
+  /** @internal Use `bb.createAppDb`. */
+  constructor(bb: BisonBase, name: string) {
+    super(bb, name)
+    this.path = `${name}.db`
+    this._api = `apps/${bb.appId}/files/${this.path}`
+  }
+
+  /**
+   * Declare a table. Like `UserDb.createTable`, but every row also has an `_owner`: the id of
+   * the user who inserted it, which the server sets. Only the app's owners can create the table
+   * or add columns; for everyone else, the table must already match.
+   *
+   * ```ts
+   * const posts = db.createTable("posts", { body: "text" }, { sharing: "shared" })
+   * ```
+   */
+  createTable<const C extends Columns>(name: string, columns: C, options: AppTableOptions = {}): Table<C, OwnedRow<C>> {
+    return this._addTable<C, OwnedRow<C>>(parseTable(name, columns, { sharing: options.sharing ?? 'private' }))
+  }
+
+  protected async _create() {
+    try {
+      await this.bb._request(this._api, 'mkdb')
+    } catch (e) {
+      if (!(e instanceof ApiError && e.code === 'app_not_registered')) throw e
+      // Registering works when the signed-in user is an admin; otherwise say what's needed.
+      try {
+        await this.bb._request(`apps/${this.bb.appId}`, 'register', { name: this.bb.appName })
+      } catch (r) {
+        if (r instanceof ApiError && r.status === 403) {
+          throw new ApiError(404, 'app_not_registered', `${this.bb.appName} isn't registered with the server yet; an admin needs to sign in to it once, or register it under Admin`)
+        }
+        throw r
+      }
+      await this.bb._request(this._api, 'mkdb')
+    }
+  }
+}
+
+/** A table in a database. Make one with `db.createTable`. `R` is the type of its rows. */
+export class Table<C extends Columns, R = RowFor<C>> {
+  readonly db: Database
   /** @internal */
   readonly def: TableDef
 
   /** @internal Use `db.createTable`. */
-  constructor(db: UserDb, def: TableDef) {
+  constructor(db: Database, def: TableDef) {
     this.db = db
     this.def = def
   }
@@ -510,25 +627,25 @@ export class Table<C extends Columns> {
     return this.def.name
   }
 
-  #rows(result: Rows): RowFor<C>[] {
+  #rows(result: Rows): R[] {
     const types = result.columns.map((c) => (c === 'id' ? null : this.def.byName.get(c)?.type ?? null))
     return result.rows.map(
-      (row) => Object.fromEntries(row.map((v, i) => [result.columns[i], types[i] ? decode(types[i], v) : v])) as RowFor<C>,
+      (row) => Object.fromEntries(row.map((v, i) => [result.columns[i], types[i] ? decode(types[i], v) : v])) as R,
     )
   }
 
   /** Fetch rows once. For rows that stay up to date in a component, use `useSelect`. */
-  async select(options?: SelectOptions<RowFor<C>>): Promise<RowFor<C>[]> {
+  async select(options?: SelectOptions<R>): Promise<R[]> {
     const result: Rows = await this.db._op('select', selectRequest(this.def, options))
     if (result.truncated) console.warn(`BisonBase: results from ${this.name} were truncated by the server's row limit`)
     return this.#rows(result)
   }
 
   /** Insert a row and return it as stored (with its `id` and defaults). */
-  insert(row: InsertFor<C>): Promise<RowFor<C>>
+  insert(row: InsertFor<C>): Promise<R>
   /** Insert several rows in one transaction. */
-  insert(rows: readonly InsertFor<C>[]): Promise<RowFor<C>[]>
-  async insert(rows: InsertFor<C> | readonly InsertFor<C>[]): Promise<RowFor<C> | RowFor<C>[]> {
+  insert(rows: readonly InsertFor<C>[]): Promise<R[]>
+  async insert(rows: InsertFor<C> | readonly InsertFor<C>[]): Promise<R | R[]> {
     const many = Array.isArray(rows)
     const list = (many ? rows : [rows]) as Record<string, unknown>[]
     const req = insertRequest(this.def, list)
@@ -542,7 +659,7 @@ export class Table<C extends Columns> {
    * Change the rows matching `where` (or the row with that id). Returns how many changed.
    * Pass `{}` to change every row.
    */
-  async update(where: Where<RowFor<C>> | number, changes: UpdateFor<C>): Promise<number> {
+  async update(where: Where<R> | number, changes: UpdateFor<C>): Promise<number> {
     const req = updateRequest(this.def, where, changes as Record<string, unknown>)
     if (!req) return 0
     const { changes: n } = await this.db._op('update', req)
@@ -551,7 +668,7 @@ export class Table<C extends Columns> {
   }
 
   /** Delete the rows matching `where` (or the row with that id). Returns how many were deleted. Pass `{}` to delete every row. */
-  async delete(where: Where<RowFor<C>> | number): Promise<number> {
+  async delete(where: Where<R> | number): Promise<number> {
     if (where === undefined) throw new Error('delete needs a where; pass {} to delete every row')
     const { changes: n } = await this.db._op('delete', deleteRequest(this.def, where))
     this.#changed()
@@ -564,7 +681,7 @@ export class Table<C extends Columns> {
   }
 
   /** The live query for these options, shared with every other user of the same options. */
-  liveQuery(options?: SelectOptions<RowFor<C>>): LiveQuery<RowFor<C>> {
+  liveQuery(options?: SelectOptions<R>): LiveQuery<R> {
     const key = stableKey([this.db.name, this.name, options ?? {}])
     // Validate now so mistakes throw where the query is written, not later in a fetch.
     selectRequest(this.def, options)
@@ -575,12 +692,12 @@ export class Table<C extends Columns> {
    * React hook: the rows matching `options`, kept up to date. Empty while signed out or
    * loading. Needs `import "bisonbase/react"` somewhere in the app.
    */
-  useSelect(options?: SelectOptions<RowFor<C>>): readonly RowFor<C>[] {
+  useSelect(options?: SelectOptions<R>): readonly R[] {
     return this.useSelectState(options).rows
   }
 
   /** React hook: like `useSelect`, plus whether it's loading and the last error. */
-  useSelectState(options?: SelectOptions<RowFor<C>>): QueryState<RowFor<C>> {
+  useSelectState(options?: SelectOptions<R>): QueryState<R> {
     if (!hooks) throw new Error('useSelect needs React: add `import "bisonbase/react"` to your app')
     return hooks.useQuery(this.liveQuery(options))
   }
@@ -589,6 +706,6 @@ export class Table<C extends Columns> {
 export { SchemaError }
 
 /** The row type of a table: `type Todo = RowOf<typeof todos>`. */
-export type RowOf<T> = T extends Table<infer C> ? RowFor<C> : never
+export type RowOf<T> = T extends Table<any, infer R> ? R : never
 /** What a table's `insert` takes. */
-export type InsertOf<T> = T extends Table<infer C> ? InsertFor<C> : never
+export type InsertOf<T> = T extends Table<infer C, any> ? InsertFor<C> : never

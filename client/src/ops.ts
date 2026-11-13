@@ -3,7 +3,7 @@
 // they're written; the server checks names again against the database itself.
 
 import { encode } from './values.ts'
-import type { ColumnDef, TableDef } from './table.ts'
+import { OWNER, type ColumnDef, type TableDef } from './table.ts'
 import type { Wire } from './types.ts'
 
 /** A where clause as sent: values in wire form, operators as is. */
@@ -34,9 +34,11 @@ export interface DeleteRequest {
 }
 
 const ID: ColumnDef = { name: 'id', type: 'integer', nullable: false }
+const OWNER_COL: ColumnDef = { name: OWNER, type: 'text', nullable: false }
 
 function column(table: TableDef, name: string): ColumnDef {
   if (name === 'id') return ID
+  if (name === OWNER && table.owned) return OWNER_COL
   const col = table.byName.get(name)
   if (!col) throw new Error(`Table "${table.name}" has no column "${name}"`)
   return col
@@ -116,7 +118,10 @@ export function selectRequest(table: TableDef, opts: SelectSpec = {}): SelectReq
 
 /** One row to insert, with defaults filled in here so the code's defaults win over the database's. */
 export function insertRow(table: TableDef, row: Record<string, unknown>): Record<string, Wire> {
-  for (const name of Object.keys(row)) column(table, name)
+  for (const name of Object.keys(row)) {
+    if (name === OWNER && table.owned) throw new Error(`${OWNER} is set by the server to the signed-in user`)
+    column(table, name)
+  }
   const out: Record<string, Wire> = {}
   if (row.id !== undefined) out.id = encode('integer', false, row.id, 'id')
   for (const col of table.columns) {
@@ -141,6 +146,7 @@ export function updateRequest(table: TableDef, where: object | number, changes: 
   for (const [name, value] of Object.entries(changes)) {
     if (value === undefined) continue
     if (name === 'id') throw new Error("A row's id can't be changed")
+    if (name === OWNER && table.owned) throw new Error(`A row's ${OWNER} can't be changed`)
     const col = column(table, name)
     set[name] = encode(col.type, col.nullable, value, name)
   }

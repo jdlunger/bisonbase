@@ -3,7 +3,7 @@
 import { useState, type FormEvent } from 'react'
 import { post, useApi, type Settings as Data } from '../api.ts'
 import { act, actionsCell, AppTag, Card, Copyable, flash, labelBlock, listTable, Loading, Secret, Status, TextButton, toolbar, useTitle } from '../components.tsx'
-import { fmtTime, treeHref } from '../format.ts'
+import { fmtTime, OWN_TREE, treeHref } from '../format.ts'
 import { addPasskey, ceremonyError } from '../passkeys.ts'
 import { Link } from '../router.tsx'
 
@@ -130,7 +130,7 @@ function Apps({ data, reload }: Props) {
               </td>
               <td>
                 <Copyable text={a.folder}>
-                  <Link href={treeHref(null, a.folder.slice(1))} title={a.folder}>
+                  <Link href={treeHref(OWN_TREE, a.folder.slice(1))} title={a.folder}>
                     <code className="whitespace-nowrap">/apps/{a.app_id.slice(0, 8)}…</code>
                   </Link>
                 </Copyable>

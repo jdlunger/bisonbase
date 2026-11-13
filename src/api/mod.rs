@@ -1,5 +1,7 @@
+pub mod apps;
 pub mod db;
 pub mod files;
+pub mod target;
 
 use axum::{
     Router,
@@ -40,7 +42,12 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/api/v1/files", file_routes.clone())
         .route("/api/v1/files/", file_routes.clone())
-        .route("/api/v1/files/{*path}", file_routes)
+        .route("/api/v1/files/{*path}", file_routes.clone())
+        // A registered app's own storage, shared by its users.
+        .route("/api/v1/apps/{app}", get(apps::get).post(apps::post))
+        .route("/api/v1/apps/{app}/files", file_routes.clone())
+        .route("/api/v1/apps/{app}/files/", file_routes.clone())
+        .route("/api/v1/apps/{app}/files/{*path}", file_routes)
         // OAuth endpoints that apps call directly: cookie-free, so open to any origin too.
         .route("/oauth/token", post(oauth::token))
         .route("/oauth/revoke", post(oauth::revoke))

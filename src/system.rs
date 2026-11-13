@@ -103,6 +103,25 @@ DELETE FROM oauth_codes;
 -- Account recovery links are invites that add a passkey to an existing user.
 ALTER TABLE invites ADD COLUMN recovers_user TEXT REFERENCES users(id) ON DELETE CASCADE;
 "#,
+    r#"
+-- Apps an admin registered: they get storage of their own (app-owned databases, shared by all
+-- their users, with per-row ownership), and only their origin may sign in with their id.
+CREATE TABLE registered_apps (
+    id         TEXT PRIMARY KEY,
+    name       TEXT NOT NULL,
+    origin     TEXT NOT NULL,
+    created_by TEXT REFERENCES users(id) ON DELETE SET NULL,
+    created_at INTEGER NOT NULL
+);
+-- Users who may manage a registered app's storage (create databases, change tables), besides
+-- admins, who always can.
+CREATE TABLE app_owners (
+    app_id   TEXT NOT NULL REFERENCES registered_apps(id) ON DELETE CASCADE,
+    user_id  TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    added_at INTEGER NOT NULL,
+    PRIMARY KEY (app_id, user_id)
+);
+"#,
 ];
 
 pub fn now() -> i64 {
@@ -183,6 +202,34 @@ pub struct App {
     pub name: String,
     /// `scheme://host[:port]` of the app that registered this id; only it may use the id.
     pub origin: String,
+}
+
+/// An app an admin registered, with storage of its own.
+#[derive(Debug, Clone, Serialize)]
+pub struct RegisteredApp {
+    pub id: Uuid,
+    pub name: String,
+    /// `scheme://host[:port]`: the only origin that may sign in with this app's id.
+    pub origin: String,
+    pub created_at: i64,
+}
+
+/// A user who may manage a registered app's storage.
+#[derive(Debug, Clone, Serialize)]
+pub struct AppOwner {
+    pub id: Uuid,
+    pub username: String,
+}
+
+/// Who a bearer token belongs to, and what it may reach.
+#[derive(Debug, Clone)]
+pub struct TokenInfo {
+    pub user: User,
+    pub scopes: String,
+    /// For tokens issued to an app through OAuth: the app's id.
+    pub app: Option<Uuid>,
+    /// For app tokens: the app's URL (`client_id`).
+    pub client_id: Option<String>,
 }
 
 /// The apps (OAuth clients) a user has authorized, one row per app.
@@ -584,10 +631,7 @@ impl SystemDb {
 
     /// Resolve a bearer token to its user, scope string and (for app tokens) the app it was
     /// issued to, recording last use.
-    pub async fn api_token_user(
-        &self,
-        token: &str,
-    ) -> AppResult<Option<(User, String, Option<Uuid>)>> {
+    pub async fn api_token_user(&self, token: &str) -> AppResult<Option<TokenInfo>> {
         let hash = hash_token(token);
         self.call(move |c| {
             let now = now();
@@ -615,7 +659,7 @@ impl SystemDb {
                 {
                     None
                 }
-                Some((u, scopes, id, _, app)) => {
+                Some((user, scopes, id, client_id, app)) => {
                     // Only write when stale by a minute to avoid a write per request.
                     c.execute(
                         "UPDATE api_tokens SET last_used_at=?2
@@ -623,7 +667,12 @@ impl SystemDb {
                         params![id, now],
                     )?;
                     let app = app.and_then(|a| Uuid::parse_str(&a).ok());
-                    Some((u, scopes, app))
+                    Some(TokenInfo {
+                        user,
+                        scopes,
+                        app,
+                        client_id,
+                    })
                 }
                 None => None,
             })
@@ -813,7 +862,7 @@ impl SystemDb {
     }
 
     /// Record (or rename) an app the user allowed. Fails if another origin already owns the id.
-    pub async fn register_app(
+    pub async fn record_app(
         &self,
         user_id: Uuid,
         app_id: Uuid,
@@ -831,6 +880,205 @@ impl SystemDb {
                     "this app ID belongs to another app".into(),
                 ));
             }
+            Ok(())
+        })
+        .await
+    }
+
+    // ---- registered apps ----
+
+    pub async fn registered_apps(&self) -> AppResult<Vec<RegisteredApp>> {
+        self.call(|c| {
+            let mut st = c.prepare(
+                "SELECT id,name,origin,created_at FROM registered_apps ORDER BY created_at, name",
+            )?;
+            let rows = st.query_map([], registered_app_from_row)?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .await
+    }
+
+    pub async fn registered_app(&self, id: Uuid) -> AppResult<Option<RegisteredApp>> {
+        self.call(move |c| {
+            Ok(c.query_row(
+                "SELECT id,name,origin,created_at FROM registered_apps WHERE id=?1",
+                [id.to_string()],
+                registered_app_from_row,
+            )
+            .optional()?)
+        })
+        .await
+    }
+
+    /// Register an app (admins only; the caller checks). Fails if the id is taken.
+    pub async fn create_registered_app(
+        &self,
+        admin: &User,
+        id: Uuid,
+        name: String,
+        origin: String,
+    ) -> AppResult<RegisteredApp> {
+        let admin = admin.clone();
+        self.call(move |c| {
+            let tx = c.transaction()?;
+            let at = now();
+            let n = tx.execute(
+                "INSERT INTO registered_apps(id,name,origin,created_by,created_at) VALUES(?1,?2,?3,?4,?5)
+                 ON CONFLICT(id) DO NOTHING",
+                params![id.to_string(), name, origin, admin.id.to_string(), at],
+            )?;
+            if n == 0 {
+                return Err(AppError::Conflict("an app with this id is already registered".into()));
+            }
+            audit(
+                &tx,
+                Some(&admin),
+                "register_app",
+                "registered_apps",
+                &id.to_string(),
+                serde_json::json!({ "name": name, "origin": origin }),
+            )?;
+            tx.commit()?;
+            Ok(RegisteredApp {
+                id,
+                name,
+                origin,
+                created_at: at,
+            })
+        })
+        .await
+    }
+
+    /// Forget a registered app and its owners. Its storage is removed separately.
+    pub async fn delete_registered_app(&self, admin: &User, id: Uuid) -> AppResult<()> {
+        let admin = admin.clone();
+        self.call(move |c| {
+            let tx = c.transaction()?;
+            let name: Option<String> = tx
+                .query_row(
+                    "DELETE FROM registered_apps WHERE id=?1 RETURNING name",
+                    [id.to_string()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(name) = name else {
+                return Err(AppError::not_found("no such app"));
+            };
+            audit(
+                &tx,
+                Some(&admin),
+                "delete_app",
+                "registered_apps",
+                &id.to_string(),
+                serde_json::json!({ "name": name }),
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+        .await
+    }
+
+    pub async fn app_owners(&self, app_id: Uuid) -> AppResult<Vec<AppOwner>> {
+        self.call(move |c| {
+            let mut st = c.prepare(
+                "SELECT u.id,u.username FROM app_owners o JOIN users u ON u.id=o.user_id
+                 WHERE o.app_id=?1 ORDER BY u.username",
+            )?;
+            let rows = st.query_map([app_id.to_string()], |r| {
+                Ok(AppOwner {
+                    id: Uuid::parse_str(&r.get::<_, String>(0)?).unwrap_or_default(),
+                    username: r.get(1)?,
+                })
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .await
+    }
+
+    /// Whether `user` was made an owner of the app (admins aren't listed, but may manage any app).
+    pub async fn is_app_owner(&self, app_id: Uuid, user_id: Uuid) -> AppResult<bool> {
+        self.call(move |c| {
+            Ok(c.query_row(
+                "SELECT 1 FROM app_owners WHERE app_id=?1 AND user_id=?2",
+                params![app_id.to_string(), user_id.to_string()],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+        })
+        .await
+    }
+
+    /// Registered apps the user owns, or has signed in to.
+    pub async fn registered_apps_for(
+        &self,
+        user_id: Uuid,
+    ) -> AppResult<Vec<(RegisteredApp, bool)>> {
+        self.call(move |c| {
+            let mut st = c.prepare(
+                "SELECT r.id,r.name,r.origin,r.created_at,
+                        EXISTS(SELECT 1 FROM app_owners o WHERE o.app_id=r.id AND o.user_id=?1)
+                 FROM registered_apps r
+                 WHERE EXISTS(SELECT 1 FROM app_owners o WHERE o.app_id=r.id AND o.user_id=?1)
+                    OR EXISTS(SELECT 1 FROM apps a WHERE a.id=r.id AND a.user_id=?1)
+                 ORDER BY r.name",
+            )?;
+            let rows = st.query_map([user_id.to_string()], |r| {
+                Ok((registered_app_from_row(r)?, r.get(4)?))
+            })?;
+            Ok(rows.collect::<Result<_, _>>()?)
+        })
+        .await
+    }
+
+    /// Make `user` an owner of the app, or (`owner` false) stop them being one.
+    pub async fn set_app_owner(
+        &self,
+        admin: &User,
+        app_id: Uuid,
+        user: &User,
+        owner: bool,
+    ) -> AppResult<()> {
+        let (admin, user) = (admin.clone(), user.clone());
+        self.call(move |c| {
+            let tx = c.transaction()?;
+            let exists = tx
+                .query_row(
+                    "SELECT 1 FROM registered_apps WHERE id=?1",
+                    [app_id.to_string()],
+                    |_| Ok(()),
+                )
+                .optional()?;
+            if exists.is_none() {
+                return Err(AppError::not_found("no such app"));
+            }
+            let n = if owner {
+                tx.execute(
+                    "INSERT INTO app_owners(app_id,user_id,added_at) VALUES(?1,?2,?3)
+                     ON CONFLICT DO NOTHING",
+                    params![app_id.to_string(), user.id.to_string(), now()],
+                )?
+            } else {
+                tx.execute(
+                    "DELETE FROM app_owners WHERE app_id=?1 AND user_id=?2",
+                    params![app_id.to_string(), user.id.to_string()],
+                )?
+            };
+            if n > 0 {
+                audit(
+                    &tx,
+                    Some(&admin),
+                    if owner {
+                        "add_app_owner"
+                    } else {
+                        "remove_app_owner"
+                    },
+                    "app_owners",
+                    &format!("{app_id}/{}", user.id),
+                    serde_json::json!({ "username": user.username }),
+                )?;
+            }
+            tx.commit()?;
             Ok(())
         })
         .await
@@ -1044,6 +1292,15 @@ impl SystemDb {
         })
         .await
     }
+}
+
+fn registered_app_from_row(r: &rusqlite::Row) -> rusqlite::Result<RegisteredApp> {
+    Ok(RegisteredApp {
+        id: Uuid::parse_str(&r.get::<_, String>(0)?).unwrap_or_default(),
+        name: r.get(1)?,
+        origin: r.get(2)?,
+        created_at: r.get(3)?,
+    })
 }
 
 /// Record an admin action in `audit_log` (`None`: from the command line).

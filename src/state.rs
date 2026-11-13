@@ -25,6 +25,8 @@ pub struct AppState {
     pub webauthn: Arc<Webauthn>,
     pub ceremonies: Arc<Ceremonies>,
     pub locks: Arc<UserLocks>,
+    /// Like `locks`, for registered apps' own storage.
+    pub app_locks: Arc<UserLocks>,
     pub limiter: Arc<crate::ratelimit::RateLimiter>,
     /// Cancelled when the server starts shutting down, so long-lived responses (change streams)
     /// end instead of holding up a graceful shutdown.
@@ -43,13 +45,28 @@ impl AppState {
             webauthn: Arc::new(webauthn),
             ceremonies: Arc::new(Ceremonies::default()),
             locks: Arc::new(UserLocks::default()),
+            app_locks: Arc::new(UserLocks::default()),
             limiter: Default::default(),
             closing: Default::default(),
         })
     }
 
+    /// A user's own files.
     pub fn store(&self, user_id: uuid::Uuid) -> UserStore {
-        UserStore::new(&self.cfg.data_dir, user_id, self.locks.get(user_id))
+        UserStore::new(
+            self.cfg.data_dir.join("users").join(user_id.to_string()),
+            self.cfg.limits.user_quota_bytes,
+            self.locks.get(user_id),
+        )
+    }
+
+    /// A registered app's own storage, shared by all its users: `<data>/apps/<id>/`.
+    pub fn app_store(&self, app_id: uuid::Uuid) -> UserStore {
+        UserStore::new(
+            self.cfg.data_dir.join("apps").join(app_id.to_string()),
+            self.cfg.limits.app_quota_bytes,
+            self.app_locks.get(app_id),
+        )
     }
 
     pub fn sql_limits(&self) -> SqlLimits {

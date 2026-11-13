@@ -238,10 +238,12 @@ impl UsageCache {
     }
 }
 
-/// Paths for one user's storage area.
+/// Paths for one storage area: a user's, or a registered app's own.
 #[derive(Debug, Clone)]
 pub struct UserStore {
     pub root: PathBuf,
+    /// How many bytes the area may hold.
+    pub quota: u64,
     pub lock: Arc<RwLock<()>>,
     pub usage_cache: Arc<UsageCache>,
     pub changes: broadcast::Sender<DbChange>,
@@ -257,9 +259,11 @@ impl Drop for Invalidate<'_> {
 }
 
 impl UserStore {
-    pub fn new(data_dir: &Path, user_id: uuid::Uuid, h: UserHandles) -> Self {
+    /// The storage area at `root` (holding `files/` and `tmp/`).
+    pub fn new(root: PathBuf, quota: u64, h: UserHandles) -> Self {
         Self {
-            root: data_dir.join("users").join(user_id.to_string()),
+            root,
+            quota,
             lock: h.lock,
             usage_cache: h.usage,
             changes: h.changes,
@@ -598,7 +602,7 @@ mod tests {
     #[tokio::test]
     async fn sqlite_sidecars_follow_their_database() {
         let dir = tempfile::tempdir().unwrap();
-        let store = UserStore::new(dir.path(), uuid::Uuid::new_v4(), Default::default());
+        let store = UserStore::new(dir.path().to_path_buf(), u64::MAX, Default::default());
         store.ensure().await.unwrap();
         let f = store.files_dir();
         let mut db = SQLITE_MAGIC.to_vec();

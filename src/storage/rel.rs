@@ -3,8 +3,11 @@
 //!
 //! No caller-supplied SQL reaches SQLite. Every table and column named in a request is looked up
 //! in the database's schema and quoted, and every value is a bound parameter. The database
-//! itself is resolved by the caller inside the requesting user's own file tree, so a request can
-//! only ever address that user's data.
+//! itself is resolved by the caller: inside the requesting user's own file tree ([`Access::All`]),
+//! or in a registered app's own storage ([`Access::Rows`]). App databases are shared by all of
+//! the app's users, so each of their rows belongs to one user (the `_owner` column, which the
+//! server fills in), and requests only reach the caller's own rows, plus, for reading, every
+//! row of tables declared `shared`.
 //!
 //! Everything here is synchronous; callers run it on a blocking thread.
 
@@ -19,6 +22,112 @@ use super::{
     },
 };
 use crate::error::{AppError, AppResult};
+
+// ---- row ownership ----
+
+/// The column holding a row's owner (a user id) in app databases.
+pub const OWNER_COLUMN: &str = "_owner";
+/// Where app databases record each table's sharing policy. Hidden from the API.
+pub const META_TABLE: &str = "_bisonbase_tables";
+
+/// Tables the server keeps for itself: never reachable through the API, and not listed.
+pub fn is_internal(table: &str) -> bool {
+    table
+        .get(..10)
+        .is_some_and(|p| p.eq_ignore_ascii_case("_bisonbase"))
+}
+
+/// Which rows a request may reach.
+#[derive(Debug, Clone)]
+pub enum Access {
+    /// Every row: a database in the user's own files.
+    All,
+    /// An app database: reads see the user's own rows (and every row of shared tables), and
+    /// writes only touch, and create, rows owned by `user`.
+    Rows { user: String },
+}
+
+/// Who may read a table's rows in an app database. Only a row's owner may change it either way.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Sharing {
+    /// Each user sees only their own rows.
+    #[default]
+    Private,
+    /// Every user of the app sees every row.
+    Shared,
+}
+
+impl Sharing {
+    fn as_str(self) -> &'static str {
+        match self {
+            Sharing::Private => "private",
+            Sharing::Shared => "shared",
+        }
+    }
+}
+
+/// A table's sharing policy in an app database (private unless recorded otherwise).
+pub fn sharing(conn: &Connection, table: &str) -> AppResult<Sharing> {
+    if sql::table(conn, META_TABLE)?.is_none() {
+        return Ok(Sharing::Private);
+    }
+    let v: Option<String> = conn
+        .query_row(
+            &format!(
+                "SELECT sharing FROM {} WHERE name = ?1 COLLATE NOCASE",
+                quote_ident(META_TABLE)
+            ),
+            [table],
+            |r| r.get(0),
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            e => Err(sql_err(e)),
+        })?;
+    Ok(match v.as_deref() {
+        Some("shared") => Sharing::Shared,
+        _ => Sharing::Private,
+    })
+}
+
+/// The owner a request is limited to on `t`, if any. `reading`: shared tables are readable in
+/// full.
+fn owner_filter(
+    conn: &Connection,
+    t: &TableSchema,
+    access: &Access,
+    reading: bool,
+) -> AppResult<Option<String>> {
+    let Access::Rows { user } = access else {
+        return Ok(None);
+    };
+    if !has_column(t, OWNER_COLUMN) {
+        return Err(AppError::forbidden(format!(
+            "\"{}\" has no {OWNER_COLUMN} column, so the app's users can't use it",
+            t.name
+        )));
+    }
+    if reading && sharing(conn, &t.name)? == Sharing::Shared {
+        return Ok(None);
+    }
+    Ok(Some(user.clone()))
+}
+
+fn has_column(t: &TableSchema, name: &str) -> bool {
+    t.columns.iter().any(|c| c.name.eq_ignore_ascii_case(name))
+}
+
+/// Refuse a request that tries to set `_owner` itself.
+fn check_not_owner(access: &Access, name: &str) -> AppResult<()> {
+    if matches!(access, Access::Rows { .. }) && name.eq_ignore_ascii_case(OWNER_COLUMN) {
+        return Err(AppError::bad(format!(
+            "{OWNER_COLUMN} is set by the server to the signed-in user"
+        )));
+    }
+    Ok(())
+}
 
 // ---- requests ----
 
@@ -93,6 +202,9 @@ pub struct Migrate {
 pub struct TableSpec {
     pub name: String,
     pub columns: Vec<ColumnSpec>,
+    /// App databases only: who may read the table's rows. Default: private.
+    #[serde(default)]
+    pub sharing: Option<Sharing>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,13 +286,14 @@ pub struct Migrated {
 
 // ---- operations ----
 
-pub fn select(c: &UserConn, q: &Select) -> AppResult<Rows> {
+pub fn select(c: &UserConn, access: &Access, q: &Select) -> AppResult<Rows> {
     let max_rows = c.max_rows();
     c.guarded(|conn| {
         let t = find(conn, &q.table, false)?;
+        let owner = owner_filter(conn, &t, access, true)?;
         let mut params = Vec::new();
         let mut sql = format!("SELECT {} FROM {}", all_columns(&t), quote_ident(&t.name));
-        sql += &where_sql(&t, &q.filter, &mut params)?;
+        sql += &where_sql(&t, &q.filter, owner.as_deref(), &mut params)?;
         sql += &order_sql(&t, &q.order_by)?;
         if q.limit.is_some() || q.offset.is_some() {
             sql += " LIMIT ?";
@@ -198,14 +311,15 @@ pub fn select(c: &UserConn, q: &Select) -> AppResult<Rows> {
 }
 
 /// Run writes in one transaction: all of them take effect, or none do.
-pub fn transact(c: &UserConn, ops: &[WriteOp]) -> AppResult<Vec<WriteResult>> {
+pub fn transact(c: &UserConn, access: &Access, ops: &[WriteOp]) -> AppResult<Vec<WriteResult>> {
     c.guarded(|conn| {
         let tx = conn.unchecked_transaction().map_err(sql_err)?;
         let mut out = Vec::with_capacity(ops.len());
         for (i, op) in ops.iter().enumerate() {
-            let r = write(&tx, op).map_err(|e| match e {
+            let r = write(&tx, access, op).map_err(|e| match e {
                 AppError::BadRequest(m) => AppError::bad(format!("op {i}: {m}")),
                 AppError::NotFound(m) => AppError::not_found(format!("op {i}: {m}")),
+                AppError::Forbidden(m) => AppError::forbidden(format!("op {i}: {m}")),
                 e => e,
             })?;
             out.push(r);
@@ -216,25 +330,30 @@ pub fn transact(c: &UserConn, ops: &[WriteOp]) -> AppResult<Vec<WriteResult>> {
 }
 
 /// Run one write (in a transaction, so a multi-row insert is all or nothing).
-pub fn write_one(c: &UserConn, op: WriteOp) -> AppResult<WriteResult> {
+pub fn write_one(c: &UserConn, access: &Access, op: WriteOp) -> AppResult<WriteResult> {
     c.guarded(|conn| {
         let tx = conn.unchecked_transaction().map_err(sql_err)?;
-        let r = write(&tx, &op)?;
+        let r = write(&tx, access, &op)?;
         tx.commit().map_err(sql_err)?;
         Ok(r)
     })
 }
 
-fn write(conn: &Connection, op: &WriteOp) -> AppResult<WriteResult> {
+fn write(conn: &Connection, access: &Access, op: &WriteOp) -> AppResult<WriteResult> {
     match op {
-        WriteOp::Insert(q) => insert(conn, q).map(WriteResult::Rows),
-        WriteOp::Update(q) => update(conn, q).map(|changes| WriteResult::Changes { changes }),
-        WriteOp::Delete(q) => delete(conn, q).map(|changes| WriteResult::Changes { changes }),
+        WriteOp::Insert(q) => insert(conn, access, q).map(WriteResult::Rows),
+        WriteOp::Update(q) => {
+            update(conn, access, q).map(|changes| WriteResult::Changes { changes })
+        }
+        WriteOp::Delete(q) => {
+            delete(conn, access, q).map(|changes| WriteResult::Changes { changes })
+        }
     }
 }
 
-fn insert(conn: &Connection, q: &Insert) -> AppResult<Rows> {
+fn insert(conn: &Connection, access: &Access, q: &Insert) -> AppResult<Rows> {
     let t = find(conn, &q.table, true)?;
+    let owner = owner_filter(conn, &t, access, false)?;
     let returning = all_columns(&t);
     let mut out = Rows {
         columns: t.columns.iter().map(|c| c.name.clone()).collect(),
@@ -245,8 +364,13 @@ fn insert(conn: &Connection, q: &Insert) -> AppResult<Rows> {
         let mut names = Vec::with_capacity(row.len());
         let mut params = Vec::with_capacity(row.len());
         for (name, v) in row {
+            check_not_owner(access, name)?;
             names.push(column(&t, name)?);
             params.push(value(name, v)?);
+        }
+        if let Some(o) = &owner {
+            names.push(quote_ident(OWNER_COLUMN));
+            params.push(Value::Text(o.clone()));
         }
         let sql = if names.is_empty() {
             format!("INSERT INTO {} DEFAULT VALUES", quote_ident(&t.name))
@@ -267,14 +391,16 @@ fn insert(conn: &Connection, q: &Insert) -> AppResult<Rows> {
     Ok(out)
 }
 
-fn update(conn: &Connection, q: &Update) -> AppResult<u64> {
+fn update(conn: &Connection, access: &Access, q: &Update) -> AppResult<u64> {
     let t = find(conn, &q.table, true)?;
+    let owner = owner_filter(conn, &t, access, false)?;
     if q.set.is_empty() {
         return Err(AppError::bad("nothing to set"));
     }
     let mut params = Vec::new();
     let mut sets = Vec::with_capacity(q.set.len());
     for (name, v) in &q.set {
+        check_not_owner(access, name)?;
         sets.push(format!("{} = ?", column(&t, name)?));
         params.push(value(name, v)?);
     }
@@ -282,19 +408,20 @@ fn update(conn: &Connection, q: &Update) -> AppResult<u64> {
         "UPDATE {} SET {}{}",
         quote_ident(&t.name),
         sets.join(", "),
-        where_sql(&t, &q.filter, &mut params)?
+        where_sql(&t, &q.filter, owner.as_deref(), &mut params)?
     );
     let st = conn.prepare(&sql).map_err(sql_err)?;
     Ok(run_prepared(conn, st, &params, false, 0)?.changes)
 }
 
-fn delete(conn: &Connection, q: &Delete) -> AppResult<u64> {
+fn delete(conn: &Connection, access: &Access, q: &Delete) -> AppResult<u64> {
     let t = find(conn, &q.table, true)?;
+    let owner = owner_filter(conn, &t, access, false)?;
     let mut params = Vec::new();
     let sql = format!(
         "DELETE FROM {}{}",
         quote_ident(&t.name),
-        where_sql(&t, &q.filter, &mut params)?
+        where_sql(&t, &q.filter, owner.as_deref(), &mut params)?
     );
     let st = conn.prepare(&sql).map_err(sql_err)?;
     Ok(run_prepared(conn, st, &params, false, 0)?.changes)
@@ -305,6 +432,7 @@ fn delete(conn: &Connection, q: &Delete) -> AppResult<u64> {
 /// The table (or, for reads, view) called `name`.
 fn find(conn: &Connection, name: &str, writing: bool) -> AppResult<TableSchema> {
     let t = sql::table(conn, name)?
+        .filter(|t| !is_internal(&t.name))
         .ok_or_else(|| AppError::not_found(format!("no table \"{name}\"")))?;
     if writing && t.kind != "table" {
         return Err(AppError::bad(format!(
@@ -347,8 +475,18 @@ fn is_ops(o: &Map<String, Json>) -> bool {
         && !(o.len() == 1 && o.contains_key("$base64"))
 }
 
-fn where_sql(t: &TableSchema, w: &Where, params: &mut Vec<Value>) -> AppResult<String> {
+/// The `WHERE` clause for `w`, limited to rows of `owner` if given.
+fn where_sql(
+    t: &TableSchema,
+    w: &Where,
+    owner: Option<&str>,
+    params: &mut Vec<Value>,
+) -> AppResult<String> {
     let mut terms = Vec::new();
+    if let Some(o) = owner {
+        terms.push(format!("{} = ?", quote_ident(OWNER_COLUMN)));
+        params.push(Value::Text(o.to_string()));
+    }
     for (name, cond) in w {
         let col = column(t, name)?;
         match cond {
@@ -436,11 +574,27 @@ fn order_sql(t: &TableSchema, items: &[String]) -> AppResult<String> {
 
 // ---- migration ----
 
-/// Create missing tables and add new columns so the database matches `spec`. Refuses (with
-/// [`AppError::SchemaMismatch`]) anything that would change or drop existing data. With
-/// `read_only`, succeeds only if nothing needs to change.
+/// Create missing tables and add new columns so a database in the user's own files matches
+/// `spec`. Refuses (with [`AppError::SchemaMismatch`]) anything that would change or drop
+/// existing data. With `read_only`, succeeds only if nothing needs to change.
 pub fn migrate(c: &UserConn, spec: &Migrate, read_only: bool) -> AppResult<Migrated> {
-    check_spec(spec)?;
+    let refuse = read_only.then(|| {
+        "the database needs changing to match the app's tables, and the token lacks the db:write scope".to_string()
+    });
+    migrate_with(c, spec, false, refuse)
+}
+
+/// [`migrate`], for a user database or (`app`) an app database, whose tables also get an
+/// `_owner` column and a sharing policy. With `refuse` set, succeeds only if nothing needs to
+/// change, and otherwise fails with that message.
+pub fn migrate_with(
+    c: &UserConn,
+    spec: &Migrate,
+    app: bool,
+    refuse: Option<String>,
+) -> AppResult<Migrated> {
+    check_spec(spec, app)?;
+    let read_only = refuse.is_some();
     c.guarded(|conn| {
         // Take the write lock before reading the schema, so two clients migrating at once can't
         // both decide to add the same column.
@@ -453,11 +607,13 @@ pub fn migrate(c: &UserConn, spec: &Migrate, read_only: bool) -> AppResult<Migra
             )
         };
         let existing = sql::schema(conn)?;
-        let applied = plan(spec, &existing)?;
-        if !applied.is_empty() && read_only {
-            return Err(AppError::forbidden(
-                "the database needs changing to match the app's tables, and the token lacks the db:write scope",
-            ));
+        let applied = if app {
+            plan_app(conn, spec, &existing)?
+        } else {
+            plan(spec, &existing, false)?
+        };
+        if let Some(msg) = refuse.filter(|_| !applied.is_empty()) {
+            return Err(AppError::forbidden(msg));
         }
         for s in &applied {
             conn.execute(s, []).map_err(sql_err)?;
@@ -470,10 +626,16 @@ pub fn migrate(c: &UserConn, spec: &Migrate, read_only: bool) -> AppResult<Migra
 }
 
 /// Validate names in a spec, before touching the database.
-fn check_spec(spec: &Migrate) -> AppResult<()> {
+fn check_spec(spec: &Migrate, app: bool) -> AppResult<()> {
     let mut seen = std::collections::HashSet::new();
     for t in &spec.tables {
         check_name("table", &t.name)?;
+        if t.sharing.is_some() && !app {
+            return Err(AppError::bad(format!(
+                "table \"{}\": sharing only applies to app databases",
+                t.name
+            )));
+        }
         if !seen.insert(t.name.to_ascii_lowercase()) {
             return Err(AppError::bad(format!(
                 "table \"{}\" is declared twice",
@@ -486,6 +648,12 @@ fn check_spec(spec: &Migrate) -> AppResult<()> {
             if c.name.eq_ignore_ascii_case("id") {
                 return Err(AppError::bad(format!(
                     "table \"{}\": every table gets an \"id\" column automatically; don't declare one",
+                    t.name
+                )));
+            }
+            if app && c.name.eq_ignore_ascii_case(OWNER_COLUMN) {
+                return Err(AppError::bad(format!(
+                    "table \"{}\": every table in an app database gets an \"{OWNER_COLUMN}\" column automatically; don't declare one",
                     t.name
                 )));
             }
@@ -522,11 +690,54 @@ fn check_name(kind: &str, name: &str) -> AppResult<()> {
             "{kind} name \"{name}\" is reserved by SQLite"
         )));
     }
+    if is_internal(name) {
+        return Err(AppError::bad(format!(
+            "{kind} name \"{name}\" is reserved by bisonbase"
+        )));
+    }
     Ok(())
 }
 
-/// The statements that bring `existing` in line with `spec`.
-fn plan(spec: &Migrate, existing: &[TableSchema]) -> AppResult<Vec<String>> {
+/// [`plan`] for an app database: tables also get an `_owner` column (with an index, since every
+/// request filters on it), and their sharing policy is recorded in [`META_TABLE`].
+fn plan_app(conn: &Connection, spec: &Migrate, existing: &[TableSchema]) -> AppResult<Vec<String>> {
+    let mut out = plan(spec, existing, true)?;
+    let meta = quote_ident(META_TABLE);
+    let mut policies = Vec::new();
+    for t in &spec.tables {
+        let want = t.sharing.unwrap_or_default();
+        let is_new = !existing
+            .iter()
+            .any(|e| e.name.eq_ignore_ascii_case(&t.name));
+        if is_new {
+            out.push(format!(
+                "CREATE INDEX {} ON {} ({})",
+                quote_ident(&format!("{META_TABLE}_{}_owner", t.name)),
+                quote_ident(&t.name),
+                quote_ident(OWNER_COLUMN)
+            ));
+        }
+        if is_new || sharing(conn, &t.name)? != want {
+            policies.push(format!(
+                "INSERT INTO {meta} (name, sharing) VALUES ({}, '{}') \
+                 ON CONFLICT(name) DO UPDATE SET sharing = excluded.sharing",
+                literal(&Value::Text(t.name.clone())),
+                want.as_str()
+            ));
+        }
+    }
+    if !policies.is_empty() && sql::table(conn, META_TABLE)?.is_none() {
+        out.push(format!(
+            "CREATE TABLE {meta} (name TEXT PRIMARY KEY COLLATE NOCASE, sharing TEXT NOT NULL)"
+        ));
+    }
+    out.extend(policies);
+    Ok(out)
+}
+
+/// The statements that bring `existing` in line with `spec`. In an app database (`app`),
+/// tables have an `_owner` column too.
+fn plan(spec: &Migrate, existing: &[TableSchema], app: bool) -> AppResult<Vec<String>> {
     let mut out = Vec::new();
     for t in &spec.tables {
         let fail = |msg: String| {
@@ -540,6 +751,9 @@ fn plan(spec: &Migrate, existing: &[TableSchema]) -> AppResult<Vec<String>> {
             .find(|e| e.name.eq_ignore_ascii_case(&t.name))
         else {
             let mut cols = vec!["\"id\" INTEGER PRIMARY KEY".to_string()];
+            if app {
+                cols.push(format!("{} TEXT NOT NULL", quote_ident(OWNER_COLUMN)));
+            }
             for c in &t.columns {
                 cols.push(column_def(c)?);
             }
@@ -567,6 +781,11 @@ fn plan(spec: &Migrate, existing: &[TableSchema]) -> AppResult<Vec<String>> {
         }
         if found.columns.iter().filter(|c| c.pk).count() > 1 {
             return fail("it has a composite primary key".into());
+        }
+        if app && have(OWNER_COLUMN).is_none() {
+            return fail(format!(
+                "it exists but has no \"{OWNER_COLUMN}\" column, so it wasn't created by this API"
+            ));
         }
         for c in &t.columns {
             let Some(h) = have(&c.name) else {
@@ -609,6 +828,7 @@ fn plan(spec: &Migrate, existing: &[TableSchema]) -> AppResult<Vec<String>> {
         }
         for h in &found.columns {
             let declared = h.name.eq_ignore_ascii_case("id")
+                || (app && h.name.eq_ignore_ascii_case(OWNER_COLUMN))
                 || t.columns
                     .iter()
                     .any(|c| c.name.eq_ignore_ascii_case(&h.name));
@@ -679,6 +899,15 @@ mod tests {
     }
 
     #[test]
+    fn internal_names() {
+        assert!(is_internal("_bisonbase_tables"));
+        assert!(is_internal("_BisonBase"));
+        assert!(!is_internal("_bison"));
+        // Not on a character boundary at byte 10: no panic.
+        assert!(!is_internal("ééééééé"));
+    }
+
+    #[test]
     fn crud() {
         let dir = tempfile::tempdir().unwrap();
         let c = open(&dir);
@@ -687,6 +916,7 @@ mod tests {
 
         let r = write_one(
             &c,
+            &Access::All,
             de(json!({"op": "insert", "table": "todos", "rows": [
                 {"content": "a"},
                 {"content": "b", "done": 1, "pic": {"$base64": "AAE="}},
@@ -702,7 +932,7 @@ mod tests {
             [json!(2), json!("b"), json!(1), json!({"$base64": "AAE="})]
         );
 
-        let sel = |q: Json| select(&c, &de(q)).unwrap();
+        let sel = |q: Json| select(&c, &Access::All, &de(q)).unwrap();
         let r = sel(json!({"table": "TODOS", "where": {"done": 0}, "order_by": ["id desc"]}));
         let ids: Vec<_> = r.rows.iter().map(|r| r[0].clone()).collect();
         assert_eq!(ids, [json!(4), json!(3), json!(1)]);
@@ -720,11 +950,13 @@ mod tests {
 
         let r = write_one(
             &c,
+            &Access::All,
             de(json!({"op": "update", "table": "todos", "where": {"done": 0}, "set": {"done": 1}})),
         );
         assert!(matches!(r, Ok(WriteResult::Changes { changes: 3 })));
         let r = write_one(
             &c,
+            &Access::All,
             de(json!({"op": "delete", "table": "todos", "where": {"id": 1}})),
         );
         assert!(matches!(r, Ok(WriteResult::Changes { changes: 1 })));
@@ -735,7 +967,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let c = open(&dir);
         migrate(&c, &todos(), false).unwrap();
-        let bad = |q: Json| select(&c, &de(q)).unwrap_err();
+        let bad = |q: Json| select(&c, &Access::All, &de(q)).unwrap_err();
         assert!(matches!(
             bad(json!({"table": "nope"})),
             AppError::NotFound(_)
@@ -780,10 +1012,10 @@ mod tests {
             {"op": "insert", "table": "todos", "rows": [{"content": "a"}]},
             {"op": "insert", "table": "todos", "rows": [{"content": null}]},
         ]}));
-        let e = transact(&c, &ops.ops).unwrap_err();
+        let e = transact(&c, &Access::All, &ops.ops).unwrap_err();
         assert!(e.to_string().starts_with("op 1:"), "{e}");
         assert!(
-            select(&c, &de(json!({"table": "todos"})))
+            select(&c, &Access::All, &de(json!({"table": "todos"})))
                 .unwrap()
                 .rows
                 .is_empty()

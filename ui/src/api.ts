@@ -102,11 +102,24 @@ export interface ListEntry {
   modified: number
 }
 
+/** A registered app's own storage, as the viewer sees it. */
+export interface AppView {
+  id: string
+  name: string
+  hue: number
+  /** The viewer may change the app's storage. */
+  manage: boolean
+}
+
 interface BrowseBase {
   owner: { id: string; username: string }
   editable: boolean
   path: string
   apps: Record<string, AppLabel>
+  /** Set in an app's storage. */
+  app: AppView | null
+  /** The viewer sees only database rows they own here. */
+  rows_only: boolean
 }
 
 export interface DirNode {
@@ -259,6 +272,20 @@ export interface AdminData {
     active: boolean
   }[]
   users: { id: string; username: string; is_admin: boolean; is_self: boolean; created: number }[]
+}
+
+export interface RegisteredApp {
+  id: string
+  name: string
+  origin: string
+  hue: number
+  created: number
+  manage: boolean
+  /** Only for admins. */
+  owners?: { id: string; username: string }[]
+  /** Only for those who manage the app. */
+  usage?: number
+  quota: number
 }
 
 export interface Consent {

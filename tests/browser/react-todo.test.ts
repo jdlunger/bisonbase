@@ -161,3 +161,14 @@ test('cancelling on the consent page leaves the app signed out with a message', 
   await page.waitForText('Sign-in was cancelled.')
   assert.equal(await page.eval('!!document.querySelector("#items")'), false)
 })
+
+test("the app's todos are in its own storage, which the admin who signed in registered", { skip }, async () => {
+  await page.goto(`${server.url}/apps`)
+  await page.waitForText('React Todo')
+  await page.click('Browse storage')
+  await page.waitForText('todos.db')
+  await page.click('todos.db')
+  await page.click('todos')
+  await page.waitForText('from laptop')
+  assert.deepEqual(page.errors, [])
+})

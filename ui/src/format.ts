@@ -32,18 +32,38 @@ export function decodePath(p: string): string {
   }
 }
 
-/** Where a file tree's pages live: the user's own (`owner` null), or another's, for admins. */
-export function treeBase(owner: string | null): string {
-  return owner ? `/admin/users/${owner}/files` : '/files'
+/**
+ * Which file tree a page shows: the viewer's own (both null), another user's (`owner`, for
+ * admins), or a registered app's own storage (`app`).
+ */
+export interface Tree {
+  owner: string | null
+  app: string | null
 }
 
-export function treeHref(owner: string | null, path: string): string {
-  const base = treeBase(owner)
+export const OWN_TREE: Tree = { owner: null, app: null }
+export const userTree = (owner: string | null): Tree => ({ owner, app: null })
+export const appTree = (app: string): Tree => ({ owner: null, app })
+
+/** Where a file tree's pages live. */
+export function treeBase(t: Tree): string {
+  if (t.app) return `/apps/${t.app}/files`
+  return t.owner ? `/admin/users/${t.owner}/files` : '/files'
+}
+
+export function treeHref(t: Tree, path: string): string {
+  const base = treeBase(t)
   return path ? `${base}/${encodePath(path)}` : base
 }
 
-export function rawHref(owner: string | null, path: string): string {
-  return `${owner ? `/admin/users/${owner}/raw` : '/raw'}/${encodePath(path)}`
+export function rawHref(t: Tree, path: string): string {
+  const base = t.app ? `/apps/${t.app}/raw` : t.owner ? `/admin/users/${t.owner}/raw` : '/raw'
+  return `${base}/${encodePath(path)}`
+}
+
+/** The API path of a file in a tree (as apps use it). */
+export function apiPath(t: Tree, path: string): string {
+  return t.app ? `/api/v1/apps/${t.app}/files/${path}` : `/api/v1/files/${path}`
 }
 
 /** The id of the app whose folder `path` is (`apps/<uuid>`), if it is one. */

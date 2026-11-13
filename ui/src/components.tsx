@@ -93,7 +93,7 @@ export const actionsCell = 'text-right whitespace-nowrap [&>*]:ml-3'
 export const labelBlock = 'block [&>input]:mt-1 [&>input]:w-full'
 
 
-export type Section = 'files' | 'settings' | 'admin' | ''
+export type Section = 'files' | 'apps' | 'settings' | 'admin' | ''
 
 export function Header({ user, section }: { user: Me | null; section: Section }) {
   return (
@@ -106,6 +106,9 @@ export function Header({ user, section }: { user: Me | null; section: Section })
           <nav className="flex gap-4">
             <Link href="/files" className={navCls(section === 'files')}>
               Files
+            </Link>
+            <Link href="/apps" className={navCls(section === 'apps')}>
+              Apps
             </Link>
             <Link href="/settings" className={navCls(section === 'settings')}>
               Settings

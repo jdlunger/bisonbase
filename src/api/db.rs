@@ -2,7 +2,8 @@
 //!
 //! Apps read and write them through the relational API (`select`, `insert`, `update`, `delete`,
 //! `transact`, `migrate`) and follow changes with `watch`; no SQL text is accepted. Every path is
-//! resolved inside the requesting user's own tree, so nothing of anyone else's can be named.
+//! resolved inside the requesting user's own tree or, for app databases, inside a registered
+//! app's own storage, where requests only reach rows the user owns (see [`rel::Access`]).
 
 use std::{convert::Infallible, time::Duration};
 
@@ -28,12 +29,12 @@ use crate::{
     storage::{
         fs::DbChange,
         fs::{SafePath, UserStore, is_sqlite},
-        rel,
+        rel::{self, Access},
         sql::{Changed, TableSchema, UserConn},
     },
 };
 
-use super::files::content_safety_headers;
+use super::{files::content_safety_headers, target::Target};
 
 // ---- operations shared by the API and the web UI ----
 
@@ -44,7 +45,7 @@ pub async fn create_db(state: &AppState, store: &UserStore, p: &SafePath) -> App
     }
     store.ensure().await?;
     let path = store.resolve(p).await?;
-    if store.usage().await? >= state.cfg.limits.user_quota_bytes {
+    if store.usage().await? >= store.quota {
         return Err(AppError::QuotaExceeded("storage quota exceeded".into()));
     }
     let _guard = store.lock.write().await;
@@ -83,11 +84,7 @@ where
         .await
         .map(|m| m.len())
         .unwrap_or(0);
-    let remaining = state
-        .cfg
-        .limits
-        .user_quota_bytes
-        .saturating_sub(store.usage().await?);
+    let remaining = store.quota.saturating_sub(store.usage().await?);
     sl.max_db_bytes = sl.max_db_bytes.min(size + remaining);
     let guard = store.lock.clone().read_owned().await;
     let cache = store.usage_cache.clone();
@@ -172,10 +169,20 @@ fn parse_body<T: DeserializeOwned>(body: &Bytes) -> AppResult<T> {
     serde_json::from_slice(body).map_err(|e| AppError::bad(format!("invalid JSON body: {e}")))
 }
 
-pub async fn mkdb(state: &AppState, auth: &ApiAuth, p: &SafePath) -> AppResult<Response> {
+/// Create a database. In an app's storage only its owners may; others get the existing one.
+pub async fn mkdb(state: &AppState, auth: &ApiAuth, t: &Target) -> AppResult<Response> {
     auth.scopes.require(auth.scopes.db_write, "db:write")?;
-    let store = state.store(auth.user.id);
-    let created = create_db(state, &store, p).await?;
+    let (store, p) = (&t.store, &t.path);
+    let exists = || async {
+        let path = store.resolve(p).await?;
+        AppResult::Ok(is_sqlite(&path).await)
+    };
+    let created = if !t.can_manage() && exists().await? {
+        false
+    } else {
+        t.require_manage("create databases")?;
+        create_db(state, store, p).await?
+    };
     let status = if created {
         StatusCode::CREATED
     } else {
@@ -185,40 +192,40 @@ pub async fn mkdb(state: &AppState, auth: &ApiAuth, p: &SafePath) -> AppResult<R
     Ok((status, Json(json!({ "entry": entry, "created": created }))).into_response())
 }
 
-pub async fn schema(state: &AppState, auth: &ApiAuth, p: &SafePath) -> AppResult<Response> {
+pub async fn schema(state: &AppState, auth: &ApiAuth, t: &Target) -> AppResult<Response> {
     auth.scopes.require(auth.scopes.db_read, "db:read")?;
-    let store = state.store(auth.user.id);
-    let tables: Vec<TableSchema> = with_db(state, &store, p, |c| c.schema()).await?;
+    let mut tables: Vec<TableSchema> = with_db(state, &t.store, &t.path, |c| c.schema()).await?;
+    tables.retain(|t| !rel::is_internal(&t.name));
     Ok(Json(json!({ "tables": tables })).into_response())
 }
 
-/// Run `f` on the database at `p` in the caller's tree, after checking the token may read it.
-async fn on_db<T, F>(state: &AppState, auth: &ApiAuth, p: &SafePath, f: F) -> AppResult<Response>
+/// Run `f` on the database the request names, after checking the token may read it.
+async fn on_db<T, F>(state: &AppState, auth: &ApiAuth, t: &Target, f: F) -> AppResult<Response>
 where
     T: serde::Serialize + Send + 'static,
-    F: FnOnce(&mut UserConn) -> AppResult<T> + Send + 'static,
+    F: FnOnce(&mut UserConn, &Access) -> AppResult<T> + Send + 'static,
 {
     auth.scopes.require(auth.scopes.db_read, "db:read")?;
-    let store = state.store(auth.user.id);
-    let r = with_db(state, &store, p, f).await?;
+    let access = t.access();
+    let r = with_db(state, &t.store, &t.path, move |c| f(c, &access)).await?;
     Ok(Json(r).into_response())
 }
 
 pub async fn select(
     state: &AppState,
     auth: &ApiAuth,
-    p: &SafePath,
+    t: &Target,
     body: &Bytes,
 ) -> AppResult<Response> {
     let q: rel::Select = parse_body(body)?;
-    on_db(state, auth, p, move |c| rel::select(c, &q)).await
+    on_db(state, auth, t, move |c, a| rel::select(c, a, &q)).await
 }
 
 /// `insert`, `update` or `delete`, as named by `op`.
 pub async fn write(
     state: &AppState,
     auth: &ApiAuth,
-    p: &SafePath,
+    t: &Target,
     op: &str,
     body: &Bytes,
 ) -> AppResult<Response> {
@@ -231,32 +238,44 @@ pub async fn write(
     obj.insert("op".into(), op.into());
     let w: rel::WriteOp =
         serde_json::from_value(v).map_err(|e| AppError::bad(format!("invalid body: {e}")))?;
-    on_db(state, auth, p, move |c| rel::write_one(c, w)).await
+    on_db(state, auth, t, move |c, a| rel::write_one(c, a, w)).await
 }
 
 pub async fn transact(
     state: &AppState,
     auth: &ApiAuth,
-    p: &SafePath,
+    t: &Target,
     body: &Bytes,
 ) -> AppResult<Response> {
     auth.scopes.require(auth.scopes.db_write, "db:write")?;
-    let t: rel::Transact = parse_body(body)?;
-    on_db(state, auth, p, move |c| {
-        rel::transact(c, &t.ops).map(|results| json!({ "results": results }))
+    let tr: rel::Transact = parse_body(body)?;
+    on_db(state, auth, t, move |c, a| {
+        rel::transact(c, a, &tr.ops).map(|results| json!({ "results": results }))
     })
     .await
 }
 
+/// Bring tables in line with what the app declares. Anyone may check that nothing needs
+/// changing; making changes needs db:write and, in an app's storage, being one of its owners.
 pub async fn migrate(
     state: &AppState,
     auth: &ApiAuth,
-    p: &SafePath,
+    t: &Target,
     body: &Bytes,
 ) -> AppResult<Response> {
     let m: rel::Migrate = parse_body(body)?;
-    let read_only = !auth.scopes.db_write;
-    on_db(state, auth, p, move |c| rel::migrate(c, &m, read_only)).await
+    let refuse = if !t.can_manage() {
+        Some("the database needs changing to match the app's tables, and only the app's owners can change them".to_string())
+    } else if !auth.scopes.db_write {
+        Some("the database needs changing to match the app's tables, and the token lacks the db:write scope".to_string())
+    } else {
+        None
+    };
+    let app = t.app.is_some();
+    on_db(state, auth, t, move |c, _| {
+        rel::migrate_with(c, &m, app, refuse)
+    })
+    .await
 }
 
 // ---- change stream ----
@@ -269,9 +288,9 @@ const RECHECK_TOKEN: Duration = Duration::from_secs(60);
 /// anything may have changed (the file was replaced, the schema changed, or the stream fell
 /// behind). It ends when the token stops working or the server shuts down; clients reconnect
 /// and should treat `ready` as "reload everything".
-pub async fn watch(state: &AppState, auth: &ApiAuth, p: &SafePath) -> AppResult<Response> {
+pub async fn watch(state: &AppState, auth: &ApiAuth, t: &Target) -> AppResult<Response> {
     auth.scopes.require(auth.scopes.db_read, "db:read")?;
-    let store = state.store(auth.user.id);
+    let (store, p) = (&t.store, &t.path);
     // Subscribe before checking, so no change between the check and the stream is missed.
     let rx = store.changes.subscribe();
     if !is_sqlite(&store.resolve(p).await?).await {

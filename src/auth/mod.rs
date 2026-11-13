@@ -174,6 +174,8 @@ pub struct ApiAuth {
     pub scopes: Scopes,
     /// Set for tokens issued to an app through OAuth: they only reach `apps/<id>/`.
     pub app: Option<uuid::Uuid>,
+    /// For app tokens: the app's URL (its OAuth `client_id`).
+    pub client_id: Option<String>,
     /// The bearer token itself, so long-lived responses can check it's still valid.
     pub token: String,
 }
@@ -222,15 +224,16 @@ impl FromRequestParts<AppState> for ApiAuth {
             })
             .map(str::trim)
             .ok_or(AppError::Unauthorized)?;
-        let (user, scopes, app) = state
+        let t = state
             .sys
             .api_token_user(token)
             .await?
             .ok_or(AppError::Unauthorized)?;
         Ok(ApiAuth {
-            user,
-            scopes: Scopes::parse(&scopes),
-            app,
+            user: t.user,
+            scopes: Scopes::parse(&t.scopes),
+            app: t.app,
+            client_id: t.client_id,
             token: token.to_string(),
         })
     }

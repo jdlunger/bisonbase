@@ -257,12 +257,25 @@ pub fn app_hue(app_id: uuid::Uuid) -> u16 {
     u16::from_be_bytes([b[0], b[1]]) % 360
 }
 
-/// Check that the app id isn't claimed by another origin for this user.
+/// Check that the app id isn't claimed by another origin: globally, if an admin registered the
+/// app, and otherwise for this user.
 async fn check_owner(
     state: &AppState,
     user: &crate::system::User,
     a: &Authorization,
 ) -> Result<(), Rejection> {
+    if let Some(r) = state.sys.registered_app(a.app_id).await? {
+        if r.origin != a.origin {
+            return Err(error_redirect(
+                state,
+                &a.redirect_uri,
+                a.state.as_deref(),
+                "invalid_request",
+                "app_id is registered to another app",
+            ));
+        }
+        return Ok(());
+    }
     match state.sys.app(user.id, a.app_id).await? {
         Some(app) if app.origin != a.origin => Err(error_redirect(
             state,
@@ -359,7 +372,7 @@ pub async fn decide(
     }
     state
         .sys
-        .register_app(user.id, a.app_id, a.app_name, a.origin)
+        .record_app(user.id, a.app_id, a.app_name, a.origin)
         .await?;
     let code = state
         .sys

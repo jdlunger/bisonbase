@@ -3,6 +3,7 @@
 //! guard and are not open to other origins.
 
 mod account;
+mod apps;
 mod db;
 mod files;
 
@@ -42,6 +43,10 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .route("/admin/users/{id}/files", get(user_page))
         .route("/admin/users/{id}/files/", get(user_page))
         .route("/admin/users/{id}/files/{*path}", get(user_page))
+        .route("/apps", get(user_page))
+        .route("/apps/{id}/files", get(user_page))
+        .route("/apps/{id}/files/", get(user_page))
+        .route("/apps/{id}/files/{*path}", get(user_page))
         .route(
             "/oauth/authorize",
             get(user_page).post(crate::oauth::decide),
@@ -50,6 +55,7 @@ pub fn router(state: &AppState) -> Router<AppState> {
         // Downloads.
         .route("/raw/{*path}", get(files::raw))
         .route("/admin/users/{id}/raw/{*path}", get(files::admin_raw))
+        .route("/apps/{id}/raw/{*path}", get(files::app_raw))
         // Passkeys.
         .route("/logout", post(passkey::logout))
         .route("/auth/register/start", post(passkey::register_start))
@@ -86,6 +92,10 @@ pub fn router(state: &AppState) -> Router<AppState> {
         .route("/ui/tokens/create", post(account::create_token))
         .route("/ui/tokens/delete", post(account::delete_token))
         .route("/ui/apps/disconnect", post(account::disconnect_app))
+        .route("/ui/apps", get(apps::list))
+        .route("/ui/admin/apps/create", post(apps::create))
+        .route("/ui/admin/apps/delete", post(apps::delete))
+        .route("/ui/admin/apps/owner", post(apps::set_owner))
         .route("/ui/passkeys/delete", post(account::delete_passkey))
         .route("/ui/oauth/authorize", get(crate::oauth::consent))
         .route("/ui/admin", get(account::admin))

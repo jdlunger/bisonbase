@@ -3,7 +3,7 @@
 import { useState, type FormEvent } from 'react'
 import { post, useApi, type AdminData, type Me } from '../api.ts'
 import { act, actionsCell, buttonLink, Card, flash, listTable, Loading, Secret, TextButton, toolbar, useTitle } from '../components.tsx'
-import { fmtTime, treeBase } from '../format.ts'
+import { fmtTime, treeBase, userTree } from '../format.ts'
 import { Link } from '../router.tsx'
 
 /** A one-time link, shown once right after it is created. */
@@ -34,6 +34,19 @@ export function Admin({ me }: { me: Me }) {
             Open system database
           </Link>{' '}
           <Link href="/admin/db?table=audit_log">Audit log</Link>
+        </p>
+      </Card>
+
+      <Card>
+        <h2>Apps</h2>
+        <p className="text-muted">
+          Register apps to give them storage of their own, shared by all their users, where each row belongs to the user
+          who created it. Choose who else may manage each app's storage.
+        </p>
+        <p>
+          <Link className={buttonLink} href="/apps">
+            Manage apps
+          </Link>
         </p>
       </Card>
 
@@ -210,7 +223,7 @@ function Users({ data, me, reload, onLink }: ListProps & { me: Me }) {
               <td>{u.is_admin ? 'admin' : 'user'}</td>
               <td>{fmtTime(u.created)}</td>
               <td className={actionsCell}>
-                <Link href={treeBase(u.id === me.id ? null : u.id)}>Browse files</Link>
+                <Link href={treeBase(userTree(u.id === me.id ? null : u.id))}>Browse files</Link>
                 {!u.is_self && (
                   <TextButton onClick={() => setAdmin(u)}>
                     {u.is_admin ? 'Remove admin' : 'Make admin'}
