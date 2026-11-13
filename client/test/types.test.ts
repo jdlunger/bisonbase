@@ -70,3 +70,18 @@ test('app table row types', () => {
   }
   void check
 })
+
+test('transact result types', () => {
+  const bb = new BisonBase('00000000-0000-4000-8000-000000000000', 'Types', { url: 'http://x', token: 't' })
+  const db = bb.createAppDb('txtypes')
+  const posts = db.createTable('posts', { body: 'text' }, { sharing: 'shared' })
+  const check = async () => {
+    const r = await db.transact((tx) => [tx.insert(posts, { body: 'a' }), tx.insert(posts, [{ body: 'b' }]), tx.delete(posts, 1), tx.update(posts, { body: 'a' }, { body: 'c' })])
+    assertType<Equal<typeof r, [RowOf<typeof posts>, RowOf<typeof posts>[], number, number]>>()
+    // @ts-expect-error wrong column type
+    void db.transact((tx) => [tx.insert(posts, { body: 1 })])
+    // @ts-expect-error unknown column in where
+    void db.transact((tx) => [tx.delete(posts, { nope: 1 })])
+  }
+  void check
+})

@@ -7,6 +7,7 @@ export {
   NotSignedInError,
   SchemaError,
   Table,
+  TxOp,
   UserDb,
   type AppInfo,
   type AppTableOptions,
@@ -16,6 +17,8 @@ export {
   type QueryState,
   type InsertOf,
   type RowOf,
+  type Tx,
+  type TxResults,
 } from './client.ts'
 export type { Sharing } from './table.ts'
 export type {

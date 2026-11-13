@@ -32,7 +32,9 @@ function App() {
 }
 ```
 
-[examples/ts/react-todo](../examples/ts/react-todo) is a complete app.
+[examples/ts/react-todo](../examples/ts/react-todo) is a complete app, and
+[examples/ts/react-workspace](../examples/ts/react-workspace) a bigger one that uses all of the
+library: tasks, a calendar and notes, each private or shared with other users.
 
 ## Tables
 
@@ -94,6 +96,24 @@ await todos.delete({ done: true })
 
 `where` matches when every listed column matches; `null` matches NULL. Operators are `$ne`,
 `$lt`, `$lte`, `$gt`, `$gte` and `$in`.
+
+### Transactions
+
+`db.transact` runs writes to tables of one database together: all of them take effect, or none
+do. The results come back in order, typed: the stored row (or rows) for an insert, the number
+changed for an update or delete.
+
+```ts
+const db = bb.createAppDb('workspace')
+const mine = db.createTable('tasks', { title: 'text' })
+const shared = db.createTable('shared_tasks', { title: 'text' }, { sharing: 'shared' })
+
+// Share a task: move it from the private table to the shared one.
+const [moved, deleted] = await db.transact((tx) => [
+  tx.insert(shared, { title: task.title }), // RowOf<typeof shared>
+  tx.delete(mine, task.id),                 // number
+])
+```
 
 The server checks every table and column name against the database and binds every value; it
 accepts no SQL.

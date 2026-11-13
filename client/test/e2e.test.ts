@@ -239,3 +239,39 @@ test('app databases are shared, and each row belongs to a user', opts, async () 
   await adminLater.todos.select()
   assert.deepEqual((await later.todos.select()).map((t) => [t.content, t.done]), [])
 })
+
+test('transact: all of its writes take effect, or none do', opts, async () => {
+  const app = randomUUID()
+  const bb = new BisonBase(app, 'Tx', { url: server.url, token: appToken(app, true) })
+  const db = bb.createAppDb('tx')
+  const mine = db.createTable('mine', { title: 'text', done: ['boolean', false] })
+  const shared = db.createTable('shared', { title: 'text', done: ['boolean', false] }, { sharing: 'shared' })
+  const other = bb.createUserDb('other').createTable('t', { x: 'text' })
+
+  const task = await mine.insert({ title: 'move me' })
+  const live = shared.liveQuery()
+  const stop = live.subscribe(() => {})
+  await until(live, (s) => !s.loading)
+
+  // Move a row from one table to another.
+  const [moved, deleted, nothing, none] = await db.transact((tx) => [
+    tx.insert(shared, { title: task.title, done: true }),
+    tx.delete(mine, task.id),
+    tx.update(shared, {}, {}),
+    tx.insert(shared, []),
+  ])
+  assert.deepEqual([moved.title, moved.done, typeof moved._owner, deleted, nothing, none], ['move me', true, 'string', 1, 0, []])
+  assert.deepEqual(await mine.select(), [])
+  // Live queries on the tables it wrote reload.
+  assert.equal((await until(live, (s) => s.rows.length === 1)).rows[0].id, moved.id)
+  stop()
+
+  // A failing op undoes the ones before it.
+  await assert.rejects(
+    db.transact((tx) => [tx.insert(mine, { title: 'kept?' }), tx.insert(shared, { id: moved.id, title: 'dup' })]),
+    (e) => e instanceof ApiError && /op 1/.test(e.message),
+  )
+  assert.deepEqual(await mine.select(), [])
+  assert.deepEqual(await db.transact(() => []), [])
+  await assert.rejects(db.transact((tx) => [tx.insert(other, { x: 'a' })]), /isn't in database "tx"/)
+})

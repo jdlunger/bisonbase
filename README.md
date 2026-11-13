@@ -50,8 +50,10 @@ function App() {
 ```
 
 This works now, with `createAppDb` (shared storage, rows owned by users) and `createUserDb` (a
-database in each user's own account): see [client/](client) (the `bisonbase` package) and
-[examples/ts/react-todo](examples/ts/react-todo).
+database in each user's own account): see [client/](client) (the `bisonbase` package),
+[examples/ts/react-todo](examples/ts/react-todo), and
+[examples/ts/react-workspace](examples/ts/react-workspace), a multi-user workspace (tasks, a
+calendar and notes, each private or shared) that uses every part of the client.
 
 ### App-owned storage
 
@@ -118,8 +120,12 @@ Compile bisonbase as a Node add-on, install example's dependencies, and run full
 ```sh
 (cd node && npm install && npm run build:debug)
 (cd examples/ts && npm install)
-node examples/ts/react-todo/server.ts
+node examples/ts/react-todo/server.ts      # http://localhost:3000
+node examples/ts/react-workspace/server.ts # or the bigger example, on http://localhost:3001
 ```
+
+To try the workspace with more than one person, invite another user under Admin in bisonbase
+and sign in as them in a private window.
 
 ## Publish
 

@@ -517,10 +517,92 @@ export abstract class Database {
   }
 
   /** @internal Run a relational op once the tables are set up. */
-  async _op(op: 'select' | 'insert' | 'update' | 'delete', body: unknown): Promise<any> {
+  async _op(op: 'select' | 'insert' | 'update' | 'delete' | 'transact', body: unknown): Promise<any> {
     await this._ensure()
     return this.bb._request(this._api, op, body)
   }
+
+  /**
+   * Run several writes to this database's tables in one transaction: all of them take effect,
+   * or none do. `build` lists them with `tx`, and the results come back in the same order:
+   * the stored row (or rows) for an insert, the number of rows changed for an update or delete.
+   *
+   * ```ts
+   * // Move a task from a private table to a shared one.
+   * const [moved] = await db.transact((tx) => [
+   *   tx.insert(sharedTasks, { title: task.title }),
+   *   tx.delete(myTasks, task.id),
+   * ])
+   * ```
+   */
+  async transact<const T extends readonly TxOp<unknown>[]>(build: (tx: Tx) => T): Promise<TxResults<T>> {
+    const ops = build(TX) as readonly TxOp<unknown>[]
+    const sent: { table: Table<any, any>; body: object }[] = []
+    const plan = ops.map((op) => {
+      if (!(op instanceof TxOp)) throw new Error('transact: list the writes made with tx.insert, tx.update and tx.delete')
+      if (op.table.db !== this) throw new Error(`transact: table "${op.table.name}" isn't in database "${this.name}"`)
+      // Nothing to send (no rows to insert, nothing to set): answer it here.
+      if (!op.body) return () => op.empty
+      const i = sent.push({ table: op.table, body: { op: op.op, ...op.body } }) - 1
+      return (results: any[]) => op.decode(results[i])
+    })
+    const results: any[] = sent.length ? (await this._op('transact', { ops: sent.map((s) => s.body) })).results : []
+    if (sent.length) this.bb._invalidate(this, [...new Set(sent.map((s) => s.table.name))])
+    return plan.map((get) => get(results)) as TxResults<T>
+  }
+}
+
+/** One write in a transaction, made with `tx.insert`, `tx.update` or `tx.delete`. */
+export class TxOp<V> {
+  readonly table: Table<any, any>
+  readonly op: 'insert' | 'update' | 'delete'
+  /** @internal The request without its `op`, or null when there's nothing to send. */
+  readonly body: object | null
+  /** @internal Turn the server's result into this op's value. */
+  readonly decode: (result: any) => V
+  /** @internal The value when nothing was sent. */
+  readonly empty: V
+  /** Only here so TypeScript tells ops with different results apart. */
+  declare readonly _value?: V
+
+  /** @internal Use `tx.insert`, `tx.update` or `tx.delete` in `db.transact`. */
+  constructor(table: Table<any, any>, op: TxOp<V>['op'], body: object | null, decode: (result: any) => V, empty: V) {
+    this.table = table
+    this.op = op
+    this.body = body
+    this.decode = decode
+    this.empty = empty
+  }
+}
+
+/** Builds the writes of a `transact`. Each method checks its arguments the way the table's own does. */
+export interface Tx {
+  insert<C extends Columns, R>(table: Table<C, R>, row: InsertFor<C>): TxOp<R>
+  insert<C extends Columns, R>(table: Table<C, R>, rows: readonly InsertFor<C>[]): TxOp<R[]>
+  update<C extends Columns, R>(table: Table<C, R>, where: Where<R> | number, changes: UpdateFor<C>): TxOp<number>
+  delete<C extends Columns, R>(table: Table<C, R>, where: Where<R> | number): TxOp<number>
+}
+
+/** What `transact` resolves to: each op's result, in order. */
+export type TxResults<T extends readonly TxOp<unknown>[]> = { -readonly [K in keyof T]: T[K] extends TxOp<infer V> ? V : never }
+
+const TX: Tx = {
+  insert(table: Table<any, any>, rows: object | readonly object[]): TxOp<any> {
+    const many = Array.isArray(rows)
+    const req = insertRequest(table.def, (many ? rows : [rows]) as Record<string, unknown>[])
+    return new TxOp(table, 'insert', req.rows.length ? req : null, (r: Rows) => {
+      const decoded = table._decode(r)
+      return many ? decoded : decoded[0]
+    }, [])
+  },
+  update(table: Table<any, any>, where: object | number, changes: object) {
+    const req = updateRequest(table.def, where, changes as Record<string, unknown>)
+    return new TxOp(table, 'update', req, (r: { changes: number }) => r.changes, 0)
+  },
+  delete(table: Table<any, any>, where: object | number) {
+    if (where === undefined) throw new Error('delete needs a where; pass {} to delete every row')
+    return new TxOp(table, 'delete', deleteRequest(table.def, where), (r: { changes: number }) => r.changes, 0)
+  },
 }
 
 /** A database each signed-in user has their own copy of. Make one with `bb.createUserDb`. */
@@ -604,7 +686,9 @@ export class AppDb extends Database {
         if (r instanceof ApiError && r.status === 403) {
           throw new ApiError(404, 'app_not_registered', `${this.bb.appName} isn't registered with the server yet; an admin needs to sign in to it once, or register it under Admin`)
         }
-        throw r
+        // A conflict means it was registered meanwhile, e.g. by another tab, or by this page's
+        // other requests while signing in.
+        if (!(r instanceof ApiError && r.status === 409)) throw r
       }
       await this.bb._request(this._api, 'mkdb')
     }
@@ -627,7 +711,8 @@ export class Table<C extends Columns, R = RowFor<C>> {
     return this.def.name
   }
 
-  #rows(result: Rows): R[] {
+  /** @internal Rows as the server sends them, decoded. */
+  _decode(result: Rows): R[] {
     const types = result.columns.map((c) => (c === 'id' ? null : this.def.byName.get(c)?.type ?? null))
     return result.rows.map(
       (row) => Object.fromEntries(row.map((v, i) => [result.columns[i], types[i] ? decode(types[i], v) : v])) as R,
@@ -638,7 +723,7 @@ export class Table<C extends Columns, R = RowFor<C>> {
   async select(options?: SelectOptions<R>): Promise<R[]> {
     const result: Rows = await this.db._op('select', selectRequest(this.def, options))
     if (result.truncated) console.warn(`BisonBase: results from ${this.name} were truncated by the server's row limit`)
-    return this.#rows(result)
+    return this._decode(result)
   }
 
   /** Insert a row and return it as stored (with its `id` and defaults). */
@@ -650,7 +735,7 @@ export class Table<C extends Columns, R = RowFor<C>> {
     const list = (many ? rows : [rows]) as Record<string, unknown>[]
     const req = insertRequest(this.def, list)
     if (req.rows.length === 0) return []
-    const inserted = this.#rows(await this.db._op('insert', req))
+    const inserted = this._decode(await this.db._op('insert', req))
     this.#changed()
     return many ? inserted : inserted[0]
   }
