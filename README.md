@@ -52,10 +52,32 @@ function App() {
 The first part of this works now with per-user databases: see [client/](client) (the `bisonbase`
 package) and [examples/ts/react-todo](examples/ts/react-todo).
 
+### Database API
+
+Apps never send SQL. A database is a file in the signed-in user's own tree, addressed as
+`/api/v1/files/<path>?op=<op>`; a token can't name anything outside that tree (and an app's
+token, nothing outside `apps/<app id>/`). Table and column names are checked against the
+database's schema, and values are always bound parameters.
+
+| op | method | scope | body |
+| --- | --- | --- | --- |
+| `mkdb` | POST | db:write | none: creates an empty database |
+| `migrate` | POST | db:read, or db:write if anything changes | `{"tables": [{"name", "columns": [{"name", "type", "nullable", "default"}]}]}` |
+| `select` | POST | db:read | `{"table", "where", "order_by": ["col desc"], "limit", "offset"}` |
+| `insert` | POST | db:write | `{"table", "rows": [{...}]}`, returns the stored rows |
+| `update` | POST | db:write | `{"table", "where", "set": {...}}`, returns `{"changes"}` |
+| `delete` | POST | db:write | `{"table", "where"}`, returns `{"changes"}` |
+| `transact` | POST | db:write | `{"ops": [{"op": "insert", ...}, ...]}`, all or nothing |
+| `schema` | GET | db:read | none: tables and columns |
+| `watch` | GET | db:read | none: server-sent events, `ready` then `change` with `{"tables": [...]}` (`null` for anything) |
+
+`where` is `{"col": value}`, `{"col": null}` for NULL, or operators: `{"col": {"$gte": 1, "$in":
+[...], "$ne": ...}}`. Blobs travel as `{"$base64": "..."}`. Unknown keys are refused, and
+`update` and `delete` need a `where` (`{}` for every row).
+
 ## TODO
 
  - App registration & -instanced databases, with per-row user ownership
- - Replace raw SQL API with realtime relational API, ACLs checked by server
  - Admin features - first user is super admin, then can set other users as app admins
  - TS & React library, with auth, file, and db APIs (started in [client/](client): auth and per-user dbs)
  - Schema creations & migrations

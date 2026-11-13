@@ -149,13 +149,15 @@ pub async fn start(mut cfg: config::Config) -> anyhow::Result<Server> {
     tracing::info!("listening on http://{addr} (public origin {origin})");
 
     let (shutdown, rx) = tokio::sync::oneshot::channel::<()>();
+    let closing = state.closing.clone();
     let task = tokio::spawn(async move {
         axum::serve(
             listener,
             app(state).into_make_service_with_connect_info::<std::net::SocketAddr>(),
         )
-        .with_graceful_shutdown(async {
+        .with_graceful_shutdown(async move {
             let _ = rx.await;
+            closing.cancel();
         })
         .await
     });

@@ -174,6 +174,8 @@ pub struct ApiAuth {
     pub scopes: Scopes,
     /// Set for tokens issued to an app through OAuth: they only reach `apps/<id>/`.
     pub app: Option<uuid::Uuid>,
+    /// The bearer token itself, so long-lived responses can check it's still valid.
+    pub token: String,
 }
 
 /// The folder an app's files live in: `apps/<id>`.
@@ -229,6 +231,7 @@ impl FromRequestParts<AppState> for ApiAuth {
             user,
             scopes: Scopes::parse(&scopes),
             app,
+            token: token.to_string(),
         })
     }
 }

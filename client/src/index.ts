@@ -8,7 +8,6 @@ export {
   UserDb,
   type AuthState,
   type BisonBaseOptions,
-  type QueryResult,
   type QueryState,
   type InsertOf,
   type RowOf,

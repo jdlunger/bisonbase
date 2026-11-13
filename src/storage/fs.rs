@@ -13,7 +13,7 @@ use futures_util::{Stream, StreamExt};
 use serde::Serialize;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    sync::RwLock,
+    sync::{RwLock, broadcast},
 };
 
 use crate::error::{AppError, AppResult};
@@ -160,13 +160,42 @@ impl Entry {
     }
 }
 
-/// Shared per-user state: the storage lock and the cached disk usage.
-#[derive(Debug, Default, Clone)]
+/// Shared per-user state: the storage lock, the cached disk usage and change notifications.
+#[derive(Debug, Clone)]
 pub struct UserHandles {
     /// SQL connections hold it shared; file mutations (replace, move, delete) hold it
     /// exclusively, so a database file never changes underneath an open connection.
     pub lock: Arc<RwLock<()>>,
     pub usage: Arc<UsageCache>,
+    pub changes: broadcast::Sender<DbChange>,
+}
+
+/// How many changes a slow watcher may fall behind before it is told "everything changed".
+const CHANGE_BACKLOG: usize = 256;
+
+impl Default for UserHandles {
+    fn default() -> Self {
+        Self {
+            lock: Default::default(),
+            usage: Default::default(),
+            changes: broadcast::channel(CHANGE_BACKLOG).0,
+        }
+    }
+}
+
+/// Something in a user's tree changed: rows in some tables of the database at `path`, or (when
+/// `tables` is `None`) anything at or under `path`.
+#[derive(Debug, Clone)]
+pub struct DbChange {
+    pub path: SafePath,
+    pub tables: Option<Arc<[String]>>,
+}
+
+impl DbChange {
+    /// Whether this change may affect the database at `db`.
+    pub fn affects(&self, db: &SafePath) -> bool {
+        db.starts_with(&self.path)
+    }
 }
 
 /// One [`UserHandles`] per user.
@@ -215,6 +244,7 @@ pub struct UserStore {
     pub root: PathBuf,
     pub lock: Arc<RwLock<()>>,
     pub usage_cache: Arc<UsageCache>,
+    pub changes: broadcast::Sender<DbChange>,
 }
 
 /// Invalidates the usage cache when dropped, so it runs however the mutation ends.
@@ -232,7 +262,18 @@ impl UserStore {
             root: data_dir.join("users").join(user_id.to_string()),
             lock: h.lock,
             usage_cache: h.usage,
+            changes: h.changes,
         }
+    }
+
+    /// Tell watchers that `path` changed: rows in `tables` of the database there, or (`None`)
+    /// anything at or under it.
+    pub fn notify(&self, path: &SafePath, tables: Option<Vec<String>>) {
+        // An error only means nobody is watching.
+        let _ = self.changes.send(DbChange {
+            path: path.clone(),
+            tables: tables.map(Into::into),
+        });
     }
 
     /// Mark the usage total stale; call after changing files under this user's root.
@@ -390,6 +431,7 @@ impl UserStore {
             let _ = tokio::fs::remove_file(&tmp).await;
         }
         result?;
+        self.notify(p, None);
         self.stat(p).await
     }
 
@@ -420,6 +462,7 @@ impl UserStore {
                 remove_sidecars(&fp).await;
             }
         }
+        self.notify(p, None);
         Ok(())
     }
 
@@ -455,6 +498,8 @@ impl UserStore {
                 let _ = tokio::fs::rename(sidecar(&src, s), sidecar(&dst, s)).await;
             }
         }
+        self.notify(from, None);
+        self.notify(to, None);
         Ok(())
     }
 
@@ -473,10 +518,12 @@ impl UserStore {
     pub async fn remove_all(&self) -> AppResult<()> {
         let _guard = self.lock.write().await;
         let _inv = Invalidate(&self.usage_cache);
-        match tokio::fs::remove_dir_all(&self.root).await {
+        let r = match tokio::fs::remove_dir_all(&self.root).await {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
             _ => Ok(()),
-        }
+        };
+        self.notify(&SafePath::default(), None);
+        r
     }
 }
 

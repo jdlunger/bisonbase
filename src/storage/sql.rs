@@ -3,9 +3,10 @@
 //! Everything here is synchronous; callers run it on a blocking thread.
 
 use std::{
+    collections::BTreeSet,
     path::Path,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -19,8 +20,8 @@ use rusqlite::{
     limits::Limit,
     types::{Value, ValueRef},
 };
-use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value as Json, json};
+use serde::Serialize;
+use serde_json::{Value as Json, json};
 
 use crate::error::{AppError, AppResult};
 
@@ -66,6 +67,25 @@ pub struct UserConn {
     deadline: Arc<AtomicU64>,
     epoch: Instant,
     limits: SqlLimits,
+    writes: Arc<Mutex<Writes>>,
+    start_changes: u64,
+}
+
+/// What statements prepared on a connection may have written, as the authorizer saw them.
+#[derive(Debug, Default)]
+struct Writes {
+    tables: BTreeSet<String>,
+    /// Some statement changed the schema (tables, views, indexes or triggers).
+    schema: bool,
+}
+
+/// What a connection changed, for change notifications.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Changed {
+    /// Rows in these tables.
+    Tables(Vec<String>),
+    /// The schema, or something too broad to list.
+    Everything,
 }
 
 impl UserConn {
@@ -110,8 +130,17 @@ impl UserConn {
         conn.pragma_update_and_check(None, "max_page_count", max_pages as i64, |_| Ok(()))?;
         conn.pragma_update(None, "foreign_keys", true)?;
 
-        // Installed last: our own setup pragmas above would otherwise be denied.
-        conn.authorizer(Some(authorize));
+        // Installed last: our own setup pragmas above would otherwise be denied. It also notes
+        // which tables statements write, so watchers can be told what changed.
+        let writes = Arc::new(Mutex::new(Writes::default()));
+        let w = writes.clone();
+        conn.authorizer(Some(move |ctx: AuthContext<'_>| {
+            let verdict = authorize(ctx);
+            if verdict == Authorization::Allow {
+                note_write(&w, ctx);
+            }
+            verdict
+        }));
 
         let deadline = Arc::new(AtomicU64::new(0));
         let epoch = Instant::now();
@@ -123,12 +152,27 @@ impl UserConn {
                 dl != 0 && epoch.elapsed().as_millis() as u64 > dl
             }),
         );
+        let start_changes = conn.total_changes();
         Ok(Self {
             conn,
             deadline,
             epoch,
             limits,
+            writes,
+            start_changes,
         })
+    }
+
+    /// What this connection has changed since it was opened, if anything.
+    pub fn changed(&self) -> Option<Changed> {
+        let w = self.writes.lock().unwrap_or_else(|p| p.into_inner());
+        if w.schema {
+            Some(Changed::Everything)
+        } else if self.conn.total_changes() != self.start_changes && !w.tables.is_empty() {
+            Some(Changed::Tables(w.tables.iter().cloned().collect()))
+        } else {
+            None
+        }
     }
 
     fn arm(&self) {
@@ -139,43 +183,6 @@ impl UserConn {
 
     fn disarm(&self) {
         self.deadline.store(0, Ordering::Relaxed);
-    }
-
-    pub fn query(&self, stmt: &Statement, read_only: bool) -> AppResult<QueryResult> {
-        self.arm();
-        let r = run(&self.conn, stmt, read_only, self.limits.max_rows);
-        self.disarm();
-        r
-    }
-
-    /// Run several statements in one transaction; all or nothing.
-    pub fn batch(&mut self, stmts: &[Statement], read_only: bool) -> AppResult<Vec<QueryResult>> {
-        if stmts.is_empty() {
-            return Ok(Vec::new());
-        }
-        self.arm();
-        let max_rows = self.limits.max_rows;
-        let r = (|| {
-            let tx = self.conn.transaction().map_err(sql_err)?;
-            let mut out = Vec::with_capacity(stmts.len());
-            for (i, s) in stmts.iter().enumerate() {
-                let res = run(&tx, s, read_only, max_rows).map_err(|e| match e {
-                    AppError::BadRequest(m) => AppError::bad(format!("statement {i}: {m}")),
-                    AppError::Forbidden(m) => AppError::forbidden(format!("statement {i}: {m}")),
-                    e => e,
-                })?;
-                out.push(res);
-                if tx.is_autocommit() {
-                    return Err(AppError::bad(
-                        "transaction control statements are not allowed in a batch",
-                    ));
-                }
-            }
-            tx.commit().map_err(sql_err)?;
-            Ok(out)
-        })();
-        self.disarm();
-        r
     }
 
     /// Web UI SQL console; see [`console`].
@@ -222,7 +229,7 @@ pub fn console(
     let mut count = 0;
     while let Some(st) = batch.next().map_err(sql_err)? {
         count += 1;
-        last = Some(run_prepared(conn, st, &Params::None, read_only, max_rows)?);
+        last = Some(run_prepared(conn, st, &[], read_only, max_rows)?);
     }
     match last {
         None => Err(AppError::bad("empty SQL")),
@@ -236,13 +243,24 @@ pub fn console(
 
 /// Tables and views (excluding SQLite's internal ones) with their columns.
 pub fn schema(conn: &Connection) -> AppResult<Vec<TableSchema>> {
+    tables(conn, None)
+}
+
+/// The table or view called `name` (compared case-insensitively, as SQLite does), if any.
+pub fn table(conn: &Connection, name: &str) -> AppResult<Option<TableSchema>> {
+    Ok(tables(conn, Some(name))?.pop())
+}
+
+fn tables(conn: &Connection, only: Option<&str>) -> AppResult<Vec<TableSchema>> {
     let mut st = conn.prepare(
         "SELECT s.name, s.type, s.sql, coalesce(l.wr, 0) FROM sqlite_schema s
          LEFT JOIN pragma_table_list l ON l.schema = 'main' AND l.name = s.name
-         WHERE s.type IN ('table','view') AND s.name NOT LIKE 'sqlite_%' ORDER BY s.name",
+         WHERE s.type IN ('table','view') AND s.name NOT LIKE 'sqlite_%'
+           AND (?1 IS NULL OR s.name = ?1 COLLATE NOCASE)
+         ORDER BY s.name",
     )?;
     let tables: Vec<(String, String, Option<String>, bool)> = st
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .query_map([only], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
         .collect::<Result<_, _>>()?;
     // table_xinfo also lists generated columns (hidden 2/3), which `SELECT *` returns; hidden
     // virtual-table columns (1) are left out.
@@ -337,6 +355,35 @@ pub fn read_only_guard<T>(
     r
 }
 
+/// Record what an allowed statement writes in the main database.
+fn note_write(w: &Mutex<Writes>, ctx: AuthContext<'_>) {
+    if ctx.database_name.is_some_and(|d| d != "main") {
+        return;
+    }
+    let mut w = w.lock().unwrap_or_else(|p| p.into_inner());
+    match ctx.action {
+        AuthAction::Insert { table_name }
+        | AuthAction::Update { table_name, .. }
+        | AuthAction::Delete { table_name } => {
+            if !table_name.starts_with("sqlite_") {
+                w.tables.insert(table_name.to_string());
+            }
+        }
+        AuthAction::CreateTable { .. }
+        | AuthAction::DropTable { .. }
+        | AuthAction::AlterTable { .. }
+        | AuthAction::CreateView { .. }
+        | AuthAction::DropView { .. }
+        | AuthAction::CreateIndex { .. }
+        | AuthAction::DropIndex { .. }
+        | AuthAction::CreateTrigger { .. }
+        | AuthAction::DropTrigger { .. }
+        | AuthAction::CreateVtable { .. }
+        | AuthAction::DropVtable { .. } => w.schema = true,
+        _ => {}
+    }
+}
+
 fn authorize(ctx: AuthContext<'_>) -> Authorization {
     match ctx.action {
         AuthAction::Attach { .. } | AuthAction::Detach { .. } => Authorization::Deny,
@@ -355,22 +402,6 @@ fn authorize(ctx: AuthContext<'_>) -> Authorization {
         }
         _ => Authorization::Allow,
     }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct Statement {
-    pub sql: String,
-    #[serde(default)]
-    pub params: Params,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(untagged)]
-pub enum Params {
-    #[default]
-    None,
-    Positional(Vec<Json>),
-    Named(Map<String, Json>),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -435,9 +466,7 @@ pub fn sql_err(e: rusqlite::Error) -> AppError {
                 _ => AppError::bad(msg),
             }
         }
-        rusqlite::Error::MultipleStatement => {
-            AppError::bad("only one statement per query; use /batch for several")
-        }
+        rusqlite::Error::MultipleStatement => AppError::bad("only one statement is allowed"),
         rusqlite::Error::InvalidParameterCount(got, want) => {
             AppError::bad(format!("expected {want} parameters, got {got}"))
         }
@@ -484,59 +513,26 @@ pub fn sql_to_json(v: ValueRef<'_>) -> Json {
     }
 }
 
-fn run(
-    conn: &Connection,
-    stmt: &Statement,
-    read_only: bool,
-    max_rows: usize,
-) -> AppResult<QueryResult> {
-    if stmt.sql.trim().is_empty() {
-        return Err(AppError::bad("empty SQL"));
-    }
-    let st = conn.prepare(&stmt.sql).map_err(sql_err)?;
-    run_prepared(conn, st, &stmt.params, read_only, max_rows)
-}
-
-fn run_prepared(
+/// Bind `params` to a prepared statement, run it and collect up to `max_rows` rows.
+pub(crate) fn run_prepared(
     conn: &Connection,
     mut st: rusqlite::Statement<'_>,
-    params: &Params,
+    params: &[Value],
     read_only: bool,
     max_rows: usize,
 ) -> AppResult<QueryResult> {
     if read_only && !st.readonly() {
         return Err(AppError::forbidden("only read-only statements are allowed"));
     }
-    match params {
-        Params::None => {}
-        Params::Positional(vals) => {
-            if vals.len() != st.parameter_count() {
-                return Err(AppError::bad(format!(
-                    "expected {} parameters, got {}",
-                    st.parameter_count(),
-                    vals.len()
-                )));
-            }
-            for (i, v) in vals.iter().enumerate() {
-                st.raw_bind_parameter(i + 1, json_to_sql(v)?)
-                    .map_err(sql_err)?;
-            }
-        }
-        Params::Named(map) => {
-            for (k, v) in map {
-                let name = if k.starts_with([':', '@', '$']) {
-                    k.clone()
-                } else {
-                    format!(":{k}")
-                };
-                let idx = st
-                    .parameter_index(&name)
-                    .map_err(sql_err)?
-                    .ok_or_else(|| AppError::bad(format!("unknown parameter {name}")))?;
-                st.raw_bind_parameter(idx, json_to_sql(v)?)
-                    .map_err(sql_err)?;
-            }
-        }
+    if params.len() != st.parameter_count() {
+        return Err(AppError::bad(format!(
+            "expected {} parameters, got {}",
+            st.parameter_count(),
+            params.len()
+        )));
+    }
+    for (i, v) in params.iter().enumerate() {
+        st.raw_bind_parameter(i + 1, v).map_err(sql_err)?;
     }
     let is_readonly = st.readonly();
     let columns: Vec<String> = st.column_names().into_iter().map(String::from).collect();
@@ -578,48 +574,43 @@ mod tests {
         }
     }
 
-    fn s(sql: &str) -> Statement {
-        Statement {
-            sql: sql.into(),
-            params: Params::None,
+    /// Run one statement as the web console would, returning its rows.
+    fn run(c: &UserConn, sql: &str, read_only: bool) -> AppResult<QueryResult> {
+        match c.console(sql, read_only)? {
+            ConsoleOutcome::Result(r) => Ok(r),
+            ConsoleOutcome::Script { .. } => panic!("expected one statement"),
         }
     }
 
     #[test]
-    fn crud_and_params() {
+    fn crud_and_read_only() {
         let dir = tempfile::tempdir().unwrap();
         let c = UserConn::open(&dir.path().join("t.db"), true, limits()).unwrap();
-        c.query(
-            &s("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, data BLOB)"),
+        run(
+            &c,
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, data BLOB)",
             false,
         )
         .unwrap();
-        let ins: Statement = serde_json::from_value(json!({
-            "sql": "INSERT INTO t(name, data) VALUES (?, ?)",
-            "params": ["a", {"$base64": "AAEC"}]
-        }))
-        .unwrap();
-        let r = c.query(&ins, false).unwrap();
-        assert_eq!(r.changes, 1);
-        assert_eq!(r.last_insert_rowid, 1);
-        let sel: Statement = serde_json::from_value(json!({
-            "sql": "SELECT id, name, data FROM t WHERE name = :n",
-            "params": {"n": "a"}
-        }))
-        .unwrap();
-        let r = c.query(&sel, true).unwrap();
+        let st = c
+            .conn
+            .prepare("INSERT INTO t(name, data) VALUES (?, ?)")
+            .unwrap();
+        let params = [
+            json_to_sql(&json!("a")).unwrap(),
+            json_to_sql(&json!({"$base64": "AAEC"})).unwrap(),
+        ];
+        let r = run_prepared(&c.conn, st, &params, false, 100).unwrap();
+        assert_eq!((r.changes, r.last_insert_rowid), (1, 1));
+        let r = run(&c, "SELECT id, name, data FROM t", true).unwrap();
         assert_eq!(r.columns, vec!["id", "name", "data"]);
         assert_eq!(
             r.rows[0],
             vec![json!(1), json!("a"), json!({"$base64": "AAEC"})]
         );
         assert!(matches!(
-            c.query(&s("DELETE FROM t"), true),
+            run(&c, "DELETE FROM t", true),
             Err(AppError::Forbidden(_))
-        ));
-        assert!(matches!(
-            c.query(&s("SELECT 1; SELECT 2"), false),
-            Err(AppError::BadRequest(_))
         ));
     }
 
@@ -633,62 +624,82 @@ mod tests {
             .unwrap();
         let c = UserConn::open(&dir.path().join("t.db"), true, limits()).unwrap();
         let attach = format!("ATTACH DATABASE '{}' AS o", other.display());
-        assert!(c.query(&s(&attach), false).is_err());
-        assert!(c.query(&s("PRAGMA writable_schema = 1"), false).is_err());
-        assert!(c.query(&s("PRAGMA journal_mode = DELETE"), false).is_err());
-        assert!(
-            c.query(&s("PRAGMA max_page_count = 999999999"), false)
-                .is_err()
-        );
-        assert!(c.query(&s("SELECT load_extension('x')"), false).is_err());
+        assert!(run(&c, &attach, false).is_err());
+        assert!(run(&c, "PRAGMA writable_schema = 1", false).is_err());
+        assert!(run(&c, "PRAGMA journal_mode = DELETE", false).is_err());
+        assert!(run(&c, "PRAGMA max_page_count = 999999999", false).is_err());
+        assert!(run(&c, "SELECT load_extension('x')", false).is_err());
         let vac = format!("VACUUM INTO '{}'", dir.path().join("copy.db").display());
-        assert!(c.query(&s(&vac), false).is_err());
+        assert!(run(&c, &vac, false).is_err());
         assert!(!dir.path().join("copy.db").exists());
         // allowed introspection
-        c.query(&s("PRAGMA table_list"), false).unwrap();
-        c.query(&s("PRAGMA user_version = 3"), false).unwrap();
+        run(&c, "PRAGMA table_list", false).unwrap();
+        run(&c, "PRAGMA user_version = 3", false).unwrap();
     }
 
     #[test]
     fn timeout_and_limits() {
         let dir = tempfile::tempdir().unwrap();
         let c = UserConn::open(&dir.path().join("t.db"), true, limits()).unwrap();
-        let slow = s(
-            "WITH RECURSIVE r(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM r) SELECT count(*) FROM r",
-        );
-        let e = c.query(&slow, true).unwrap_err();
+        let slow =
+            "WITH RECURSIVE r(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM r) SELECT count(*) FROM r";
+        let e = run(&c, slow, true).unwrap_err();
         assert!(e.to_string().contains("timed out"), "{e}");
         // connection still usable afterwards
-        c.query(&s("SELECT 1"), true).unwrap();
-        let many = s(
-            "WITH RECURSIVE r(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM r LIMIT 500) SELECT i FROM r",
-        );
-        let r = c.query(&many, true).unwrap();
+        run(&c, "SELECT 1", true).unwrap();
+        let many = "WITH RECURSIVE r(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM r LIMIT 500) SELECT i FROM r";
+        let r = run(&c, many, true).unwrap();
         assert_eq!(r.rows.len(), 100);
         assert!(r.truncated);
         // size limit (1 MiB)
-        c.query(&s("CREATE TABLE big(b)"), false).unwrap();
-        let e = c
-            .query(&s("INSERT INTO big SELECT randomblob(2000000)"), false)
-            .unwrap_err();
+        run(&c, "CREATE TABLE big(b)", false).unwrap();
+        let e = run(&c, "INSERT INTO big SELECT randomblob(2000000)", false).unwrap_err();
         assert!(matches!(e, AppError::QuotaExceeded(_)), "{e}");
     }
 
     #[test]
-    fn batch_is_atomic() {
+    fn tracks_what_changed() {
         let dir = tempfile::tempdir().unwrap();
-        let mut c = UserConn::open(&dir.path().join("t.db"), true, limits()).unwrap();
-        c.query(&s("CREATE TABLE t(x UNIQUE)"), false).unwrap();
-        let r = c.batch(
-            &[s("INSERT INTO t VALUES (1)"), s("INSERT INTO t VALUES (1)")],
+        let path = dir.path().join("t.db");
+        let open = || UserConn::open(&path, false, limits()).unwrap();
+        let c = UserConn::open(&path, true, limits()).unwrap();
+        assert_eq!(c.changed(), None);
+        run(&c, "CREATE TABLE a(x)", false).unwrap();
+        assert_eq!(c.changed(), Some(Changed::Everything));
+        drop(c);
+        let c = open();
+        c.console(
+            "CREATE TABLE b(x); CREATE TABLE log(t);
+                   CREATE TRIGGER tr AFTER INSERT ON a BEGIN INSERT INTO log VALUES ('a'); END;",
             false,
+        )
+        .unwrap();
+        drop(c);
+
+        // Reads and writes that touch no rows change nothing.
+        let c = open();
+        run(&c, "SELECT * FROM a", true).unwrap();
+        run(&c, "DELETE FROM b WHERE x = 1", false).unwrap();
+        assert_eq!(c.changed(), None);
+
+        // A trigger's writes count; so does a truncating DELETE (no update hook fires for it).
+        let c = open();
+        run(&c, "INSERT INTO a VALUES (1)", false).unwrap();
+        assert_eq!(
+            c.changed(),
+            Some(Changed::Tables(vec!["a".into(), "log".into()]))
         );
-        assert!(r.is_err());
-        let r = c.query(&s("SELECT count(*) FROM t"), true).unwrap();
-        assert_eq!(r.rows[0][0], json!(0));
-        assert!(
-            c.batch(&[s("INSERT INTO t VALUES (2)"), s("COMMIT")], false)
-                .is_err()
-        );
+        let c = open();
+        run(&c, "DELETE FROM a", false).unwrap();
+        assert_eq!(c.changed(), Some(Changed::Tables(vec!["a".into()])));
+
+        // Temp tables aren't in the database.
+        let c = open();
+        c.console(
+            "CREATE TEMP TABLE tmp(x); INSERT INTO tmp VALUES (1)",
+            false,
+        )
+        .unwrap();
+        assert_eq!(c.changed(), None);
     }
 }

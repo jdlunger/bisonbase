@@ -92,6 +92,37 @@ fn j(b: &[u8]) -> Value {
     serde_json::from_slice(b).unwrap_or_else(|_| panic!("not json: {}", String::from_utf8_lossy(b)))
 }
 
+/// Open a user's database file directly. The API takes no SQL, so tests set up and check
+/// databases this way.
+fn open_db(e: &Env, user: Uuid, file: &str) -> rusqlite::Connection {
+    rusqlite::Connection::open(e.state.store(user).files_dir().join(file)).unwrap()
+}
+
+fn seed(e: &Env, user: Uuid, file: &str, sql: &str) {
+    open_db(e, user, file).execute_batch(sql).unwrap();
+}
+
+/// Run a query straight on a user's database: `{"rows": [[...], ...]}`.
+fn peek(e: &Env, user: Uuid, file: &str, sql: &str) -> Value {
+    let c = open_db(e, user, file);
+    let mut st = c.prepare(sql).unwrap();
+    let n = st.column_count();
+    let rows: Vec<Vec<Value>> = st
+        .query_map([], |r| {
+            (0..n)
+                .map(|i| Ok(bisonbase::storage::sql::sql_to_json(r.get_ref(i)?)))
+                .collect()
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    json!({ "rows": rows })
+}
+
+fn db_op(db: &str, op: &str, tok: &str, body: Value) -> Request<Body> {
+    json_req("POST", &format!("/api/v1/files/{db}?op={op}"), tok, body)
+}
+
 #[tokio::test]
 async fn requires_auth() {
     let e = env();
@@ -260,38 +291,47 @@ async fn users_are_isolated() {
     assert_eq!(s, StatusCode::NOT_FOUND);
     let (_, _, body) = call(&e, req("GET", "/api/v1/files/", &tb, Body::empty())).await;
     assert_eq!(j(&body)["entries"], json!([]));
+    seed(
+        &e,
+        a,
+        "private.db",
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, x)",
+    );
     let (s, _, _) = call(
         &e,
-        json_req(
-            "POST",
-            "/api/v1/files/private.db?op=query",
+        db_op("private.db", "select", &tb, json!({"table": "t"})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let (s, _, _) = call(
+        &e,
+        req(
+            "GET",
+            "/api/v1/files/private.db?op=watch",
             &tb,
-            json!({"sql": "SELECT 1"}),
+            Body::empty(),
         ),
     )
     .await;
     assert_eq!(s, StatusCode::NOT_FOUND);
 
-    // Bob can't ATTACH Alice's database by path.
+    // Bob can't reach Alice's database through his own: names are checked against his schema,
+    // never spliced into SQL, and there is no SQL op to ATTACH with.
     call(
         &e,
         req("POST", "/api/v1/files/mine.db?op=mkdb", &tb, Body::empty()),
     )
     .await;
     let alice_db = e.state.store(a).files_dir().join("private.db");
-    let (s, _, _) = call(
-        &e,
-        json_req(
-            "POST",
-            "/api/v1/files/mine.db?op=query",
-            &tb,
-            json!({
-                "sql": format!("ATTACH DATABASE '{}' AS a", alice_db.display())
-            }),
-        ),
-    )
-    .await;
-    assert!(s.is_client_error(), "{s}");
+    for table in ["main.t".to_string(), format!("'{}'.t", alice_db.display())] {
+        let (s, _, _) = call(&e, db_op("mine.db", "select", &tb, json!({"table": table}))).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+    let attach = format!("ATTACH DATABASE '{}' AS a", alice_db.display());
+    for op in ["query", "batch"] {
+        let (s, _, _) = call(&e, db_op("mine.db", op, &tb, json!({"sql": attach}))).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+    }
 }
 
 #[tokio::test]
@@ -330,50 +370,37 @@ async fn scopes_enforced() {
         .0,
         StatusCode::CREATED
     );
-    call(
-        &e,
-        json_req(
-            "POST",
-            "/api/v1/files/d.db?op=query",
-            &w,
-            json!({"sql": "CREATE TABLE t(x)"}),
-        ),
-    )
-    .await;
+    let spec = json!({"tables": [{"name": "t", "columns": [{"name": "x", "type": "integer"}]}]});
+    // Read-only tokens can check the tables match, but not create them.
+    assert_eq!(
+        call(&e, db_op("d.db", "migrate", &r, spec.clone())).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        call(&e, db_op("d.db", "migrate", &w, spec.clone())).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        call(&e, db_op("d.db", "migrate", &r, spec)).await.0,
+        StatusCode::OK
+    );
 
-    let (s, _, _) = call(
-        &e,
-        json_req(
-            "POST",
-            "/api/v1/files/d.db?op=query",
-            &r,
-            json!({"sql": "INSERT INTO t VALUES (1)"}),
+    for (op, body) in [
+        ("insert", json!({"table": "t", "rows": [{"x": 1}]})),
+        (
+            "update",
+            json!({"table": "t", "where": {}, "set": {"x": 2}}),
         ),
-    )
-    .await;
-    assert_eq!(s, StatusCode::FORBIDDEN);
-    let (s, _, _) = call(
-        &e,
-        json_req(
-            "POST",
-            "/api/v1/files/d.db?op=query",
-            &r,
-            json!({"sql": "SELECT * FROM t"}),
-        ),
-    )
-    .await;
+        ("delete", json!({"table": "t", "where": {}})),
+        ("transact", json!({"ops": []})),
+    ] {
+        let (s, _, _) = call(&e, db_op("d.db", op, &r, body)).await;
+        assert_eq!(s, StatusCode::FORBIDDEN, "{op}");
+    }
+    let (s, _, _) = call(&e, db_op("d.db", "select", &r, json!({"table": "t"}))).await;
     assert_eq!(s, StatusCode::OK);
     // `none` has db:read but not files:read: it can query but not download the file.
-    let (s, _, _) = call(
-        &e,
-        json_req(
-            "POST",
-            "/api/v1/files/d.db?op=query",
-            &none,
-            json!({"sql": "SELECT * FROM t"}),
-        ),
-    )
-    .await;
+    let (s, _, _) = call(&e, db_op("d.db", "select", &none, json!({"table": "t"}))).await;
     assert_eq!(s, StatusCode::OK);
     assert_eq!(
         call(&e, req("GET", "/api/v1/files/d.db", &none, Body::empty()))
@@ -400,53 +427,115 @@ async fn database_api() {
         StatusCode::OK
     );
 
+    let d = "apps/todo.db";
     let (s, _, b) = call(
         &e,
-        json_req("POST", &format!("{db}?op=batch"), &t, json!({ "statements": [
-            {"sql": "CREATE TABLE items(id INTEGER PRIMARY KEY, title TEXT NOT NULL, done INTEGER DEFAULT 0)"},
-            {"sql": "INSERT INTO items(title) VALUES (?)", "params": ["write design"]},
-            {"sql": "INSERT INTO items(title, done) VALUES (:t, :d)", "params": {"t": "build it", "d": true}},
-        ]})),
+        db_op(
+            d,
+            "migrate",
+            &t,
+            json!({"tables": [{"name": "items", "columns": [
+                {"name": "title", "type": "text"},
+                {"name": "done", "type": "boolean", "default": 0},
+            ]}]}),
+        ),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
-    assert_eq!(j(&b)["results"][2]["last_insert_rowid"], 2);
+    assert_eq!(j(&b)["applied"].as_array().unwrap().len(), 1);
 
     let (s, _, b) = call(
         &e,
-        json_req(
-            "POST",
-            &format!("{db}?op=query"),
+        db_op(
+            d,
+            "insert",
             &t,
-            json!({"sql": "SELECT id, title, done FROM items ORDER BY id"}),
+            json!({"table": "items", "rows": [
+                {"title": "write design"},
+                {"title": "build it", "done": 1},
+            ]}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+    assert_eq!(
+        j(&b),
+        json!({"columns": ["id", "title", "done"], "rows": [[1, "write design", 0], [2, "build it", 1]]})
+    );
+
+    let (s, _, b) = call(
+        &e,
+        db_op(
+            d,
+            "select",
+            &t,
+            json!({"table": "items", "order_by": ["id desc"]}),
         ),
     )
     .await;
     assert_eq!(s, StatusCode::OK);
-    let v = j(&b);
-    assert_eq!(v["columns"], json!(["id", "title", "done"]));
     assert_eq!(
-        v["rows"],
-        json!([[1, "write design", 0], [2, "build it", 1]])
+        j(&b)["rows"],
+        json!([[2, "build it", 1], [1, "write design", 0]])
     );
 
     let (s, _, b) = call(
         &e,
-        json_req(
-            "POST",
-            &format!("{db}?op=query"),
+        db_op(
+            d,
+            "update",
             &t,
-            json!({"sql": "SELEC nope"}),
+            json!({"table": "items", "where": {"done": 0}, "set": {"done": 1}}),
         ),
     )
     .await;
-    assert_eq!(s, StatusCode::BAD_REQUEST);
-    assert!(
-        j(&b)["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("syntax")
-    );
+    assert_eq!((s, j(&b)), (StatusCode::OK, json!({"changes": 1})));
+
+    let (s, _, b) = call(
+        &e,
+        db_op(
+            d,
+            "transact",
+            &t,
+            json!({"ops": [
+                {"op": "insert", "table": "items", "rows": [{"title": "ship it"}]},
+                {"op": "delete", "table": "items", "where": {"id": 1}},
+            ]}),
+        ),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
+    assert_eq!(j(&b)["results"][1], json!({"changes": 1}));
+
+    // Mistakes are reported, not guessed at: unknown tables, columns and keys.
+    for (op, body, status) in [
+        ("select", json!({"table": "nope"}), StatusCode::NOT_FOUND),
+        (
+            "select",
+            json!({"table": "items", "where": {"nope": 1}}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "delete",
+            json!({"table": "items", "were": {"id": 2}}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "insert",
+            json!({"table": "items", "rows": [{"title": null}]}),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let (s, _, b) = call(&e, db_op(d, op, &t, body)).await;
+        assert_eq!(s, status, "{}", String::from_utf8_lossy(&b));
+    }
+    let (s, _, b) = call(
+        &e,
+        db_op(d, "migrate", &t, json!({"tables": [{"name": "items", "columns": [{"name": "title", "type": "integer"}]}]})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    assert_eq!(j(&b)["error"]["code"], "schema_mismatch");
 
     let (s, _, b) = call(
         &e,
@@ -488,16 +577,11 @@ async fn database_api() {
     assert_eq!(s, StatusCode::OK);
     let (s, _, b) = call(
         &e,
-        json_req(
-            "POST",
-            "/api/v1/files/todo2.db?op=query",
-            &t,
-            json!({"sql": "SELECT count(*) FROM items"}),
-        ),
+        db_op("todo2.db", "select", &t, json!({"table": "items"})),
     )
     .await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(j(&b)["rows"][0][0], 2);
+    assert_eq!(j(&b)["rows"].as_array().unwrap().len(), 2);
 
     // An uploaded database file is queryable too.
     let (_, _, snap) = call(&e, req("GET", "/api/v1/files/todo2.db", &t, Body::empty())).await;
@@ -509,26 +593,26 @@ async fn database_api() {
     );
     let (s, _, b) = call(
         &e,
-        json_req(
-            "POST",
-            "/api/v1/files/copy.sqlite?op=query",
+        db_op(
+            "copy.sqlite",
+            "select",
             &t,
-            json!({"sql": "SELECT title FROM items WHERE id = 2"}),
+            json!({"table": "items", "where": {"id": 2}}),
         ),
     )
     .await;
     assert_eq!(s, StatusCode::OK, "{}", String::from_utf8_lossy(&b));
-    assert_eq!(j(&b)["rows"][0][0], "build it");
+    assert_eq!(j(&b)["rows"][0][1], "build it");
 
     // Non-database files can't be queried (and aren't turned into databases).
     call(&e, req("PUT", "/api/v1/files/notes.txt", &t, "")).await;
     let (s, _, _) = call(
         &e,
-        json_req(
-            "POST",
-            "/api/v1/files/notes.txt?op=query",
+        db_op(
+            "notes.txt",
+            "migrate",
             &t,
-            json!({"sql": "CREATE TABLE x(y)"}),
+            json!({"tables": [{"name": "x", "columns": []}]}),
         ),
     )
     .await;
@@ -556,12 +640,7 @@ async fn database_api() {
     );
     let (s, _, _) = call(
         &e,
-        json_req(
-            "POST",
-            "/api/v1/files/todo2.db?op=query",
-            &t,
-            json!({"sql": "SELECT 1"}),
-        ),
+        db_op("todo2.db", "select", &t, json!({"table": "items"})),
     )
     .await;
     assert_eq!(s, StatusCode::NOT_FOUND);
@@ -583,25 +662,24 @@ async fn database_growth_counts_toward_quota() {
         req("POST", "/api/v1/files/d.db?op=mkdb", &t, Body::empty()),
     )
     .await;
-    let q = |sql: &str| {
-        json_req(
-            "POST",
-            "/api/v1/files/d.db?op=query",
-            &t,
-            json!({ "sql": sql }),
-        )
-    };
-    assert_eq!(call(&e, q("CREATE TABLE b(x)")).await.0, StatusCode::OK);
+    let spec = json!({"tables": [{"name": "b", "columns": [{"name": "x", "type": "blob"}]}]});
     assert_eq!(
-        call(&e, q("INSERT INTO b VALUES (randomblob(200000))"))
-            .await
-            .0,
+        call(&e, db_op("d.db", "migrate", &t, spec)).await.0,
         StatusCode::OK
     );
+    let blob = |n: usize| {
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::STANDARD.encode(vec![7u8; n]);
+        db_op(
+            "d.db",
+            "insert",
+            &t,
+            json!({"table": "b", "rows": [{"x": {"$base64": b64}}]}),
+        )
+    };
+    assert_eq!(call(&e, blob(200_000)).await.0, StatusCode::OK);
     assert_eq!(
-        call(&e, q("INSERT INTO b VALUES (randomblob(700000))"))
-            .await
-            .0,
+        call(&e, blob(700_000)).await.0,
         StatusCode::INSUFFICIENT_STORAGE
     );
 }
@@ -663,7 +741,7 @@ async fn cors_preflight() {
     let e = env();
     let r = Request::builder()
         .method("OPTIONS")
-        .uri("/api/v1/files/x.db?op=query")
+        .uri("/api/v1/files/x.db?op=select")
         .header(header::ORIGIN, "https://some-app.example")
         .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
         .header(
@@ -814,16 +892,7 @@ async fn ui_browse() {
         req("POST", "/api/v1/files/app.db?op=mkdb", &t, Body::empty()),
     )
     .await;
-    call(
-        &e,
-        json_req(
-            "POST",
-            "/api/v1/files/app.db?op=query",
-            &t,
-            json!({"sql": "CREATE TABLE \"we\"\"ird\"(x)"}),
-        ),
-    )
-    .await;
+    seed(&e, u, "app.db", "CREATE TABLE \"we\"\"ird\"(x)");
 
     let (s, _, html) = get_page(&e, &cookie, "/files/notes/readme.md").await;
     assert_eq!(s, StatusCode::OK);
@@ -1183,28 +1252,15 @@ async fn ui_row_editing() {
         req("POST", "/api/v1/files/app.db?op=mkdb", &t, Body::empty()),
     )
     .await;
-    call(
+    seed(
         &e,
-        json_req(
-            "POST",
-            "/api/v1/files/app.db?op=batch",
-            &t,
-            json!({"statements": [
-                {"sql": "CREATE TABLE items(id INTEGER PRIMARY KEY, title TEXT NOT NULL, n REAL, b BLOB)"},
-                {"sql": "INSERT INTO items(title, n) VALUES ('first', 1.5)"},
-                {"sql": "CREATE VIEW v AS SELECT title FROM items"}
-            ]}),
-        ),
-    )
-    .await;
-    let q = |sql: &str| {
-        json_req(
-            "POST",
-            "/api/v1/files/app.db?op=query",
-            &t,
-            json!({"sql": sql}),
-        )
-    };
+        u,
+        "app.db",
+        "CREATE TABLE items(id INTEGER PRIMARY KEY, title TEXT NOT NULL, n REAL, b BLOB);
+         INSERT INTO items(title, n) VALUES ('first', 1.5);
+         CREATE VIEW v AS SELECT title FROM items;",
+    );
+    let q = |sql: &str| peek(&e, u, "app.db", sql);
 
     // The landing page previews tables, read-only; views aren't previewed.
     let (s, b) = ui_get(&e, &cookie, "/ui/db?path=app.db").await;
@@ -1266,16 +1322,9 @@ async fn ui_row_editing() {
         b["message"].as_str().unwrap().starts_with("Row inserted"),
         "{b}"
     );
-    let (_, _, r) = call(
-        &e,
-        q("SELECT title, n, typeof(n), hex(b) FROM items WHERE id = 2"),
-    )
-    .await;
+    let r = q("SELECT title, n, typeof(n), hex(b) FROM items WHERE id = 2");
     // REAL affinity stores 42 as 42.0.
-    assert_eq!(
-        j(&r)["rows"][0],
-        json!(["two\nlines", 42.0, "real", "00FF"])
-    );
+    assert_eq!(r["rows"][0], json!(["two\nlines", 42.0, "real", "00FF"]));
 
     // Bad values are rejected with a message and nothing changes.
     let (s, b) = ui_post(&e, &cookie, "/ui/db/row", insert("abc")).await;
@@ -1308,8 +1357,10 @@ async fn ui_row_editing() {
     // The same (now stale) version is refused.
     let (s, _) = ui_post(&e, &cookie, "/ui/db/row", update("again")).await;
     assert_eq!(s, StatusCode::CONFLICT);
-    let (_, _, r) = call(&e, q("SELECT title FROM items WHERE id = 1")).await;
-    assert_eq!(j(&r)["rows"][0][0], "renamed");
+    assert_eq!(
+        q("SELECT title FROM items WHERE id = 1")["rows"][0][0],
+        "renamed"
+    );
     let (s, _) = ui_get(
         &e,
         &cookie,
@@ -1329,8 +1380,7 @@ async fn ui_row_editing() {
     )
     .await;
     assert_eq!((s, &b["message"]), (StatusCode::OK, &json!("Row deleted")));
-    let (_, _, r) = call(&e, q("SELECT count(*) FROM items")).await;
-    assert_eq!(j(&r)["rows"][0][0], 1);
+    assert_eq!(q("SELECT count(*) FROM items")["rows"][0][0], 1);
 }
 
 async fn admin(e: &Env, name: &str) -> Uuid {
@@ -1368,16 +1418,12 @@ async fn admin_browses_user_data_read_only() {
         req("POST", "/api/v1/files/app.db?op=mkdb", &t, Body::empty()),
     )
     .await;
-    call(
+    seed(
         &e,
-        json_req(
-            "POST",
-            "/api/v1/files/app.db?op=batch",
-            &t,
-            json!({"statements": [{"sql": "CREATE TABLE t(x)"}, {"sql": "INSERT INTO t VALUES ('hello')"}]}),
-        ),
-    )
-    .await;
+        alice,
+        "app.db",
+        "CREATE TABLE t(x); INSERT INTO t VALUES ('hello');",
+    );
 
     let (s, _, html) = get_page(&e, &rc, &format!("/admin/users/{alice}/files/notes")).await;
     assert_eq!(s, StatusCode::OK);
@@ -1695,19 +1741,16 @@ async fn ui_inline_cell_editing() {
         req("POST", "/api/v1/files/app.db?op=mkdb", &t, Body::empty()),
     )
     .await;
-    call(
+    seed(
         &e,
-        json_req(
-            "POST",
-            "/api/v1/files/app.db?op=batch",
-            &t,
-            json!({"statements": [
-                {"sql": "CREATE TABLE items(id INTEGER PRIMARY KEY, title TEXT, n INTEGER, b BLOB)"},
-                {"sql": "INSERT INTO items(title, n, b) VALUES (?, 1, x'00')", "params": ["x".repeat(600)]}
-            ]}),
+        u,
+        "app.db",
+        &format!(
+            "CREATE TABLE items(id INTEGER PRIMARY KEY, title TEXT, n INTEGER, b BLOB);
+             INSERT INTO items(title, n, b) VALUES ('{}', 1, x'00');",
+            "x".repeat(600)
         ),
-    )
-    .await;
+    );
 
     // Editable cells carry what the editor needs; long text carries its full value; blobs
     // aren't editable in place.
@@ -2356,7 +2399,7 @@ async fn oauth_apps_only_reach_their_folder() {
         ("DELETE", "/api/v1/files/notes.txt".to_string()),
         ("GET", format!("{other}/x.db?op=schema")),
         ("POST", format!("{other}/x.db?op=mkdb")),
-        ("POST", "/api/v1/files/notes.db?op=query".to_string()),
+        ("POST", "/api/v1/files/notes.db?op=select".to_string()),
         (
             "GET",
             format!("/api/v1/files/apps/{}", APP_ID.to_uppercase()),
@@ -2672,4 +2715,158 @@ async fn cli_recovery_link() {
     )
     .await;
     assert!(b.to_string().contains("(command line)"));
+}
+
+/// Read SSE events from a streaming body until `n` arrive (or a timeout), as (event, data).
+async fn sse_events(body: &mut Body, n: usize) -> Vec<(String, Value)> {
+    use http_body_util::BodyExt;
+    let mut buf = String::new();
+    let mut out = Vec::new();
+    while out.len() < n {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), body.frame())
+            .await
+            .expect("timed out waiting for an event")
+            .expect("stream ended")
+            .unwrap();
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        buf.push_str(std::str::from_utf8(&data).unwrap());
+        while let Some(end) = buf.find("\n\n") {
+            let block: String = buf.drain(..end + 2).collect();
+            let (mut event, mut data) = (String::new(), String::new());
+            for line in block.lines() {
+                if let Some(v) = line.strip_prefix("event:") {
+                    event = v.trim().into();
+                } else if let Some(v) = line.strip_prefix("data:") {
+                    data += v.trim();
+                }
+            }
+            if !event.is_empty() {
+                out.push((event, serde_json::from_str(&data).unwrap()));
+            }
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn watch_streams_changes() {
+    let e = env();
+    let u = user(&e, "alice").await;
+    let t = token(&e, u, "files:write db:write").await;
+    let r = token(&e, u, "db:read").await;
+    call(
+        &e,
+        req("POST", "/api/v1/files/a.db?op=mkdb", &t, Body::empty()),
+    )
+    .await;
+    call(
+        &e,
+        req("POST", "/api/v1/files/b.db?op=mkdb", &t, Body::empty()),
+    )
+    .await;
+    let spec = json!({"tables": [
+        {"name": "items", "columns": [{"name": "x", "type": "integer"}]},
+        {"name": "other", "columns": [{"name": "x", "type": "integer"}]},
+    ]});
+    for db in ["a.db", "b.db"] {
+        call(&e, db_op(db, "migrate", &t, spec.clone())).await;
+    }
+
+    // A read-only token may watch.
+    let res = e
+        .app
+        .clone()
+        .oneshot(req("GET", "/api/v1/files/a.db?op=watch", &r, Body::empty()))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.headers()[header::CONTENT_TYPE], "text/event-stream");
+    let mut body = res.into_body();
+    assert_eq!(sse_events(&mut body, 1).await[0].0, "ready");
+
+    // Writes through the API name the tables they touched; writes to other databases, and
+    // writes that change nothing, aren't sent.
+    call(
+        &e,
+        db_op(
+            "b.db",
+            "insert",
+            &t,
+            json!({"table": "items", "rows": [{"x": 1}]}),
+        ),
+    )
+    .await;
+    call(
+        &e,
+        db_op(
+            "a.db",
+            "delete",
+            &t,
+            json!({"table": "items", "where": {"x": 5}}),
+        ),
+    )
+    .await;
+    call(
+        &e,
+        db_op(
+            "a.db",
+            "insert",
+            &t,
+            json!({"table": "items", "rows": [{"x": 1}]}),
+        ),
+    )
+    .await;
+    call(
+        &e,
+        db_op(
+            "a.db",
+            "transact",
+            &t,
+            json!({"ops": [
+                {"op": "update", "table": "items", "where": {}, "set": {"x": 2}},
+                {"op": "insert", "table": "other", "rows": [{"x": 1}]},
+            ]}),
+        ),
+    )
+    .await;
+    // Replacing the file says anything may have changed.
+    let (_, _, snap) = call(&e, req("GET", "/api/v1/files/b.db", &t, Body::empty())).await;
+    call(&e, req("PUT", "/api/v1/files/a.db", &t, snap)).await;
+    let events = sse_events(&mut body, 3).await;
+    assert_eq!(
+        events,
+        vec![
+            ("change".into(), json!({"tables": ["items"]})),
+            ("change".into(), json!({"tables": ["items", "other"]})),
+            ("change".into(), json!({"tables": null})),
+        ]
+    );
+
+    // Watching needs db:read, and a database.
+    let none = token(&e, u, "files:read").await;
+    let (s, _, _) = call(
+        &e,
+        req("GET", "/api/v1/files/a.db?op=watch", &none, Body::empty()),
+    )
+    .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _, _) = call(
+        &e,
+        req("GET", "/api/v1/files/nope.db?op=watch", &r, Body::empty()),
+    )
+    .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+
+    // Shutting down ends open streams.
+    e.state.closing.cancel();
+    use http_body_util::BodyExt;
+    let end = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(f) = body.frame().await {
+            f.unwrap();
+        }
+    })
+    .await;
+    assert!(end.is_ok(), "stream didn't end on shutdown");
 }

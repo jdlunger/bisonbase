@@ -70,11 +70,8 @@ await todos.delete({ done: true })
 `where` matches when every listed column matches; `null` matches NULL. Operators are `$ne`,
 `$lt`, `$lte`, `$gt`, `$gte` and `$in`.
 
-Raw SQL works on per-user databases, with interpolated values sent as parameters:
-
-```ts
-const [{ n }] = await todos.db.sql`SELECT count(*) AS n FROM todos WHERE done = ${false}`
-```
+The server checks every table and column name against the database and binds every value; it
+accepts no SQL.
 
 ## React
 
@@ -87,9 +84,11 @@ Import `bisonbase/react` once (importing `AuthElement` or `useAuth` does it).
 - `<AuthElement />`: a sign-in button, or a sign-out button once signed in. Unstyled; target
   `.bb-auth`, `.bb-auth-error`.
 
-Queries are fetched again after any write through the library to the same table, and when the
-window regains focus. Changes made elsewhere (another device) show up on focus; the server
-doesn't push changes yet.
+While a live query is in use, the client keeps a change stream open to its database (one per
+database, over server-sent events). The server says which tables changed after every write,
+whether it came from this page, another tab or device, or the bisonbase web UI, and the queries
+on those tables load again. Writes through the library also reload their table's queries
+straight away. If the stream drops, it reconnects and reloads everything.
 
 Outside React, `table.liveQuery(options)` returns the same shared query, with `subscribe` and
 `getSnapshot`.

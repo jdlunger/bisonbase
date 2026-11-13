@@ -3,7 +3,8 @@
 A complete backend for prototyping client-side web apps, started from Node. You get:
 
 - a private file tree per user,
-- SQLite databases (any file in the tree) queried with raw, parameterized SQL over HTTP,
+- SQLite databases (any file in the tree) read and written through a relational JSON API over
+  HTTP, with a stream of changes,
 - a web UI with passkey login, a file browser and database editor, API tokens and an admin page.
 
 It's the [bisonbase](https://github.com/jdlunger/bisonbase/blob/main/README.md) Rust server compiled as a native addon. It runs on its own threads inside your Node process and listens on its own port. Prebuilt binaries are published for Linux (x64, arm64, glibc), macOS (x64, arm64) and Windows (x64), so no Rust toolchain is needed.

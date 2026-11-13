@@ -26,6 +26,9 @@ pub struct AppState {
     pub ceremonies: Arc<Ceremonies>,
     pub locks: Arc<UserLocks>,
     pub limiter: Arc<crate::ratelimit::RateLimiter>,
+    /// Cancelled when the server starts shutting down, so long-lived responses (change streams)
+    /// end instead of holding up a graceful shutdown.
+    pub closing: tokio_util::sync::CancellationToken,
 }
 
 impl AppState {
@@ -41,6 +44,7 @@ impl AppState {
             ceremonies: Arc::new(Ceremonies::default()),
             locks: Arc::new(UserLocks::default()),
             limiter: Default::default(),
+            closing: Default::default(),
         })
     }
 

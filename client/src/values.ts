@@ -84,16 +84,3 @@ export function decode(type: ColumnType, value: Wire): unknown {
       return value
   }
 }
-
-/** Convert a value used in raw SQL (`db.sql`) to its wire form. */
-export function encodeParam(value: unknown): Wire {
-  if (value === null || typeof value === 'string') return value
-  if (typeof value === 'number') {
-    if (!Number.isFinite(value)) throw new TypeError(`SQL parameter must be finite, got ${value}`)
-    return value
-  }
-  if (typeof value === 'boolean') return value ? 1 : 0
-  if (value instanceof Uint8Array) return { $base64: toBase64(value) }
-  if (value === undefined) throw new TypeError('SQL parameter is undefined')
-  return JSON.stringify(value)
-}

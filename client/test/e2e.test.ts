@@ -94,8 +94,6 @@ test('create, insert, select, update, delete', opts, async () => {
   assert.equal(await todos.delete({ content: 'done' }), 2)
   assert.deepEqual((await todos.select()).map((t) => t.content), ['c'])
 
-  const db = todos.db
-  assert.deepEqual(await db.sql`SELECT count(*) AS n FROM todos WHERE done = ${false}`, [{ n: 1 }])
   await assert.rejects(todos.insert({ content: 'x', id: 3 }), (e) => e instanceof ApiError && e.status === 400)
 })
 
@@ -144,6 +142,43 @@ test('live queries load, reload after writes, and empty on sign-out', opts, asyn
   assert.deepEqual(states, ['signed-out'])
   assert.deepEqual(open.getSnapshot(), { rows: [], loading: false, error: null })
   stop()
+})
+
+test('live queries follow changes made elsewhere', opts, async () => {
+  // Two clients for the same user, as in two tabs or on two devices.
+  const token = appToken()
+  const here = new BisonBase(APP, 'Test', { url: server.url, token }).createUserDb('live')
+  const there = new BisonBase(APP, 'Test', { url: server.url, token }).createUserDb('live')
+  const todos = here.createTable('todos', columns)
+  const notes = here.createTable('notes', { text: 'text' })
+  const theirTodos = there.createTable('todos', columns)
+  const theirNotes = there.createTable('notes', { text: 'text' })
+
+  const open = todos.liveQuery({ orderBy: 'id' })
+  let updates = 0
+  const stop = open.subscribe(() => updates++)
+  await until(open, (s) => !s.loading)
+  for (let i = 0; i < 250 && !here._live; i++) await new Promise((r) => setTimeout(r, 20))
+  assert.ok(here._live, 'change stream connected')
+
+  await theirTodos.insert({ content: 'from there' })
+  assert.deepEqual((await until(open, (s) => s.rows.length === 1)).rows.map((t) => t.content), ['from there'])
+  await theirTodos.update({}, { done: true })
+  await until(open, (s) => s.rows[0]?.done === true)
+
+  // A change to another table doesn't reload this one.
+  const openNotes = notes.liveQuery()
+  const stopNotes = openNotes.subscribe(() => {})
+  await until(openNotes, (s) => !s.loading)
+  const seen = updates
+  await theirNotes.insert({ text: 'n' })
+  await until(openNotes, (s) => s.rows.length === 1)
+  await new Promise((r) => setTimeout(r, 100))
+  assert.equal(updates, seen)
+  stopNotes()
+
+  stop()
+  assert.equal(here._live, false, 'stream closes when nothing is subscribed')
 })
 
 test('a revoked token signs the user out', opts, async () => {

@@ -1,12 +1,14 @@
 // The client: BisonBase (sign-in and the connection to the server), UserDb (one SQLite file
-// per user) and Table (typed select / insert / update / delete, plus cached live queries).
+// per user) and Table (typed select / insert / update / delete, plus live queries that the
+// server keeps up to date).
 
 import { revoke, startSignIn, takeSignInResponse } from './auth.ts'
-import { migrationSql, SchemaError, type ServerSchema } from './schema.ts'
-import { deleteSql, insertSql, selectSql, updateSql, type Statement } from './sql.ts'
+import { deleteRequest, insertRequest, selectRequest, updateRequest } from './ops.ts'
+import { migrateRequest, SchemaError } from './schema.ts'
 import { checkName, parseTable, type TableDef } from './table.ts'
 import type { Columns, InsertFor, RowFor, SelectOptions, UpdateFor, Where, Wire } from './types.ts'
-import { decode, encodeParam } from './values.ts'
+import { decode } from './values.ts'
+import { watch } from './watch.ts'
 
 export interface BisonBaseOptions {
   /** The bisonbase server. Default: `/bb` on the current origin. */
@@ -45,12 +47,11 @@ export class NotSignedInError extends Error {
   }
 }
 
-export interface QueryResult {
+/** Rows as the server sends them: column names, then values in wire form. */
+interface Rows {
   columns: string[]
   rows: Wire[][]
-  truncated: boolean
-  changes: number
-  last_insert_rowid: number
+  truncated?: boolean
 }
 
 /** The state of a live query, as `useSelectState` returns it. */
@@ -155,7 +156,8 @@ export class BisonBase {
     }
 
     if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
-      // Pick up changes made in other tabs or apps when the user comes back to this one.
+      // Changes arrive over each database's change stream; if one isn't connected, at least
+      // pick up changes made elsewhere when the user comes back to this page.
       window.addEventListener('focus', () => this.#refreshAll())
       window.addEventListener('storage', (e) => {
         if (e.key === this.#tokenKey && this.#persist && e.newValue !== this.#token) this.#setToken(e.newValue)
@@ -223,7 +225,7 @@ export class BisonBase {
   }
 
   #refreshAll() {
-    for (const q of this.#queries.values()) q._invalidate()
+    for (const q of this.#queries.values()) if (!q.table.db._live) q._invalidate()
   }
 
   /** @internal A cached live query, shared by everything that asks for the same rows. */
@@ -236,10 +238,14 @@ export class BisonBase {
     return q
   }
 
-  /** @internal Mark live queries on `table` (or on every table in `db`) stale, and reload the ones in use. */
-  _invalidate(db: UserDb, table?: Table<any>) {
+  /**
+   * @internal Mark live queries on `tables` of `db` (by name, or every table) stale, and reload
+   * the ones in use.
+   */
+  _invalidate(db: UserDb, tables?: readonly string[]) {
+    const names = tables && new Set(tables.map((t) => t.toLowerCase()))
     for (const q of this.#queries.values()) {
-      if (table ? q.table === table : q.table.db === db) q._invalidate()
+      if (q.table.db === db && (!names || names.has(q.table.name.toLowerCase()))) q._invalidate()
     }
   }
 
@@ -253,24 +259,34 @@ export class BisonBase {
     return this.#auth.status !== 'signed-out'
   }
 
-  /** @internal Call the files API, after any pending sign-in. */
+  /** @internal POST an op to the files API, after any pending sign-in. */
   async _request(path: string, op: string, body?: unknown): Promise<any> {
+    const res = await this._fetch(path, op, { method: 'POST', body })
+    const json = await res.json().catch(() => ({}))
+    if (!res.ok) {
+      const code = json.error?.code ?? 'unknown'
+      const message = json.error?.message ?? res.statusText
+      if (code === 'schema_mismatch') throw new SchemaError(`${path}: ${message}`)
+      throw new ApiError(res.status, code, message)
+    }
+    return json
+  }
+
+  /** @internal Call the files API with the token, signing out if the server rejects it. */
+  async _fetch(path: string, op: string, init: { method: string; body?: unknown; signal?: AbortSignal }): Promise<Response> {
     await this.#settled
     const token = this.#token
     if (!token) throw new NotSignedInError()
     const headers: Record<string, string> = { authorization: `Bearer ${token}` }
-    if (body !== undefined) headers['content-type'] = 'application/json'
+    if (init.body !== undefined) headers['content-type'] = 'application/json'
     const res = await fetch(`${this.url}/api/v1/files/${path}?op=${op}`, {
-      method: op === 'schema' ? 'GET' : 'POST',
+      method: init.method,
       headers,
-      body: body === undefined ? undefined : JSON.stringify(body),
+      body: init.body === undefined ? undefined : JSON.stringify(init.body),
+      signal: init.signal,
     })
-    const json = await res.json().catch(() => ({}))
-    if (!res.ok) {
-      if (res.status === 401 && this.#token === token) this.#setToken(null, EXPIRED)
-      throw new ApiError(res.status, json.error?.code ?? 'unknown', json.error?.message ?? res.statusText)
-    }
-    return json
+    if (res.status === 401 && this.#token === token) this.#setToken(null, EXPIRED)
+    return res
   }
 }
 
@@ -297,13 +313,17 @@ export class LiveQuery<R> {
 
   /** For `useSyncExternalStore`. */
   subscribe = (listener: () => void): (() => void) => {
+    if (this.#listeners.has(listener)) return () => {}
+    // While anything is subscribed, the database's change stream stays open.
+    if (this.#listeners.size === 0) this.table.db._retain()
     this.#listeners.add(listener)
     clearTimeout(this.#gc)
     if (this.#stale) void this.#load()
     return () => {
-      this.#listeners.delete(listener)
+      if (!this.#listeners.delete(listener)) return
       // Keep the rows a little while in case the same query is used again soon.
       if (this.#listeners.size === 0) {
+        this.table.db._release()
         this.#gc = setTimeout(this.#dispose, 30_000)
         // In Node, don't keep the process alive just for this.
         ;(this.#gc as { unref?: () => void }).unref?.()
@@ -369,6 +389,11 @@ export class UserDb {
   readonly path: string
   #tables = new Map<string, Table<any>>()
   #ready: Promise<void> | null = null
+  /** How many live queries on this database are in use. */
+  #watchers = 0
+  #stopWatch: (() => void) | null = null
+  /** @internal Whether the change stream is connected. */
+  _live = false
 
   /** @internal Use `bb.createUserDb`. */
   constructor(bb: BisonBase, name: string) {
@@ -396,23 +421,53 @@ export class UserDb {
     return table
   }
 
-  /**
-   * Run raw SQL against this database, returning rows as objects. Values interpolated into
-   * the template are sent as bound parameters. Booleans come back as 0/1 and JSON as text.
-   *
-   * ```ts
-   * const rows = await db.sql`SELECT count(*) AS n FROM todos WHERE done = ${false}`
-   * ```
-   */
-  async sql(strings: TemplateStringsArray, ...values: unknown[]): Promise<Record<string, Wire>[]> {
-    const result = await this._query({ sql: strings.join('?'), params: values.map(encodeParam) })
-    this.bb._invalidate(this)
-    return result.rows.map((row) => Object.fromEntries(result.columns.map((c, i) => [c, row[i]])))
-  }
-
-  /** @internal Forget that the schema was set up (the user changed). */
+  /** @internal Forget that the schema was set up, and reconnect the change stream (the user changed). */
   _reset() {
     this.#ready = null
+    this.#unwatch()
+    if (this.#watchers > 0) this.#watch()
+  }
+
+  /** @internal A live query on this database is in use. */
+  _retain() {
+    if (this.#watchers++ === 0) this.#watch()
+  }
+
+  /** @internal A live query on this database is no longer in use. */
+  _release() {
+    if (--this.#watchers === 0) this.#unwatch()
+  }
+
+  /** Follow the server's change stream, reloading live queries on the tables that change. */
+  #watch() {
+    if (this.#stopWatch || !this.bb._active) return
+    const stop = watch({
+      open: async (signal) => {
+        await this._ensure()
+        return this.bb._fetch(this.path, 'watch', { method: 'GET', signal })
+      },
+      // Signed out, or the tables can't be set up: retrying won't help.
+      fatal: (e) => e instanceof NotSignedInError || e instanceof SchemaError,
+      onEvent: (event, data) => {
+        // `ready` comes first on every (re)connection: changes may have been missed before it.
+        if (event === 'ready') this.bb._invalidate(this)
+        else if (event === 'change') {
+          const tables = (data as { tables?: string[] | null }).tables
+          this.bb._invalidate(this, tables ?? undefined)
+        }
+      },
+      onLive: (live) => {
+        // A stream that was already stopped may report late; only the current one counts.
+        if (this.#stopWatch === stop) this._live = live
+      },
+    })
+    this.#stopWatch = stop
+  }
+
+  #unwatch() {
+    this.#stopWatch?.()
+    this.#stopWatch = null
+    this._live = false
   }
 
   /** @internal Create the database and bring its tables up to date, once per sign-in. */
@@ -427,31 +482,15 @@ export class UserDb {
     return this.#ready
   }
 
-  async #setUp(attempt = 0): Promise<void> {
-    const tables = [...this.#tables.values()].map((t) => t.def)
+  async #setUp(): Promise<void> {
     await this.bb._request(this.path, 'mkdb')
-    const schema: ServerSchema = await this.bb._request(this.path, 'schema')
-    const statements = migrationSql(tables, schema, this.path)
-    if (statements.length === 0) return
-    try {
-      await this.bb._request(this.path, 'batch', { statements: statements.map((sql) => ({ sql })) })
-    } catch (e) {
-      // Another tab may have made the same change at the same time; look again.
-      if (attempt === 0 && e instanceof ApiError && e.status === 400) return this.#setUp(1)
-      throw e
-    }
+    await this.bb._request(this.path, 'migrate', migrateRequest([...this.#tables.values()].map((t) => t.def)))
   }
 
-  /** @internal */
-  async _query(stmt: Statement): Promise<QueryResult> {
+  /** @internal Run a relational op once the tables are set up. */
+  async _op(op: 'select' | 'insert' | 'update' | 'delete', body: unknown): Promise<any> {
     await this._ensure()
-    return this.bb._request(this.path, 'query', stmt)
-  }
-
-  /** @internal Run statements in one transaction. */
-  async _batch(stmts: Statement[]): Promise<QueryResult[]> {
-    await this._ensure()
-    return (await this.bb._request(this.path, 'batch', { statements: stmts })).results
+    return this.bb._request(this.path, op, body)
   }
 }
 
@@ -471,7 +510,7 @@ export class Table<C extends Columns> {
     return this.def.name
   }
 
-  #rows(result: QueryResult): RowFor<C>[] {
+  #rows(result: Rows): RowFor<C>[] {
     const types = result.columns.map((c) => (c === 'id' ? null : this.def.byName.get(c)?.type ?? null))
     return result.rows.map(
       (row) => Object.fromEntries(row.map((v, i) => [result.columns[i], types[i] ? decode(types[i], v) : v])) as RowFor<C>,
@@ -480,7 +519,7 @@ export class Table<C extends Columns> {
 
   /** Fetch rows once. For rows that stay up to date in a component, use `useSelect`. */
   async select(options?: SelectOptions<RowFor<C>>): Promise<RowFor<C>[]> {
-    const result = await this.db._query(selectSql(this.def, options))
+    const result: Rows = await this.db._op('select', selectRequest(this.def, options))
     if (result.truncated) console.warn(`BisonBase: results from ${this.name} were truncated by the server's row limit`)
     return this.#rows(result)
   }
@@ -492,11 +531,10 @@ export class Table<C extends Columns> {
   async insert(rows: InsertFor<C> | readonly InsertFor<C>[]): Promise<RowFor<C> | RowFor<C>[]> {
     const many = Array.isArray(rows)
     const list = (many ? rows : [rows]) as Record<string, unknown>[]
-    const stmts = list.map((row) => insertSql(this.def, row))
-    if (stmts.length === 0) return []
-    const results = many ? await this.db._batch(stmts) : [await this.db._query(stmts[0])]
-    this.db.bb._invalidate(this.db, this)
-    const inserted = results.flatMap((r) => this.#rows(r))
+    const req = insertRequest(this.def, list)
+    if (req.rows.length === 0) return []
+    const inserted = this.#rows(await this.db._op('insert', req))
+    this.#changed()
     return many ? inserted : inserted[0]
   }
 
@@ -505,26 +543,31 @@ export class Table<C extends Columns> {
    * Pass `{}` to change every row.
    */
   async update(where: Where<RowFor<C>> | number, changes: UpdateFor<C>): Promise<number> {
-    const stmt = updateSql(this.def, where, changes as Record<string, unknown>)
-    if (!stmt) return 0
-    const result = await this.db._query(stmt)
-    this.db.bb._invalidate(this.db, this)
-    return result.changes
+    const req = updateRequest(this.def, where, changes as Record<string, unknown>)
+    if (!req) return 0
+    const { changes: n } = await this.db._op('update', req)
+    this.#changed()
+    return n
   }
 
   /** Delete the rows matching `where` (or the row with that id). Returns how many were deleted. Pass `{}` to delete every row. */
   async delete(where: Where<RowFor<C>> | number): Promise<number> {
     if (where === undefined) throw new Error('delete needs a where; pass {} to delete every row')
-    const result = await this.db._query(deleteSql(this.def, where))
-    this.db.bb._invalidate(this.db, this)
-    return result.changes
+    const { changes: n } = await this.db._op('delete', deleteRequest(this.def, where))
+    this.#changed()
+    return n
+  }
+
+  /** Reload live queries on this table now, rather than waiting for the change stream. */
+  #changed() {
+    this.db.bb._invalidate(this.db, [this.name])
   }
 
   /** The live query for these options, shared with every other user of the same options. */
   liveQuery(options?: SelectOptions<RowFor<C>>): LiveQuery<RowFor<C>> {
     const key = stableKey([this.db.name, this.name, options ?? {}])
     // Validate now so mistakes throw where the query is written, not later in a fetch.
-    selectSql(this.def, options)
+    selectRequest(this.def, options)
     return this.db.bb._liveQuery(key, () => this.select(options), this)
   }
 

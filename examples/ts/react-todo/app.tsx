@@ -22,7 +22,7 @@ type Todo = RowOf<typeof todos>
 
 function App() {
   const auth = useAuth()
-  // Re-fetched after every change made through `todos`, and when the window regains focus.
+  // Kept up to date: reloaded whenever the table changes, from this tab or anywhere else.
   const items = todos.useSelect({ orderBy: ['done', 'id'] })
   const left = items.filter((t) => !t.done).length
 

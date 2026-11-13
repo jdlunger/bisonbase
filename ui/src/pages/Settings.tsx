@@ -266,7 +266,12 @@ function Tokens({ data, reload }: Props) {
 curl -X PUT -H "Authorization: Bearer $TOKEN" --data-binary @notes.txt ${o}/api/v1/files/docs/notes.txt
 curl -X POST -H "Authorization: Bearer $TOKEN" "${o}/api/v1/files/app.db?op=mkdb"
 curl -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
-  -d '{"sql": "SELECT ?1 AS hello", "params": ["world"]}' "${o}/api/v1/files/app.db?op=query"`}</pre>
+  -d '{"tables": [{"name": "notes", "columns": [{"name": "text", "type": "text"}]}]}' "${o}/api/v1/files/app.db?op=migrate"
+curl -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
+  -d '{"table": "notes", "rows": [{"text": "hello"}]}' "${o}/api/v1/files/app.db?op=insert"
+curl -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \\
+  -d '{"table": "notes", "where": {"id": {"$gte": 1}}, "order_by": ["id desc"]}' "${o}/api/v1/files/app.db?op=select"
+curl -N -H "Authorization: Bearer $TOKEN" "${o}/api/v1/files/app.db?op=watch"`}</pre>
       </details>
     </Card>
   )

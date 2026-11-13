@@ -18,6 +18,10 @@ pub enum AppError {
     NotFound(String),
     #[error("{0}")]
     Conflict(String),
+    /// A database's tables don't match what the app declares, and can't be changed to match
+    /// without losing data.
+    #[error("{0}")]
+    SchemaMismatch(String),
     #[error("{0}")]
     PayloadTooLarge(String),
     #[error("{0}")]
@@ -35,7 +39,7 @@ impl AppError {
             AppError::Unauthorized => StatusCode::UNAUTHORIZED,
             AppError::Forbidden(_) => StatusCode::FORBIDDEN,
             AppError::NotFound(_) => StatusCode::NOT_FOUND,
-            AppError::Conflict(_) => StatusCode::CONFLICT,
+            AppError::Conflict(_) | AppError::SchemaMismatch(_) => StatusCode::CONFLICT,
             AppError::PayloadTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             AppError::QuotaExceeded(_) => StatusCode::INSUFFICIENT_STORAGE,
             AppError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -49,6 +53,7 @@ impl AppError {
             AppError::Forbidden(_) => "forbidden",
             AppError::NotFound(_) => "not_found",
             AppError::Conflict(_) => "conflict",
+            AppError::SchemaMismatch(_) => "schema_mismatch",
             AppError::PayloadTooLarge(_) => "payload_too_large",
             AppError::QuotaExceeded(_) => "quota_exceeded",
             AppError::Internal(_) => "internal",

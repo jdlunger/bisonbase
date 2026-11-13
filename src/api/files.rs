@@ -103,6 +103,7 @@ pub async fn get(
     match q.op.as_deref() {
         None => {}
         Some("schema") => return db::schema(&state, &auth, &p).await,
+        Some("watch") => return db::watch(&state, &auth, &p).await,
         Some(other) => return Err(AppError::bad(format!("unknown op '{other}'"))),
     }
     auth.scopes.require(auth.scopes.files_read, "files:read")?;
@@ -215,8 +216,12 @@ pub async fn post(
     auth.check_path(&p)?;
     match q.op.as_str() {
         "mkdb" => return db::mkdb(&state, &auth, &p).await,
-        "query" => return db::query(&state, &auth, &p, &body).await,
-        "batch" => return db::batch(&state, &auth, &p, &body).await,
+        "select" => return db::select(&state, &auth, &p, &body).await,
+        op @ ("insert" | "update" | "delete") => {
+            return db::write(&state, &auth, &p, op, &body).await;
+        }
+        "transact" => return db::transact(&state, &auth, &p, &body).await,
+        "migrate" => return db::migrate(&state, &auth, &p, &body).await,
         _ => {}
     }
     auth.scopes
