@@ -1,9 +1,9 @@
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
 use rusqlite::{Connection, OptionalExtension};
@@ -49,6 +49,13 @@ async fn main() {
             token TEXT PRIMARY KEY,
             pubkey TEXT NOT NULL REFERENCES users(pubkey),
             created_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+        CREATE TABLE IF NOT EXISTS notes (
+            id INTEGER PRIMARY KEY,
+            author TEXT NOT NULL REFERENCES users(pubkey),
+            body TEXT NOT NULL,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            updated_at INTEGER NOT NULL DEFAULT (unixepoch())
         );",
     )
     .unwrap();
@@ -73,6 +80,8 @@ async fn main() {
         .route("/api/login/start", post(login_start))
         .route("/api/login/finish", post(login_finish))
         .route("/api/logout", post(logout))
+        .route("/api/notes", get(list_notes).post(create_note))
+        .route("/api/notes/{id}", put(update_note).delete(delete_note))
         .with_state(app)
         .fallback_service(spa);
 
@@ -235,4 +244,92 @@ async fn logout(State(app): S, headers: HeaderMap) -> StatusCode {
         app.db.lock().unwrap().execute("DELETE FROM sessions WHERE token = ?1", [token]).unwrap();
     }
     StatusCode::NO_CONTENT
+}
+
+#[derive(Deserialize)]
+struct NoteBody {
+    body: String,
+}
+
+/// The trimmed note text, or a 400 if it's empty.
+fn note_body(req: &NoteBody) -> Result<&str, Response> {
+    let body = req.body.trim();
+    if body.is_empty() { Err(err("note is empty")) } else { Ok(body) }
+}
+
+async fn list_notes(State(app): S) -> Json<Value> {
+    let db = app.db.lock().unwrap();
+    let mut stmt = db
+        .prepare("SELECT id, author, body, created_at, updated_at FROM notes ORDER BY created_at DESC, id DESC")
+        .unwrap();
+    let notes: Vec<Value> = stmt
+        .query_map([], |r| {
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?,
+                "author": user_json(&app, &r.get::<_, String>(1)?),
+                "body": r.get::<_, String>(2)?,
+                "created_at": r.get::<_, i64>(3)?,
+                "updated_at": r.get::<_, i64>(4)?,
+            }))
+        })
+        .unwrap()
+        .flatten()
+        .collect();
+    Json(Value::Array(notes))
+}
+
+async fn create_note(State(app): S, headers: HeaderMap, Json(req): Json<NoteBody>) -> Response {
+    let Some(author) = session_pubkey(&app, &headers) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let body = match note_body(&req) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    app.db
+        .lock()
+        .unwrap()
+        .execute("INSERT INTO notes (author, body) VALUES (?1, ?2)", (&author, body))
+        .unwrap();
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// Only the note's author can edit it; anyone else gets a 404.
+async fn update_note(
+    State(app): S,
+    headers: HeaderMap,
+    Path(id): Path<i64>,
+    Json(req): Json<NoteBody>,
+) -> Response {
+    let Some(author) = session_pubkey(&app, &headers) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let body = match note_body(&req) {
+        Ok(b) => b,
+        Err(e) => return e,
+    };
+    let n = app
+        .db
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE notes SET body = ?1, updated_at = unixepoch() WHERE id = ?2 AND author = ?3",
+            (body, id, &author),
+        )
+        .unwrap();
+    if n == 0 { StatusCode::NOT_FOUND } else { StatusCode::NO_CONTENT }.into_response()
+}
+
+/// Only the note's author can delete it; anyone else gets a 404.
+async fn delete_note(State(app): S, headers: HeaderMap, Path(id): Path<i64>) -> StatusCode {
+    let Some(author) = session_pubkey(&app, &headers) else {
+        return StatusCode::UNAUTHORIZED;
+    };
+    let n = app
+        .db
+        .lock()
+        .unwrap()
+        .execute("DELETE FROM notes WHERE id = ?1 AND author = ?2", (id, &author))
+        .unwrap();
+    if n == 0 { StatusCode::NOT_FOUND } else { StatusCode::NO_CONTENT }
 }
