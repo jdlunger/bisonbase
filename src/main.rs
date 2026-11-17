@@ -1,30 +1,33 @@
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode, header},
+    http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::get,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
+use ed25519_dalek::{Signature, VerifyingKey};
 use rusqlite::{Connection, OptionalExtension};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
     sync::{Arc, Mutex},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tower_http::services::{ServeDir, ServeFile};
-use uuid::Uuid;
-use webauthn_rs::prelude::*;
 
 const WORDS: &str = include_str!("../google-10000-english-usa-no-swears.txt");
 
+/// Bump to wipe the database when the schema changes incompatibly.
+/// 3: no sessions; every note write is signed by its author and versioned.
+const SCHEMA_VERSION: i64 = 3;
+
+/// How far ahead of the server's clock a write's version may be.
+const MAX_CLOCK_SKEW_MS: i64 = 10 * 60 * 1000;
+
 struct App {
-    webauthn: Webauthn,
     db: Mutex<Connection>,
-    pending_reg: Mutex<HashMap<String, PasskeyRegistration>>,
-    pending_auth: Mutex<HashMap<String, DiscoverableAuthentication>>,
     words: Vec<&'static str>,
 }
 
@@ -32,28 +35,31 @@ type S = State<Arc<App>>;
 
 #[tokio::main]
 async fn main() {
-    let origin = std::env::var("ORIGIN").unwrap_or("http://localhost:8080".into());
-    let origin = Url::parse(&origin).expect("bad ORIGIN");
-    let rp_id = origin.host_str().expect("ORIGIN needs a host").to_string();
-    let webauthn = WebauthnBuilder::new(&rp_id, &origin).unwrap().build().unwrap();
-
     let db = Connection::open(std::env::var("DB").unwrap_or("users.db".into())).unwrap();
+    let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+    if version < SCHEMA_VERSION {
+        db.execute_batch(&format!(
+            "DROP TABLE IF EXISTS notes; DROP TABLE IF EXISTS sessions; DROP TABLE IF EXISTS users;
+             PRAGMA user_version = {SCHEMA_VERSION};"
+        ))
+        .unwrap();
+    }
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS users (
             pubkey TEXT PRIMARY KEY,
-            cred_id TEXT NOT NULL UNIQUE,
-            passkey TEXT NOT NULL,
             created_at INTEGER NOT NULL DEFAULT (unixepoch())
         );
-        CREATE TABLE IF NOT EXISTS sessions (
-            token TEXT PRIMARY KEY,
-            pubkey TEXT NOT NULL REFERENCES users(pubkey),
-            created_at INTEGER NOT NULL DEFAULT (unixepoch())
-        );
+        -- One row per note, holding its latest signed write (last writer wins, by version).
+        -- Deleted notes stay as tombstones so an older signed write can't resurrect them.
         CREATE TABLE IF NOT EXISTS notes (
-            id INTEGER PRIMARY KEY,
+            id TEXT PRIMARY KEY,
             author TEXT NOT NULL REFERENCES users(pubkey),
-            body TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            deleted INTEGER NOT NULL DEFAULT 0,
+            body TEXT NOT NULL DEFAULT '',
+            encrypted INTEGER NOT NULL DEFAULT 0,
+            wrapped_key TEXT,
+            sig TEXT NOT NULL,
             created_at INTEGER NOT NULL DEFAULT (unixepoch()),
             updated_at INTEGER NOT NULL DEFAULT (unixepoch())
         );",
@@ -61,10 +67,7 @@ async fn main() {
     .unwrap();
 
     let app = Arc::new(App {
-        webauthn,
         db: Mutex::new(db),
-        pending_reg: Default::default(),
-        pending_auth: Default::default(),
         words: WORDS.lines().map(str::trim).filter(|w| !w.is_empty()).collect(),
     });
 
@@ -74,31 +77,32 @@ async fn main() {
 
     let router = Router::new()
         .route("/api/users", get(users))
-        .route("/api/me", get(me))
-        .route("/api/register/start", post(register_start))
-        .route("/api/register/finish", post(register_finish))
-        .route("/api/login/start", post(login_start))
-        .route("/api/login/finish", post(login_finish))
-        .route("/api/logout", post(logout))
-        .route("/api/notes", get(list_notes).post(create_note))
-        .route("/api/notes/{id}", put(update_note).delete(delete_note))
+        .route("/api/users/{pubkey}", get(user))
+        .route("/api/notes", get(list_notes))
+        .route("/api/notes/{id}", axum::routing::put(put_note).delete(delete_note))
         .with_state(app)
         .fallback_service(spa);
 
     let port = std::env::var("PORT").unwrap_or("8080".into());
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await.unwrap();
-    println!("listening on {origin} (port {port})");
+    println!("listening http://localhost:{port}");
     axum::serve(listener, router).await.unwrap();
 }
 
-/// The user's ID: their public key, base64url-encoded.
-fn pubkey_id(pk: &Passkey) -> String {
-    let bytes = match &pk.get_public_key().key {
-        COSEKeyType::EC_EC2(k) => [&[4u8][..], &k.x, &k.y].concat(), // SEC1 uncompressed point
-        COSEKeyType::EC_OKP(k) => k.x.clone(),
-        COSEKeyType::RSA(k) => [&k.n[..], &k.e[..]].concat(),
-    };
-    B64.encode(bytes)
+/// Checks an Ed25519 signature by `pubkey` (base64url, 32 bytes) over `msg`.
+fn verify(pubkey: &str, msg: &[u8], sig: &str) -> Result<(), String> {
+    let pk: [u8; 32] = B64
+        .decode(pubkey)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or("public key isn't 32 bytes of base64url")?;
+    let sig: [u8; 64] = B64
+        .decode(sig)
+        .ok()
+        .and_then(|b| b.try_into().ok())
+        .ok_or("signature isn't 64 bytes of base64url")?;
+    let pk = VerifyingKey::from_bytes(&pk).map_err(|e| e.to_string())?;
+    pk.verify_strict(msg, &Signature::from_bytes(&sig)).map_err(|_| "signature doesn't match".to_string())
 }
 
 /// Deterministic 4-word phrase from the public key.
@@ -115,32 +119,8 @@ fn user_json(app: &App, pubkey: &str) -> Value {
     json!({ "pubkey": pubkey, "phrase": phrase(app, pubkey) })
 }
 
-fn session_token(headers: &HeaderMap) -> Option<&str> {
-    let cookies = headers.get(header::COOKIE)?.to_str().ok()?;
-    cookies.split(';').find_map(|c| c.trim().strip_prefix("session="))
-}
-
-fn session_pubkey(app: &App, headers: &HeaderMap) -> Option<String> {
-    let token = session_token(headers)?;
-    let db = app.db.lock().unwrap();
-    db.query_row("SELECT pubkey FROM sessions WHERE token = ?1", [token], |r| r.get(0))
-        .optional()
-        .unwrap()
-}
-
-fn sign_in(app: &App, pubkey: &str) -> Response {
-    let token = Uuid::new_v4().to_string();
-    app.db
-        .lock()
-        .unwrap()
-        .execute("INSERT INTO sessions (token, pubkey) VALUES (?1, ?2)", (&token, pubkey))
-        .unwrap();
-    let cookie = format!("session={token}; Path=/; HttpOnly; SameSite=Strict");
-    ([(header::SET_COOKIE, cookie)], Json(user_json(app, pubkey))).into_response()
-}
-
-fn err(e: impl std::fmt::Display) -> Response {
-    (StatusCode::BAD_REQUEST, e.to_string()).into_response()
+fn err(status: StatusCode, e: impl std::fmt::Display) -> Response {
+    (status, e.to_string()).into_response()
 }
 
 async fn users(State(app): S) -> Json<Value> {
@@ -150,126 +130,100 @@ async fn users(State(app): S) -> Json<Value> {
     Json(keys.iter().map(|k| user_json(&app, k)).collect())
 }
 
-async fn me(State(app): S, headers: HeaderMap) -> Json<Value> {
-    Json(session_pubkey(&app, &headers).map_or(Value::Null, |k| user_json(&app, &k)))
+/// Any public key's phrase, whether or not it has written anything yet.
+async fn user(State(app): S, Path(pubkey): Path<String>) -> Json<Value> {
+    Json(user_json(&app, &pubkey))
+}
+
+// ---- notes: every write is a signed, versioned operation ----
+
+/// The exact bytes a note write's signature covers. Keep in sync with writePayload in web/src/api.ts.
+fn write_payload(id: &str, version: i64, put: Option<&PutNote>) -> String {
+    let head = format!("bisonbase-note-v2\n{id}\n{version}");
+    match put {
+        None => format!("{head}\ndelete"),
+        Some(p) => format!(
+            "{head}\nput\n{}\n{}\n{}",
+            if p.encrypted { "encrypted" } else { "plain" },
+            p.wrapped_key.as_deref().unwrap_or(""),
+            p.body
+        ),
+    }
 }
 
 #[derive(Deserialize)]
-struct Finish<T> {
-    id: String,
-    credential: T,
+struct PutNote {
+    author: String,
+    /// Milliseconds since the epoch, by the author's clock; a write only lands if it's newer.
+    version: i64,
+    /// Plain text, or base64url(iv || AES-GCM ciphertext) under a random per-note key when `encrypted`.
+    body: String,
+    #[serde(default)]
+    encrypted: bool,
+    /// For encrypted notes: base64url(iv || per-note key encrypted under the author's note key).
+    wrapped_key: Option<String>,
+    /// base64url Ed25519 signature by `author` over write_payload(..).
+    sig: String,
 }
 
-async fn register_start(State(app): S) -> Response {
-    let user_id = Uuid::new_v4();
-    let name = format!("user-{}", &user_id.to_string()[..8]);
-    match app.webauthn.start_passkey_registration(user_id, &name, &name, None) {
-        Ok((options, state)) => {
-            let id = Uuid::new_v4().to_string();
-            app.pending_reg.lock().unwrap().insert(id.clone(), state);
-            Json(json!({ "id": id, "options": options })).into_response()
-        }
-        Err(e) => err(e),
+#[derive(Deserialize)]
+struct DeleteNote {
+    author: String,
+    version: i64,
+    sig: String,
+}
+
+fn valid_id(id: &str) -> bool {
+    (1..=64).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn now_ms() -> i64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64
+}
+
+/// Checks the signature, the author, and that the write is newer than what's stored.
+fn check_write(app: &App, id: &str, author: &str, version: i64, payload: &str, sig: &str) -> Result<(), Response> {
+    if !valid_id(id) {
+        return Err(err(StatusCode::BAD_REQUEST, "bad note id"));
     }
-}
-
-async fn register_finish(
-    State(app): S,
-    Json(req): Json<Finish<RegisterPublicKeyCredential>>,
-) -> Response {
-    let Some(state) = app.pending_reg.lock().unwrap().remove(&req.id) else {
-        return err("unknown registration");
-    };
-    let pk = match app.webauthn.finish_passkey_registration(&req.credential, &state) {
-        Ok(pk) => pk,
-        Err(e) => return err(e),
-    };
-    let pubkey = pubkey_id(&pk);
-    let res = app.db.lock().unwrap().execute(
-        "INSERT INTO users (pubkey, cred_id, passkey) VALUES (?1, ?2, ?3)",
-        (&pubkey, B64.encode(pk.cred_id()), serde_json::to_string(&pk).unwrap()),
-    );
-    match res {
-        Ok(_) => sign_in(&app, &pubkey),
-        Err(e) => err(e),
+    if version > now_ms() + MAX_CLOCK_SKEW_MS {
+        return Err(err(StatusCode::BAD_REQUEST, "version is too far in the future; check your clock"));
     }
-}
-
-async fn login_start(State(app): S) -> Response {
-    match app.webauthn.start_discoverable_authentication() {
-        Ok((options, state)) => {
-            let id = Uuid::new_v4().to_string();
-            app.pending_auth.lock().unwrap().insert(id.clone(), state);
-            Json(json!({ "id": id, "options": options })).into_response()
-        }
-        Err(e) => err(e),
-    }
-}
-
-async fn login_finish(State(app): S, Json(req): Json<Finish<PublicKeyCredential>>) -> Response {
-    let Some(state) = app.pending_auth.lock().unwrap().remove(&req.id) else {
-        return err("unknown login");
-    };
-    let cred_id = B64.encode(req.credential.get_credential_id());
-    let db = app.db.lock().unwrap();
-    let row: Option<(String, String)> = db
-        .query_row(
-            "SELECT pubkey, passkey FROM users WHERE cred_id = ?1",
-            [&cred_id],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
+    verify(author, payload.as_bytes(), sig).map_err(|e| err(StatusCode::BAD_REQUEST, format!("bad signature: {e}")))?;
+    let existing: Option<(String, i64)> = app
+        .db
+        .lock()
+        .unwrap()
+        .query_row("SELECT author, version FROM notes WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()
         .unwrap();
-    let Some((pubkey, passkey)) = row else {
-        return err("unknown passkey");
-    };
-    let mut pk: Passkey = serde_json::from_str(&passkey).unwrap();
-    let result = match app.webauthn.finish_discoverable_authentication_v2(&req.credential, state, &pk) {
-        Ok(r) => r,
-        Err(e) => return err(e),
-    };
-    if pk.update_credential(&result) == Some(true) {
-        db.execute(
-            "UPDATE users SET passkey = ?1 WHERE pubkey = ?2",
-            (serde_json::to_string(&pk).unwrap(), &pubkey),
-        )
-        .unwrap();
+    match existing {
+        Some((a, _)) if a != author => Err(err(StatusCode::FORBIDDEN, "that note belongs to someone else")),
+        Some((_, v)) if v >= version => Err(err(StatusCode::CONFLICT, "a newer version of this note exists")),
+        _ => Ok(()),
     }
-    drop(db);
-    sign_in(&app, &pubkey)
-}
-
-async fn logout(State(app): S, headers: HeaderMap) -> StatusCode {
-    if let Some(token) = session_token(&headers) {
-        app.db.lock().unwrap().execute("DELETE FROM sessions WHERE token = ?1", [token]).unwrap();
-    }
-    StatusCode::NO_CONTENT
-}
-
-#[derive(Deserialize)]
-struct NoteBody {
-    body: String,
-}
-
-/// The trimmed note text, or a 400 if it's empty.
-fn note_body(req: &NoteBody) -> Result<&str, Response> {
-    let body = req.body.trim();
-    if body.is_empty() { Err(err("note is empty")) } else { Ok(body) }
 }
 
 async fn list_notes(State(app): S) -> Json<Value> {
     let db = app.db.lock().unwrap();
     let mut stmt = db
-        .prepare("SELECT id, author, body, created_at, updated_at FROM notes ORDER BY created_at DESC, id DESC")
+        .prepare(
+            "SELECT id, author, version, body, encrypted, wrapped_key, sig, created_at, updated_at
+             FROM notes WHERE NOT deleted ORDER BY created_at DESC, id",
+        )
         .unwrap();
     let notes: Vec<Value> = stmt
         .query_map([], |r| {
             Ok(json!({
-                "id": r.get::<_, i64>(0)?,
+                "id": r.get::<_, String>(0)?,
                 "author": user_json(&app, &r.get::<_, String>(1)?),
-                "body": r.get::<_, String>(2)?,
-                "created_at": r.get::<_, i64>(3)?,
-                "updated_at": r.get::<_, i64>(4)?,
+                "version": r.get::<_, i64>(2)?,
+                "body": r.get::<_, String>(3)?,
+                "encrypted": r.get::<_, bool>(4)?,
+                "wrapped_key": r.get::<_, Option<String>>(5)?,
+                "sig": r.get::<_, String>(6)?,
+                "created_at": r.get::<_, i64>(7)?,
+                "updated_at": r.get::<_, i64>(8)?,
             }))
         })
         .unwrap()
@@ -278,58 +232,54 @@ async fn list_notes(State(app): S) -> Json<Value> {
     Json(Value::Array(notes))
 }
 
-async fn create_note(State(app): S, headers: HeaderMap, Json(req): Json<NoteBody>) -> Response {
-    let Some(author) = session_pubkey(&app, &headers) else {
-        return StatusCode::UNAUTHORIZED.into_response();
-    };
-    let body = match note_body(&req) {
-        Ok(b) => b,
-        Err(e) => return e,
-    };
-    app.db
-        .lock()
-        .unwrap()
-        .execute("INSERT INTO notes (author, body) VALUES (?1, ?2)", (&author, body))
-        .unwrap();
+/// Creates or replaces a note.
+async fn put_note(State(app): S, Path(id): Path<String>, Json(req): Json<PutNote>) -> Response {
+    if req.body.is_empty() || req.body.trim() != req.body {
+        return err(StatusCode::BAD_REQUEST, "note must be non-empty and trimmed");
+    }
+    if req.encrypted {
+        // 12-byte IV + 32-byte key + 16-byte GCM tag.
+        if !req.wrapped_key.as_deref().is_some_and(|k| B64.decode(k).is_ok_and(|b| b.len() == 60)) {
+            return err(StatusCode::BAD_REQUEST, "encrypted note is missing its wrapped key");
+        }
+        // 12-byte IV + 16-byte GCM tag at minimum.
+        if !B64.decode(&req.body).is_ok_and(|b| b.len() > 28) {
+            return err(StatusCode::BAD_REQUEST, "encrypted note body isn't valid ciphertext");
+        }
+    } else if req.wrapped_key.is_some() {
+        return err(StatusCode::BAD_REQUEST, "plain notes don't have a wrapped key");
+    }
+    let payload = write_payload(&id, req.version, Some(&req));
+    if let Err(e) = check_write(&app, &id, &req.author, req.version, &payload, &req.sig) {
+        return e;
+    }
+    let db = app.db.lock().unwrap();
+    db.execute("INSERT OR IGNORE INTO users (pubkey) VALUES (?1)", [&req.author]).unwrap();
+    db.execute(
+        "INSERT INTO notes (id, author, version, body, encrypted, wrapped_key, sig)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT (id) DO UPDATE SET version = ?3, deleted = 0, body = ?4, encrypted = ?5,
+             wrapped_key = ?6, sig = ?7, updated_at = unixepoch()",
+        (&id, &req.author, req.version, &req.body, req.encrypted, &req.wrapped_key, &req.sig),
+    )
+    .unwrap();
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// Only the note's author can edit it; anyone else gets a 404.
-async fn update_note(
-    State(app): S,
-    headers: HeaderMap,
-    Path(id): Path<i64>,
-    Json(req): Json<NoteBody>,
-) -> Response {
-    let Some(author) = session_pubkey(&app, &headers) else {
-        return StatusCode::UNAUTHORIZED.into_response();
-    };
-    let body = match note_body(&req) {
-        Ok(b) => b,
-        Err(e) => return e,
-    };
-    let n = app
-        .db
-        .lock()
-        .unwrap()
-        .execute(
-            "UPDATE notes SET body = ?1, updated_at = unixepoch() WHERE id = ?2 AND author = ?3",
-            (body, id, &author),
-        )
-        .unwrap();
-    if n == 0 { StatusCode::NOT_FOUND } else { StatusCode::NO_CONTENT }.into_response()
-}
-
-/// Only the note's author can delete it; anyone else gets a 404.
-async fn delete_note(State(app): S, headers: HeaderMap, Path(id): Path<i64>) -> StatusCode {
-    let Some(author) = session_pubkey(&app, &headers) else {
-        return StatusCode::UNAUTHORIZED;
-    };
-    let n = app
-        .db
-        .lock()
-        .unwrap()
-        .execute("DELETE FROM notes WHERE id = ?1 AND author = ?2", (id, &author))
-        .unwrap();
-    if n == 0 { StatusCode::NOT_FOUND } else { StatusCode::NO_CONTENT }
+/// Deletes a note, leaving a signed tombstone.
+async fn delete_note(State(app): S, Path(id): Path<String>, Json(req): Json<DeleteNote>) -> Response {
+    let payload = write_payload(&id, req.version, None);
+    if let Err(e) = check_write(&app, &id, &req.author, req.version, &payload, &req.sig) {
+        return e;
+    }
+    let db = app.db.lock().unwrap();
+    db.execute("INSERT OR IGNORE INTO users (pubkey) VALUES (?1)", [&req.author]).unwrap();
+    db.execute(
+        "INSERT INTO notes (id, author, version, deleted, sig) VALUES (?1, ?2, ?3, 1, ?4)
+         ON CONFLICT (id) DO UPDATE SET version = ?3, deleted = 1, body = '', encrypted = 0,
+             wrapped_key = NULL, sig = ?4, updated_at = unixepoch()",
+        (&id, &req.author, req.version, &req.sig),
+    )
+    .unwrap();
+    StatusCode::NO_CONTENT.into_response()
 }
