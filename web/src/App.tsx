@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   type Note,
+  type Passkey,
   type User,
   decryptNote,
   deleteNote,
@@ -9,6 +10,9 @@ import {
   getUsers,
   isRemembering,
   forgetKeys,
+  forgetRecentPasskey,
+  myPasskey,
+  recentPasskeys,
   myPubkey,
   putNote,
   deriveFromNewPasskey,
@@ -30,6 +34,19 @@ const badge = "rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset";
 const fmtTime = (t: number) => new Date(t * 1000).toLocaleString();
 
 type Draft = { body: string; encrypt: boolean };
+
+/** A forged note, added client-side to the bottom of the list to show what a bad signature looks like. */
+const FORGED_NOTE: Note = {
+  id: "forged-demo-note",
+  author: { pubkey: "O2onvM62pC1io6jQKm8Nc2UyFXcd4kOmOsBIoYtZ2ik", phrase: "forged_signature_demo_note" },
+  version: 1,
+  body: "This note was added client-side with a made-up signature, so it should show as a bad signature.",
+  encrypted: false,
+  wrapped_key: null,
+  sig: "A".repeat(86),
+  created_at: Math.floor(Date.now() / 1000),
+  updated_at: Math.floor(Date.now() / 1000),
+};
 
 // The composer's Encrypt choice persists across visits.
 const OPTS_KEY = "note-opts";
@@ -100,13 +117,25 @@ export default function App() {
   /** Per note ID: decrypted text, and whether its signature checks out. */
   const [plain, setPlain] = useState<Record<string, string>>({});
   const [verified, setVerified] = useState<Record<string, boolean>>({});
+  /** The passkey the loaded keys came from, and others used on this device recently (with their keys' phrases). */
+  const [passkey, setPasskey] = useState<Passkey | null>(null);
+  const [recent, setRecent] = useState<(Passkey & { phrase: string })[]>([]);
 
   const refresh = useCallback(async () => {
     const pubkey = myPubkey();
-    const [m, u, n] = await Promise.all([pubkey ? getUser(pubkey) : null, getUsers(), getNotes()]);
+    const current = myPasskey();
+    const others = recentPasskeys().filter((p) => p.credId !== current?.credId);
+    const [m, u, n, phrases] = await Promise.all([
+      pubkey ? getUser(pubkey) : null,
+      getUsers(),
+      getNotes(),
+      Promise.all(others.map((p) => getUser(p.pubkey).then((u) => u.phrase))),
+    ]);
     setMe(m);
     setUsers(u);
-    setNotes(n);
+    setNotes([...n, FORGED_NOTE]);
+    setPasskey(current);
+    setRecent(others.map((p, i) => ({ ...p, phrase: phrases[i] })));
     setRememberState(isRemembering());
   }, []);
 
@@ -161,7 +190,13 @@ export default function App() {
         <div className="flex flex-wrap items-center gap-3">
           {me ? (
             <span>
-              Keys loaded (<strong title={me.pubkey}>{me.phrase}</strong>). Derive different keys:
+              Keys loaded (<strong title={me.pubkey}>{me.phrase}</strong>
+              {passkey && (
+                <>
+                  , from passkey <strong>{passkey.name ?? "(unnamed)"}</strong>
+                </>
+              )}
+              ). Derive different keys:
             </span>
           ) : (
             <span>Derive keys:</span>
@@ -182,6 +217,33 @@ export default function App() {
           Everything happens in your browser: your passkey derives a signing key (your ID) and an encryption key.
           A new passkey may ask for confirmation twice: once to create it, once to derive the keys.
         </p>
+        {recent.length > 0 && (
+          <div>
+            <h3 className="text-sm font-semibold">{me ? "Other passkeys" : "Passkeys"} recently used on this device</h3>
+            <ul className="mt-1 divide-y divide-gray-200 rounded-lg text-sm ring-1 ring-gray-200">
+              {recent.map((p) => (
+                <li key={p.credId} className="flex flex-wrap items-center justify-between gap-2 p-2">
+                  <span>
+                    <strong>{p.name ?? "(unnamed passkey)"}</strong>
+                    <span className="ml-2 text-xs text-gray-500">
+                      keys <span title={p.pubkey}>{p.phrase}</span> ·{" "}
+                      last used{" "}
+                      {new Date(p.lastUsed).toLocaleString()}
+                    </span>
+                  </span>
+                  <span className="flex gap-2">
+                    <button className={secondary} disabled={busy} onClick={run(() => deriveFromExistingPasskey(p.credId))}>
+                      Use
+                    </button>
+                    <button className={secondary} disabled={busy} onClick={run(() => forgetRecentPasskey(p.credId))}>
+                      Remove
+                    </button>
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
         {me && (
           <>
             <div className="space-y-1 text-sm">
@@ -194,7 +256,7 @@ export default function App() {
                     setRememberState(isRemembering());
                   }}
                 />
-                🔑 Remember my keys on this device (keep them loaded across reloads)
+                🔑 Remember keys (save across reloads, no passkey flow needed, this device only)
               </label>
               {remember && (
                 <p className="text-xs text-amber-800">
