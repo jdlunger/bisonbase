@@ -1,55 +1,15 @@
 [package]
-name = "bisonbase"
+name = "fedcrdt"
 version = "0.1.0"
 edition = "2024"
-description = "Backend-as-a-service: per-user files and SQLite databases with a web UI and passkey auth"
-license = "MIT"
-repository = "https://github.com/jdlunger/bisonbase"
-homepage = "https://github.com/jdlunger/bisonbase"
-readme = "README.md"
-keywords = ["sqlite", "backend", "passkeys", "self-hosted", "baas"]
-categories = ["web-programming::http-server", "database"]
-exclude = ["/examples", "/node", "/.github", "/tests/browser", "/ui/node_modules"]
 
 [dependencies]
-anyhow = "1"
-axum = { version = "0.8", features = ["multipart", "macros"] }
-axum-extra = { version = "0.12", features = ["cookie"] }
-base64 = "0.22"
-bytes = "1"
-futures-util = "0.3"
-hex = "0.4"
-mime_guess = "2"
-percent-encoding = "2"
-rand = "0.9"
-rusqlite = { version = "0.37", features = ["bundled", "hooks", "limits", "backup"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
-thiserror = "2"
-tokio = { version = "1", features = ["full"] }
-tokio-util = { version = "0.7", features = ["io"] }
-time = "0.3"
-tower-http = { version = "0.6", features = ["cors", "trace", "limit", "set-header"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-url = "2"
-uuid = { version = "1", features = ["v4", "serde"] }
-webauthn-rs = "0.5"
-# Only for the `vendored-openssl` feature.
-openssl = { version = "0.10", optional = true }
-
-[features]
-# Build and link OpenSSL statically (used for the release binaries and Docker image).
-vendored-openssl = ["dep:openssl", "openssl/vendored"]
-
-[dev-dependencies]
-tower = { version = "0.5", features = ["util"] }
-http-body-util = "0.1"
-tempfile = "3"
-
-[profile.release]
-strip = true
-
-[workspace]
-members = ["node"]
+axum = "0.8.9"
+base64 = "0.23.1"
+rusqlite = { version = "0.43.0", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sha2 = "0.11.1"
+tokio = { version = "1.54.1", features = ["full"] }
+uuid = { version = "1.29.3", features = ["v4"] }
+webauthn-rs = { version = "0.6.2", features = ["conditional-ui"] }
