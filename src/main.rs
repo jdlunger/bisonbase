@@ -2,7 +2,7 @@ use axum::{
     Json, Router,
     extract::State,
     http::{HeaderMap, StatusCode, header},
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
@@ -14,6 +14,7 @@ use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
 };
+use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 use webauthn_rs::prelude::*;
 
@@ -60,8 +61,11 @@ async fn main() {
         words: WORDS.lines().map(str::trim).filter(|w| !w.is_empty()).collect(),
     });
 
+    // The React app (web/), built with `npm run build`; unknown paths fall back to index.html.
+    let web_dir = std::env::var("WEB_DIR").unwrap_or("web/dist".into());
+    let spa = ServeDir::new(&web_dir).fallback(ServeFile::new(format!("{web_dir}/index.html")));
+
     let router = Router::new()
-        .route("/", get(|| async { Html(include_str!("index.html")) }))
         .route("/api/users", get(users))
         .route("/api/me", get(me))
         .route("/api/register/start", post(register_start))
@@ -69,7 +73,8 @@ async fn main() {
         .route("/api/login/start", post(login_start))
         .route("/api/login/finish", post(login_finish))
         .route("/api/logout", post(logout))
-        .with_state(app);
+        .with_state(app)
+        .fallback_service(spa);
 
     let port = std::env::var("PORT").unwrap_or("8080".into());
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await.unwrap();

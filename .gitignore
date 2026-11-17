@@ -1,2 +1,5 @@
 /target
 /users.db
+/node_modules
+/web/dist
+*.tsbuildinfo

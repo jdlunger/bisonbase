@@ -1,7 +1,7 @@
 # federated crdt
 
 Simple Rust web server that:
- - Serves a JS SPA
+ - Serves a React + Tailwind SPA (in `web/`)
  - Uses SQLite (users, sessions)
  - On main page, offers A) a list of all users (if any) and B) "create new passkey" and "sign in with existing passkey" buttons (or says already signed in); if sign-in fails, tells the user and suggests creating a new one
  - Allows users to sign in with passkey only
@@ -11,7 +11,6 @@ Simple Rust web server that:
 ## Run
 
 ```
-cargo run
+npm install
+npm run dev
 ```
-
-Then open http://localhost:8080. Env vars: `ORIGIN` (default `http://localhost:8080`; passkeys need https anywhere except localhost), `PORT` (default 8080), `DB` (default `users.db`).
