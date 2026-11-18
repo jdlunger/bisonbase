@@ -7,6 +7,7 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
 use ed25519_dalek::{Signature, VerifyingKey};
+use fedcrdt::{NOTE_NAMESPACE, is_sshsig, verify_sshsig, write_payload};
 use rusqlite::{Connection, OptionalExtension};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -89,18 +90,19 @@ async fn main() {
     axum::serve(listener, router).await.unwrap();
 }
 
-/// Checks an Ed25519 signature by `pubkey` (base64url, 32 bytes) over `msg`.
+/// Checks a signature by `pubkey` (base64url, 32 bytes) over `msg`. `sig` is base64url of either a bare
+/// Ed25519 signature (passkey-derived keys) or an SSHSIG blob (ssh-ed25519 keys, see src/lib.rs).
 fn verify(pubkey: &str, msg: &[u8], sig: &str) -> Result<(), String> {
     let pk: [u8; 32] = B64
         .decode(pubkey)
         .ok()
         .and_then(|b| b.try_into().ok())
         .ok_or("public key isn't 32 bytes of base64url")?;
-    let sig: [u8; 64] = B64
-        .decode(sig)
-        .ok()
-        .and_then(|b| b.try_into().ok())
-        .ok_or("signature isn't 64 bytes of base64url")?;
+    let sig = B64.decode(sig).map_err(|_| "signature isn't base64url")?;
+    if is_sshsig(&sig) {
+        return verify_sshsig(&pk, NOTE_NAMESPACE, msg, &sig);
+    }
+    let sig: [u8; 64] = sig.try_into().map_err(|_| "signature isn't 64 bytes, nor an SSH signature")?;
     let pk = VerifyingKey::from_bytes(&pk).map_err(|e| e.to_string())?;
     pk.verify_strict(msg, &Signature::from_bytes(&sig)).map_err(|_| "signature doesn't match".to_string())
 }
@@ -137,20 +139,6 @@ async fn user(State(app): S, Path(pubkey): Path<String>) -> Json<Value> {
 
 // ---- notes: every write is a signed, versioned operation ----
 
-/// The exact bytes a note write's signature covers. Keep in sync with writePayload in web/src/api.ts.
-fn write_payload(id: &str, version: i64, put: Option<&PutNote>) -> String {
-    let head = format!("bisonbase-note-v2\n{id}\n{version}");
-    match put {
-        None => format!("{head}\ndelete"),
-        Some(p) => format!(
-            "{head}\nput\n{}\n{}\n{}",
-            if p.encrypted { "encrypted" } else { "plain" },
-            p.wrapped_key.as_deref().unwrap_or(""),
-            p.body
-        ),
-    }
-}
-
 #[derive(Deserialize)]
 struct PutNote {
     author: String,
@@ -162,7 +150,7 @@ struct PutNote {
     encrypted: bool,
     /// For encrypted notes: base64url(iv || per-note key encrypted under the author's note key).
     wrapped_key: Option<String>,
-    /// base64url Ed25519 signature by `author` over write_payload(..).
+    /// base64url signature by `author` over write_payload(..): bare Ed25519, or SSHSIG (see verify).
     sig: String,
 }
 
@@ -249,7 +237,7 @@ async fn put_note(State(app): S, Path(id): Path<String>, Json(req): Json<PutNote
     } else if req.wrapped_key.is_some() {
         return err(StatusCode::BAD_REQUEST, "plain notes don't have a wrapped key");
     }
-    let payload = write_payload(&id, req.version, Some(&req));
+    let payload = write_payload(&id, req.version, Some((req.encrypted, req.wrapped_key.as_deref(), &req.body)));
     if let Err(e) = check_write(&app, &id, &req.author, req.version, &payload, &req.sig) {
         return e;
     }

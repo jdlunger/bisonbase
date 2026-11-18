@@ -348,9 +348,77 @@ export async function deleteNote(note: Note) {
 /** Checks a note's signature against its author's ID (their Ed25519 public key), without trusting the server. */
 export async function verifyNote(note: Note): Promise<boolean> {
   try {
-    const key = await crypto.subtle.importKey("raw", unb64(note.author.pubkey), "Ed25519", false, ["verify"]);
-    return await crypto.subtle.verify("Ed25519", key, unb64(note.sig), writePayload(note.id, note.version, note));
+    const pk = unb64(note.author.pubkey);
+    const key = await crypto.subtle.importKey("raw", pk, "Ed25519", false, ["verify"]);
+    const msg = writePayload(note.id, note.version, note);
+    const sig = unb64(note.sig);
+    if (!isSshsig(sig)) return await crypto.subtle.verify("Ed25519", key, sig, msg);
+    const s = await parseSshsig(sig, pk, NOTE_NAMESPACE);
+    return !!s && (await crypto.subtle.verify("Ed25519", key, s.raw, await sshsigSignedData(NOTE_NAMESPACE, s.reserved, msg)));
   } catch {
     return false;
   }
+}
+
+// ---- SSH signatures ----
+//
+// Writes by the `note` CLI (src/bin/note.rs) are signed with an ssh-ed25519 key from the author's
+// SSH agent, in OpenSSH's SSHSIG format (what `ssh-keygen -Y sign` makes), under NOTE_NAMESPACE.
+// The author's ID is then their SSH public key itself. Keep in sync with src/lib.rs.
+
+const NOTE_NAMESPACE = "bisonbase-note";
+const SSHSIG = enc.encode("SSHSIG");
+
+const isSshsig = (sig: Uint8Array) => SSHSIG.every((b, i) => sig[i] === b);
+
+/** SSH wire-format string: u32 big-endian length, then the bytes. */
+const sshString = (b: Uint8Array) => {
+  const out = new Uint8Array(4 + b.length);
+  new DataView(out.buffer).setUint32(0, b.length);
+  out.set(b, 4);
+  return out;
+};
+
+const bytesEqual = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((x, i) => x === b[i]);
+
+/** Picks an SSHSIG blob apart; null unless it's an ssh-ed25519, sha512 signature by `pk` under `namespace`. */
+async function parseSshsig(sig: Uint8Array, pk: Uint8Array, namespace: string) {
+  let at = SSHSIG.length;
+  const dv = new DataView(sig.buffer, sig.byteOffset, sig.byteLength);
+  const u32 = () => {
+    const v = dv.getUint32(at); // throws past the end
+    at += 4;
+    return v;
+  };
+  const str = () => {
+    const n = u32();
+    if (at + n > sig.length) throw new Error("truncated");
+    return sig.slice(at, (at += n));
+  };
+  if (u32() !== 1) return null;
+  const keyBlob = str();
+  const ns = str();
+  const reserved = str();
+  const hash = str();
+  const sigBlob = str();
+  if (at !== sig.length) return null;
+  const want = new Uint8Array([...sshString(enc.encode("ssh-ed25519")), ...sshString(pk)]);
+  if (!bytesEqual(keyBlob, want) || !bytesEqual(ns, enc.encode(namespace))) return null;
+  if (!bytesEqual(hash, enc.encode("sha512"))) return null;
+  const algo = sshString(enc.encode("ssh-ed25519"));
+  if (sigBlob.length !== algo.length + 4 + 64 || !bytesEqual(sigBlob.slice(0, algo.length), algo)) return null;
+  if (new DataView(sigBlob.buffer).getUint32(algo.length) !== 64) return null;
+  return { reserved, raw: sigBlob.slice(algo.length + 4) };
+}
+
+/** The bytes an SSHSIG signature actually covers. */
+async function sshsigSignedData(namespace: string, reserved: Uint8Array, msg: Uint8Array<ArrayBuffer>) {
+  const hash = new Uint8Array(await crypto.subtle.digest("SHA-512", msg));
+  return new Uint8Array([
+    ...SSHSIG,
+    ...sshString(enc.encode(namespace)),
+    ...sshString(reserved),
+    ...sshString(enc.encode("sha512")),
+    ...sshString(hash),
+  ]);
 }
