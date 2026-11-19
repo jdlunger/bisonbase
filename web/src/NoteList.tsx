@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { type Grant, type Post, type User, canEdit, deletePost, newPostPath, putPost } from "./api.ts";
-import { Link, idPath } from "./router.tsx";
+import { Link, idPath, recordPath } from "./router.tsx";
 import { type Run, badge, danger, fmtTime, input, link, primary, secondary, textarea } from "./ui.ts";
 
 /** `path` and `grant` are only for new posts: where it goes, and the grant to write in someone else's space. */
@@ -95,6 +95,57 @@ function typeColor(type: string) {
   return typeColors[3 + (h % (typeColors.length - 3))];
 }
 
+/** A record's bb:// address with the owner as a phrase (`short`: just its first word). Clicking or
+ * selecting any of it swaps in the real address, selected and copied to the clipboard, until it loses focus. */
+function Uri({ post: n, short }: { post: Post; short: boolean }) {
+  const [full, setFull] = useState(false);
+  const [copied, setCopied] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  const href = recordPath(n.owner.pubkey, n.rec.path);
+  useEffect(() => {
+    if (!full || !ref.current) return;
+    getSelection()?.selectAllChildren(ref.current);
+    navigator.clipboard?.writeText(location.origin + href).then(
+      () => setCopied(true),
+      () => {},
+    );
+  }, [full]);
+  useEffect(() => {
+    if (!copied) return;
+    const t = setTimeout(() => setCopied(false), 1200);
+    return () => clearTimeout(t);
+  }, [copied]);
+  return (
+    <div className="relative">
+      {copied && (
+        <span className="pointer-events-none absolute bottom-full left-0 mb-1 rounded bg-gray-900 px-2 py-0.5 text-xs text-white shadow select-none">
+          Link copied
+        </span>
+      )}
+      <div
+        ref={ref}
+        tabIndex={-1}
+        onMouseUp={() => setFull(true)}
+        onBlur={() => setFull(false)}
+        className="font-mono text-sm break-all text-gray-500 outline-none"
+      >
+        {full ? (
+          <Link href={href} className={link}>
+            {location.origin}/bb/{n.owner.pubkey}
+            <span className="font-semibold text-gray-900">{n.rec.path}</span>
+          </Link>
+        ) : (
+          <>
+            bb://
+            <span title={n.owner.pubkey}>{short ? `${n.owner.phrase.split("_")[0]}_…` : n.owner.phrase}</span>
+            <span className="font-semibold text-gray-900">{n.rec.path}</span>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
 type ItemProps = { post: Post; me: User | null; busy: boolean; run: Run };
 
 /** One record: author, badges, content, and Edit / Delete when we may. `name` replaces the bb:// address (in trees). */
@@ -105,10 +156,10 @@ function PostItem({ post: n, me, busy, run, name }: ItemProps & { name?: string 
   const elsewhere = n.owner.pubkey !== n.author.pubkey;
   return (
     <div className="p-3">
+      {name ? <div className="font-mono text-sm font-semibold">{name}</div> : <Uri post={n} short={!elsewhere} />}
       <div className="flex flex-wrap items-baseline justify-between gap-2 text-sm">
         <span className="flex flex-wrap items-baseline gap-2">
-          {name && <span className="font-mono font-semibold">{name}</span>}
-          <Link href={idPath(n.author.pubkey)} className={`font-semibold ${link}`} title={n.author.pubkey}>
+          <Link href={idPath(n.author.pubkey)} className={link} title={n.author.pubkey}>
             {n.author.phrase}
             {mine && <span className="ml-1 font-normal text-gray-500">(you)</span>}
           </Link>
@@ -126,15 +177,6 @@ function PostItem({ post: n, me, busy, run, name }: ItemProps & { name?: string 
         </span>
         <span className="text-xs text-gray-500">{fmtTime(n.rec.version / 1000)}</span>
       </div>
-      {!name && (
-        <Link
-          href={idPath(n.owner.pubkey)}
-          className={`block font-mono text-xs break-all text-gray-500 ${link}`}
-          title={elsewhere ? `in ${n.owner.phrase}'s space` : undefined}
-        >
-          {n.uri}
-        </Link>
-      )}
       {editing ? (
         <div className="mt-2">
           <NoteEditor
@@ -205,7 +247,24 @@ export function NoteList({ posts, ...rest }: { posts: Post[] } & Omit<ItemProps,
 type Node = { post?: Post; children: Map<string, Node> };
 const newNode = (): Node => ({ children: new Map() });
 
-function Folder({ node, ...rest }: { node: Node } & Omit<ItemProps, "post">) {
+/** Files each post under `root` by its path segments after `base` ("" or "/a/b"). */
+function buildTree(posts: Post[], base = "", root = newNode()) {
+  for (const p of posts) {
+    let node = root;
+    const rest = p.rec.path.slice(base.length);
+    if (rest)
+      for (const seg of rest.slice(1).split("/")) {
+        let next = node.children.get(seg);
+        if (!next) node.children.set(seg, (next = newNode()));
+        node = next;
+      }
+    node.post = p;
+  }
+  return root;
+}
+
+/** `node`'s children: records by name, and subfolders (linking to their own page). `dir` is `node`'s path ("" for the root). */
+function Folder({ node, owner, dir, ...rest }: { node: Node; owner: string; dir: string } & Omit<ItemProps, "post">) {
   return (
     <ul className="space-y-2">
       {[...node.children]
@@ -219,9 +278,11 @@ function Folder({ node, ...rest }: { node: Node } & Omit<ItemProps, "post">) {
             )}
             {child.children.size > 0 && (
               <>
-                <div className="mt-1 font-mono text-sm text-gray-700">📁 {seg}/</div>
+                <Link href={recordPath(owner, `${dir}/${seg}`)} className={`mt-1 block font-mono text-sm text-gray-700 ${link}`}>
+                  📁 {seg}/
+                </Link>
                 <div className="mt-1 ml-2 border-l border-gray-200 pl-3">
-                  <Folder node={child} {...rest} />
+                  <Folder node={child} owner={owner} dir={`${dir}/${seg}`} {...rest} />
                 </div>
               </>
             )}
@@ -233,24 +294,18 @@ function Folder({ node, ...rest }: { node: Node } & Omit<ItemProps, "post">) {
 
 /** Every record, grouped by space and nested by path. `first` (a base58 ID) puts that space first. */
 export function PostTree({ posts, first, ...rest }: { posts: Post[]; first?: string } & Omit<ItemProps, "post">) {
-  const spaces = new Map<string, { owner: User; root: Node }>();
+  const spaces = new Map<string, { owner: User; posts: Post[] }>();
   for (const p of posts) {
     let space = spaces.get(p.owner.pubkey);
-    if (!space) spaces.set(p.owner.pubkey, (space = { owner: p.owner, root: newNode() }));
-    let node = space.root;
-    for (const seg of p.rec.path.slice(1).split("/")) {
-      let next = node.children.get(seg);
-      if (!next) node.children.set(seg, (next = newNode()));
-      node = next;
-    }
-    node.post = p;
+    if (!space) spaces.set(p.owner.pubkey, (space = { owner: p.owner, posts: [] }));
+    space.posts.push(p);
   }
   const ordered = [...spaces.values()].sort(
     (a, b) => Number(b.owner.pubkey === first) - Number(a.owner.pubkey === first) || a.owner.phrase.localeCompare(b.owner.phrase),
   );
   return (
     <div className="mt-4 space-y-6">
-      {ordered.map(({ owner, root }) => (
+      {ordered.map(({ owner, posts }) => (
         <section key={owner.pubkey}>
           <h3 className="font-mono text-sm break-all">
             bb://
@@ -260,10 +315,31 @@ export function PostTree({ posts, first, ...rest }: { posts: Post[]; first?: str
             /
           </h3>
           <div className="mt-2">
-            <Folder node={root} {...rest} />
+            <Folder node={buildTree(posts)} owner={owner.pubkey} dir="" {...rest} />
           </div>
         </section>
       ))}
+    </div>
+  );
+}
+
+/** One space at `path` ("/" for all of it): the record there, if any, then everything below it. `posts` are all at or under `path`. */
+export function Subtree({
+  owner,
+  path,
+  posts,
+  ...rest
+}: { owner: string; path: string; posts: Post[] } & Omit<ItemProps, "post">) {
+  const dir = path === "/" ? "" : path;
+  const root = buildTree(posts, dir);
+  return (
+    <div className="mt-4 space-y-4">
+      {root.post && (
+        <div className="rounded-lg ring-1 ring-gray-200">
+          <PostItem post={root.post} {...rest} />
+        </div>
+      )}
+      {root.children.size > 0 && <Folder node={root} owner={owner} dir={dir} {...rest} />}
     </div>
   );
 }

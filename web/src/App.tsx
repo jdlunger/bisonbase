@@ -23,11 +23,12 @@ import {
   userPhrase,
 } from "./api.ts";
 import Identity from "./Identity.tsx";
+import RecordPage from "./Record.tsx";
 import { type Draft, NoteEditor, NoteList } from "./NoteList.tsx";
 import { Link, idPath, usePath } from "./router.tsx";
 import { type Run, link, primary, secondary } from "./ui.ts";
 
-/** Routes: "/" is Home, "/id/<pubkey>" an identity page. Remembered keys load first, for both. */
+/** Routes: "/" is Home, "/id/<pubkey>" an identity page, "/bb/<pubkey><path>" a record and what's under it. Remembered keys load first, for both. */
 export default function App() {
   const path = usePath();
   /** undefined while loading remembered keys; then the error restoring them, if any. */
@@ -40,7 +41,13 @@ export default function App() {
   }, []);
   if (restoreError === undefined) return null;
   const id = path.match(/^\/id\/([^/]+)\/?$/);
-  return id ? <Identity pubkey={decodeURIComponent(id[1])} /> : <Home initialError={restoreError} />;
+  if (id) return <Identity pubkey={decodeURIComponent(id[1])} />;
+  const rec = path.match(/^\/bb\/([^/]+)(\/.*)?$/);
+  if (rec) {
+    const segs = (rec[2] ?? "/").replace(/\/$/, "").split("/").map(decodeURIComponent);
+    return <RecordPage owner={decodeURIComponent(rec[1])} path={segs.join("/") || "/"} />;
+  }
+  return <Home initialError={restoreError} />;
 }
 
 function Home({ initialError }: { initialError: string | null }) {

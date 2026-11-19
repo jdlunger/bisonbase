@@ -23,6 +23,9 @@ export function navigate(to: string) {
 
 export const idPath = (pubkey: string) => `/id/${pubkey}`;
 
+/** The page for one record: /bb/<owner><path>, each path segment URL-encoded. */
+export const recordPath = (owner: string, path: string) => `/bb/${owner}${path.split("/").map(encodeURIComponent).join("/")}`;
+
 /** An <a> that navigates within the SPA on a plain left click. */
 export function Link({ href, onClick, ...rest }: AnchorHTMLAttributes<HTMLAnchorElement> & { href: string }) {
   return (
