@@ -14,9 +14,11 @@ Simple Rust web server that:
 ## Run
 
 ```
+cargo build
 npm install
 npm run dev
 ```
+
 ## Posting from the command line with an SSH key
 
 `note` signs a note with an `ssh-ed25519` key from your SSH agent and posts it to a server:
