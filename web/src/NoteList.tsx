@@ -1,7 +1,7 @@
 import { createContext, useContext, useEffect, useRef, useState } from "react";
 import { type Grant, type Post, type User, canEdit, deletePost, newPostPath, putPost } from "./api.ts";
 import { Link, idPath, recordPath } from "./router.tsx";
-import { type Run, badge, danger, fmtTime, input, link, primary, secondary, textarea } from "./ui.ts";
+import { type Run, badge, danger, fmtTime, input, idHl, link, phraseHl, primary, secondary, textarea } from "./ui.ts";
 
 /** `path` and `grant` are only for new posts: where it goes, and the grant to write in someone else's space. */
 export type Draft = { body: string; path?: string; grant?: Grant };
@@ -131,13 +131,13 @@ function Uri({ post: n, short }: { post: Post; short: boolean }) {
       >
         {full ? (
           <Link href={href} className={link}>
-            {location.origin}/bb/{n.owner.pubkey}
+            {location.origin}/bb/<span className={idHl}>{n.owner.pubkey}</span>
             <span className="font-semibold text-gray-900">{n.rec.path}</span>
           </Link>
         ) : (
           <>
             bb://
-            <span title={n.owner.pubkey}>{short ? `${n.owner.phrase.split("_")[0]}_…` : n.owner.phrase}</span>
+            <span className={phraseHl} title={n.owner.pubkey}>{short ? `${n.owner.phrase.split("_")[0]}_…` : n.owner.phrase}</span>
             <span className="font-semibold text-gray-900">{n.rec.path}</span>
           </>
         )}
@@ -160,7 +160,7 @@ function PostItem({ post: n, me, busy, run, name }: ItemProps & { name?: string 
       <div className="flex flex-wrap items-baseline justify-between gap-2 text-sm">
         <span className="flex flex-wrap items-baseline gap-2">
           <Link href={idPath(n.author.pubkey)} className={link} title={n.author.pubkey}>
-            {n.author.phrase}
+            <span className={phraseHl}>{n.author.phrase}</span>
             {mine && <span className="ml-1 font-normal text-gray-500">(you)</span>}
           </Link>
           {n.verified ? (
@@ -197,7 +197,7 @@ function PostItem({ post: n, me, busy, run, name }: ItemProps & { name?: string 
             <p className="mt-1">
               🔑 Lets{" "}
               <Link href={idPath(n.grant.grantee.pubkey)} className={`font-semibold ${link}`} title={n.grant.grantee.pubkey}>
-                {n.grant.grantee.phrase}
+                <span className={phraseHl}>{n.grant.grantee.phrase}</span>
                 {me?.pubkey === n.grant.grantee.pubkey && <span className="ml-1 font-normal text-gray-500">(you)</span>}
               </Link>{" "}
               write at or under <code className="font-mono text-sm">{n.grant.path}</code>
@@ -322,7 +322,7 @@ export function PostTree({ posts, first, ...rest }: { posts: Post[]; first?: str
           <h3 className="font-mono text-sm break-all">
             bb://
             <Link href={idPath(owner.pubkey)} className={`font-semibold ${link}`} title={owner.pubkey}>
-              {owner.phrase}
+              <span className={phraseHl}>{owner.phrase}</span>
             </Link>
             /
             <NewHere owner={owner.pubkey} dir="" />

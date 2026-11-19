@@ -22,7 +22,7 @@ import {
 import { Compose, type Draft, NoteEditor } from "./NoteList.tsx";
 import Browse from "./Record.tsx";
 import { Link, idPath, usePath } from "./router.tsx";
-import { type Run, link, primary, secondary } from "./ui.ts";
+import { type Run, link, phraseHl, primary, secondary } from "./ui.ts";
 
 /** A recently used passkey, with its keys' phrase. */
 type Recent = Passkey & { phrase: string };
@@ -179,14 +179,14 @@ function AuthMenu({ me, passkey, recent, busy, run }: { me: User | null; passkey
   return (
     <div ref={ref} className="relative">
       <button className={me ? secondary : primary} onClick={() => setOpenMenu(!openMenu)} aria-expanded={openMenu}>
-        {me ? me.phrase : "Sign in"} <span className="text-xs">▾</span>
+        {me ? <span className={phraseHl}>{me.phrase}</span> : "Sign in"} <span className="text-xs">▾</span>
       </button>
       {openMenu && (
         <div className="absolute right-0 z-10 mt-2 w-80 max-w-[calc(100vw-2rem)] rounded-lg bg-white p-2 shadow-lg ring-1 ring-gray-200">
           {me && (
             <div className="border-b border-gray-200 px-2 pb-2">
               <Link href={idPath(me.pubkey)} className={`font-semibold ${link}`} title={me.pubkey} onClick={() => setOpenMenu(false)}>
-                {me.phrase}
+                <span className={phraseHl}>{me.phrase}</span>
               </Link>
               {passkey && <div className="text-xs text-gray-500">passkey {passkey.name ?? "(unnamed)"}</div>}
               <label className="mt-2 flex items-center gap-1.5 text-sm">
@@ -216,7 +216,7 @@ function AuthMenu({ me, passkey, recent, busy, run }: { me: User | null; passkey
               {recent.map((p) => (
                 <li key={p.credId} className="flex items-center gap-1">
                   <button className={item} disabled={busy} onClick={act(() => deriveFromExistingPasskey(p.credId))} title={p.pubkey}>
-                    <span className="font-medium">{p.phrase}</span>
+                    <span className={`font-medium ${phraseHl}`}>{p.phrase}</span>
                     <span className="text-xs text-gray-500">{p.name ?? "(unnamed)"}</span>
                   </button>
                   <button

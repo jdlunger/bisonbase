@@ -2,7 +2,7 @@ import { type MouseEvent, useState } from "react";
 import { encode } from "uqr";
 import { type Post, type User, makeGrant } from "./api.ts";
 import { Link, idPath } from "./router.tsx";
-import { type Run, fmtTime, input, link, primary } from "./ui.ts";
+import { type Run, fmtTime, idHl, input, link, phraseHl, primary } from "./ui.ts";
 
 /** A QR code as an SVG, encoded entirely client-side. */
 function QrCode({ text, className }: { text: string; className?: string }) {
@@ -29,7 +29,7 @@ async function copy(text: string) {
 }
 
 /** A read-only text box that copies its value when clicked. */
-function CopyBox({ label, value }: { label: string; value: string }) {
+function CopyBox({ label, value, id }: { label: string; value: string; id?: boolean }) {
   const [status, setStatus] = useState("");
   const onClick = async (e: MouseEvent<HTMLInputElement>) => {
     e.currentTarget.select(); // if copying fails, at least it's ready for Ctrl+C
@@ -49,7 +49,7 @@ function CopyBox({ label, value }: { label: string; value: string }) {
         value={value}
         onClick={onClick}
         title="Click to copy"
-        className="mt-1 block w-full cursor-copy rounded-md bg-gray-50 p-2 font-mono text-xs ring-1 ring-gray-300 ring-inset focus:ring-2 focus:ring-indigo-600 focus:outline-none"
+        className={`mt-1 block w-full cursor-copy rounded-md ${id ? "bg-green-100 ring-green-300" : "bg-gray-50 ring-gray-300"} p-2 font-mono text-xs ring-1 ring-inset focus:ring-2 focus:ring-indigo-600 focus:outline-none`}
       />
     </label>
   );
@@ -61,7 +61,7 @@ function GrantForm({ grantee, phrase, busy, run }: { grantee: string; phrase: st
   const [saved, setSaved] = useState("");
   return (
     <section className="mt-10">
-      <h2 className="text-xl font-semibold">Let {phrase} write in your space</h2>
+      <h2 className="text-xl font-semibold">Let <span className={phraseHl}>{phrase}</span> write in your space</h2>
       <div className="mt-3 flex flex-wrap items-center gap-2 text-sm">
         <label className="flex min-w-48 flex-1 items-center gap-1.5 whitespace-nowrap">
           At or under
@@ -80,7 +80,7 @@ function GrantForm({ grantee, phrase, busy, run }: { grantee: string; phrase: st
       </div>
       {saved && (
         <p className="mt-2 text-sm text-gray-600">
-          Saved as <code className="font-mono text-xs break-all">{saved}</code>. {phrase} can now pick it when posting.
+          Saved as <code className="font-mono text-xs break-all">{saved}</code>. <span className={phraseHl}>{phrase}</span> can now pick it when posting.
           It can't be revoked yet: deleting the record doesn't stop the grant from working.
         </p>
       )}
@@ -92,7 +92,7 @@ function GrantForm({ grantee, phrase, busy, run }: { grantee: string; phrase: st
 function UserLink({ user, me }: { user: User; me: string | null }) {
   return (
     <Link href={idPath(user.pubkey)} className={`font-semibold ${link}`} title={user.pubkey}>
-      {user.phrase}
+      <span className={phraseHl}>{user.phrase}</span>
       {user.pubkey === me && <span className="ml-1 font-normal text-gray-500">(you)</span>}
     </Link>
   );
@@ -152,14 +152,14 @@ export function OwnerInfo({
   return (
     <>
       <h1 className="mt-2 text-3xl font-bold tracking-tight break-words">
-        {phrase ?? "…"}
+        <span className={phraseHl}>{phrase ?? "…"}</span>
         {mine && <span className="ml-2 text-lg font-normal text-gray-500">(you)</span>}
       </h1>
 
       <section className="mt-6 flex flex-col gap-6 sm:flex-row sm:items-start">
         <QrCode text={url} className="w-48 shrink-0 self-center rounded-lg ring-1 ring-gray-200 sm:self-start" />
         <div className="min-w-0 flex-1 space-y-3">
-          <CopyBox label="Public ID (key)" value={pubkey} />
+          <CopyBox label="Public ID (key)" value={pubkey} id />
           <CopyBox label="Link to this page" value={url} />
           <p className="text-xs text-gray-500">
             The ID is an Ed25519 public key. Records below are checked against their authors' keys in your browser;
