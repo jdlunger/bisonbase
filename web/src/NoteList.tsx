@@ -75,6 +75,26 @@ export function NoteEditor(props: {
   );
 }
 
+/** Badge colors for record types; known types get fixed ones, any other type a stable pick by hash. */
+const typeColors = [
+  "bg-sky-50 text-sky-700 ring-sky-200",
+  "bg-amber-50 text-amber-700 ring-amber-200",
+  "bg-gray-100 text-gray-600 ring-gray-300",
+  "bg-violet-50 text-violet-700 ring-violet-200",
+  "bg-pink-50 text-pink-700 ring-pink-200",
+  "bg-teal-50 text-teal-700 ring-teal-200",
+  "bg-orange-50 text-orange-700 ring-orange-200",
+  "bg-lime-50 text-lime-700 ring-lime-200",
+];
+const knownTypes: Record<string, number> = { post: 0, grant: 1, tombstone: 2 };
+
+function typeColor(type: string) {
+  if (type in knownTypes) return typeColors[knownTypes[type]];
+  let h = 0;
+  for (const c of type) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  return typeColors[3 + (h % (typeColors.length - 3))];
+}
+
 type ItemProps = { post: Post; me: User | null; busy: boolean; run: Run };
 
 /** One record: author, badges, content, and Edit / Delete when we may. `name` replaces the bb:// address (in trees). */
@@ -102,6 +122,7 @@ function PostItem({ post: n, me, busy, run, name }: ItemProps & { name?: string 
           ) : (
             <span className={`${badge} bg-red-50 text-red-700 ring-red-200`}>✗ bad signature</span>
           )}
+          <span className={`${badge} font-mono ${typeColor(n.rec.type)}`}>{n.rec.type}</span>
         </span>
         <span className="text-xs text-gray-500">{fmtTime(n.rec.version / 1000)}</span>
       </div>
