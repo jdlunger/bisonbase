@@ -30,14 +30,17 @@ static WORDS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
         .collect()
 });
 
-/// A readable four_word nickname for an ID, from SHA-256 of its raw bytes. Not unique enough to identify anyone.
+static EMOJI: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    include_str!("../emoji.txt").lines().map(str::trim).filter(|e| !e.is_empty()).collect()
+});
+
+/// A readable "🦬four_word" nickname for an ID, from SHA-256 of its raw bytes: four u32s pick the words, the
+/// fifth the emoji. Not unique enough to identify anyone.
 pub fn phrase(pk: &Pubkey) -> String {
-    Sha256::digest(pk)
-        .chunks(4)
-        .take(4)
-        .map(|c| WORDS[u32::from_be_bytes(c.try_into().unwrap()) as usize % WORDS.len()])
-        .collect::<Vec<_>>()
-        .join("_")
+    let h = Sha256::digest(pk);
+    let pick = |i: usize, n: usize| u32::from_be_bytes(h[i..i + 4].try_into().unwrap()) as usize % n;
+    let words = [0, 4, 8, 12].map(|i| WORDS[pick(i, WORDS.len())]).join("_");
+    format!("{}{words}", EMOJI[pick(16, EMOJI.len())])
 }
 
 // ---- deterministic CBOR (RFC 8949 §4.2.1 core deterministic encoding) ----
