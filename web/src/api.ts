@@ -62,13 +62,13 @@ function decodeId(id: string) {
 /** Whether `s` is an ID: 32 bytes of base58. */
 export const isPubkey = (s: string) => decodeId(s) !== null;
 
-/** An ID's "🦬four_word" nickname, from SHA-256 of its raw bytes; same as `phrase` in src/lib.rs. */
+/** An ID's "🦬two_words" nickname, from SHA-256 of its raw bytes; same as `phrase` in src/lib.rs. */
 export async function userPhrase(pubkey: string) {
   const pk = decodeId(pubkey);
   if (!pk) throw new Error("not an ID");
   const h = new DataView(await crypto.subtle.digest("SHA-256", pk));
-  const words = [0, 4, 8, 12].map((i) => WORDS[h.getUint32(i) % WORDS.length]).join("_");
-  return `${EMOJI[h.getUint32(16) % EMOJI.length]}${words}`;
+  const words = [0, 4].map((i) => WORDS[h.getUint32(i) % WORDS.length]).join("_");
+  return `${EMOJI[h.getUint32(8) % EMOJI.length]}${words}`;
 }
 
 // ---- bytes ----
