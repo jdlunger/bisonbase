@@ -1,5 +1,6 @@
 /target
 /users.db
+/peer.db
 /node_modules
 /web/dist
 *.tsbuildinfo

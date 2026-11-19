@@ -34,13 +34,22 @@ static EMOJI: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
     include_str!("../emoji.txt").lines().map(str::trim).filter(|e| !e.is_empty()).collect()
 });
 
+/// The u32 at byte `i` of SHA-256(`pk`), mod `n`.
+fn pick(pk: &Pubkey, i: usize, n: usize) -> usize {
+    let h = Sha256::digest(pk);
+    u32::from_be_bytes(h[i..i + 4].try_into().unwrap()) as usize % n
+}
+
 /// A readable "🦬two_words" nickname for an ID, from SHA-256 of its raw bytes: two u32s pick the words, the
 /// third the emoji. Not unique enough to identify anyone.
 pub fn phrase(pk: &Pubkey) -> String {
-    let h = Sha256::digest(pk);
-    let pick = |i: usize, n: usize| u32::from_be_bytes(h[i..i + 4].try_into().unwrap()) as usize % n;
-    let words = [0, 4].map(|i| WORDS[pick(i, WORDS.len())]).join("_");
-    format!("{}{words}", EMOJI[pick(8, EMOJI.len())])
+    let words = [0, 4].map(|i| WORDS[pick(pk, i, WORDS.len())]).join("_");
+    format!("{}{words}", EMOJI[pick(pk, 8, EMOJI.len())])
+}
+
+/// A server's nickname instead: "server_" and the phrase's first word.
+pub fn server_phrase(pk: &Pubkey) -> String {
+    format!("server_{}", WORDS[pick(pk, 0, WORDS.len())])
 }
 
 // ---- deterministic CBOR (RFC 8949 §4.2.1 core deterministic encoding) ----
@@ -217,7 +226,7 @@ fn decode_value(b: &mut &[u8], depth: usize) -> Result<Cbor, String> {
 //                             written bb://<owner, base58><path> at the edges
 //   version        uint       ms since the epoch, by the author's clock; per (owner, path), the newest wins
 //   type           text       what `data` holds: "post" (data: text), "tombstone" (data: null, a
-//                             delete), or "grant" (see `GrantData`)
+//                             delete), "grant" (see `GrantData`), or one of the server types below
 //   data           any        the content, per `type`
 //   authorization  map?       required iff author != owner: {path, signature}, the owner's signature
 //                             (see `grant_signed_bytes`) letting the author write at or under `path`;
@@ -292,6 +301,120 @@ pub fn grant_signed_bytes(author: &Pubkey, owner: &Pubkey, path: &str) -> Vec<u8
         ("path".into(), Cbor::Text(path.into())),
     ]);
     [GRANT_CONTEXT, &cbor_encode(&Cbor::Map(m))].concat()
+}
+
+// ---- servers and federation ----
+//
+// Each server has its own key, and these records in its space:
+//
+//   /server          type "server", data {url}: self-signed; marks the key as a server's
+//   /owner           type "owner", data {user: bytes(32)}: self-signed when someone claims the server
+//                    with its one-time link (see `claim_signed_bytes`); the server also grants them /federate
+//   /federate/<ID>   type "federate" (see `FederateData`): push records to the server with that ID.
+//                    Written by the owner under that grant, and never pushed themselves
+
+pub const CLAIM_CONTEXT: &[u8] = b"bisonbase-claim-v1\n";
+
+/// The bytes a user signs to claim `server`, with the token from its one-time claim link.
+pub fn claim_signed_bytes(server: &Pubkey, token: &[u8]) -> Vec<u8> {
+    let m = BTreeMap::from([
+        ("server".into(), Cbor::Bytes(server.to_vec())),
+        ("token".into(), Cbor::Bytes(token.to_vec())),
+    ]);
+    [CLAIM_CONTEXT, &cbor_encode(&Cbor::Map(m))].concat()
+}
+
+/// The peer a federate record's path names: /federate/<ID>.
+pub fn federate_peer(path: &str) -> Option<Pubkey> {
+    decode_id(path.strip_prefix("/federate/")?)
+}
+
+/// Which records go to a peer: everything at or under `path` ("/" for all of it), in `owner`'s space, or
+/// in every space if None. Written bb://<owner, base58 or *><path> at the edges.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PathFilter {
+    pub owner: Option<Pubkey>,
+    pub path: String,
+}
+
+impl PathFilter {
+    pub fn matches(&self, owner: &Pubkey, path: &str) -> bool {
+        self.owner.is_none_or(|o| &o == owner) && (self.path == "/" || path_within(path, &self.path))
+    }
+}
+
+/// A "federate" record's data: push records to the server at `url`, if their type is in `types` and
+/// they match one of `paths`. Either missing means all. Tombstones always pass the type filter, so
+/// deletes follow what they delete.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FederateData {
+    pub url: String,
+    pub types: Option<Vec<String>>,
+    pub paths: Option<Vec<PathFilter>>,
+}
+
+fn check_url(url: &str) -> Result<(), String> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) || url.chars().any(char::is_whitespace) {
+        return Err("url must be an http:// or https:// URL".into());
+    }
+    Ok(())
+}
+
+impl FederateData {
+    pub fn from_cbor(v: &Cbor) -> Result<Self, String> {
+        let Cbor::Map(m) = v else { return Err("a federate record's data must be a map".into()) };
+        let mut m = m.clone();
+        let list = |v: Cbor| match v {
+            Cbor::Array(a) => Some(a),
+            _ => None,
+        };
+        let types = opt_field(&mut m, "types", list)?
+            .map(|a| a.into_iter().map(|t| text(t).ok_or("types must be text")).collect::<Result<Vec<_>, _>>())
+            .transpose()?;
+        let paths = opt_field(&mut m, "paths", list)?
+            .map(|a| {
+                a.into_iter()
+                    .map(|p| {
+                        let Cbor::Map(mut p) = p else { return Err("paths must be maps".to_string()) };
+                        let f = PathFilter { owner: opt_field(&mut p, "owner", bytes)?, path: field(&mut p, "path", text)? };
+                        no_more_fields(p)?;
+                        if f.path != "/" {
+                            check_path(&f.path)?;
+                        }
+                        Ok(f)
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?;
+        let d = FederateData { url: field(&mut m, "url", text)?, types, paths };
+        no_more_fields(m)?;
+        check_url(&d.url)?;
+        Ok(d)
+    }
+
+    pub fn to_cbor(&self) -> Cbor {
+        let mut m = BTreeMap::from([("url".into(), Cbor::Text(self.url.clone()))]);
+        if let Some(t) = &self.types {
+            m.insert("types".into(), Cbor::Array(t.iter().map(|t| Cbor::Text(t.clone())).collect()));
+        }
+        if let Some(p) = &self.paths {
+            let p = p.iter().map(|f| {
+                let mut m = BTreeMap::from([("path".into(), Cbor::Text(f.path.clone()))]);
+                if let Some(o) = f.owner {
+                    m.insert("owner".into(), Cbor::Bytes(o.to_vec()));
+                }
+                Cbor::Map(m)
+            });
+            m.insert("paths".into(), Cbor::Array(p.collect()));
+        }
+        Cbor::Map(m)
+    }
+
+    /// Whether a record of type `kind` at (`owner`, `path`) goes to this peer.
+    pub fn wants(&self, owner: &Pubkey, path: &str, kind: &str) -> bool {
+        (kind == "tombstone" || self.types.as_ref().is_none_or(|t| t.iter().any(|t| t == kind)))
+            && self.paths.as_ref().is_none_or(|p| p.iter().any(|f| f.matches(owner, path)))
+    }
 }
 
 /// Paths: "/" then one or more "/"-separated segments. Segments are non-empty, not "." or "..",
@@ -455,6 +578,31 @@ impl Record {
                 verify_sig(&self.owner, &grant_signed_bytes(&g.grantee, &self.owner, &g.path), &g.signature)
                     .map_err(|e| format!("grant: {e}"))?;
             }
+            ("server" | "owner", _) if self.author != self.owner => {
+                return Err(format!("only a server can write its {} record", self.kind));
+            }
+            ("server", d) => {
+                if self.path != "/server" {
+                    return Err("a server record belongs at /server".into());
+                }
+                let Cbor::Map(m) = d else { return Err("a server record's data must be a map".into()) };
+                let mut m = m.clone();
+                check_url(&field(&mut m, "url", text)?)?;
+                no_more_fields(m)?;
+            }
+            ("owner", d) => {
+                if self.path != "/owner" {
+                    return Err("an owner record belongs at /owner".into());
+                }
+                let Cbor::Map(m) = d else { return Err("an owner record's data must be a map".into()) };
+                let mut m = m.clone();
+                field(&mut m, "user", bytes::<32>)?;
+                no_more_fields(m)?;
+            }
+            ("federate", d) => {
+                federate_peer(&self.path).ok_or("a federate record belongs at /federate/<server ID>")?;
+                FederateData::from_cbor(d)?;
+            }
             _ => return Err(format!("unknown record type {:?}", self.kind)),
         }
         match (&self.authorization, self.author == self.owner) {
@@ -541,5 +689,25 @@ mod tests {
         outside.path = "/sharedx".into();
         outside.signature = author.sign(&outside.signed_bytes()).to_bytes();
         assert!(outside.check().is_err());
+    }
+
+    #[test]
+    fn federate_filters() {
+        let (a, b) = ([1; 32], [2; 32]);
+        let all = FederateData { url: "http://x".into(), types: None, paths: None };
+        assert_eq!(FederateData::from_cbor(&all.to_cbor()).unwrap(), all);
+        assert!(all.wants(&a, "/anything", "post"));
+        let some = FederateData {
+            url: "http://x".into(),
+            types: Some(vec!["post".into()]),
+            paths: Some(vec![PathFilter { owner: None, path: "/pub".into() }, PathFilter { owner: Some(b), path: "/".into() }]),
+        };
+        assert_eq!(FederateData::from_cbor(&some.to_cbor()).unwrap(), some);
+        assert!(some.wants(&a, "/pub/x", "post") && some.wants(&b, "/x", "post"));
+        assert!(some.wants(&a, "/pub/x", "tombstone"), "deletes follow");
+        assert!(!some.wants(&a, "/pubx", "post") && !some.wants(&a, "/pub/x", "grant"));
+        assert!(FederateData::from_cbor(&FederateData { url: "ftp://x".into(), ..all }.to_cbor()).is_err());
+        assert_eq!(federate_peer(&format!("/federate/{}", encode_id(&a))), Some(a));
+        assert_eq!(federate_peer("/federate/x/y"), None);
     }
 }

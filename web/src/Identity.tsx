@@ -1,8 +1,9 @@
-import { type MouseEvent, useState } from "react";
+import { type MouseEvent, useContext, useState } from "react";
 import { encode } from "uqr";
-import { type Post, type User, makeGrant } from "./api.ts";
+import { type Post, type User, makeGrant, putFederate } from "./api.ts";
+import { Compose } from "./NoteList.tsx";
 import { Link, idPath } from "./router.tsx";
-import { type Run, fmtTime, idHl, input, link, phraseHl, primary } from "./ui.ts";
+import { type Run, fmtTime, idHl, input, link, hl, primary, textarea } from "./ui.ts";
 
 /** A QR code as an SVG, encoded entirely client-side. */
 function QrCode({ text, className }: { text: string; className?: string }) {
@@ -61,7 +62,7 @@ function GrantForm({ grantee, phrase, busy, run }: { grantee: string; phrase: st
   const [saved, setSaved] = useState("");
   return (
     <section className="mt-10">
-      <h2 className="text-xl font-semibold">Let <span className={phraseHl}>{phrase}</span> write in your space</h2>
+      <h2 className="text-xl font-semibold">Let <span className={hl(phrase)}>{phrase}</span> write in your space</h2>
       <div className="mt-3 flex flex-wrap items-center gap-2 text-sm">
         <label className="flex min-w-48 flex-1 items-center gap-1.5 whitespace-nowrap">
           At or under
@@ -80,8 +81,60 @@ function GrantForm({ grantee, phrase, busy, run }: { grantee: string; phrase: st
       </div>
       {saved && (
         <p className="mt-2 text-sm text-gray-600">
-          Saved as <code className="font-mono text-xs break-all">{saved}</code>. <span className={phraseHl}>{phrase}</span> can now pick it when posting.
+          Saved as <code className="font-mono text-xs break-all">{saved}</code>. <span className={hl(phrase)}>{phrase}</span> can now pick it when posting.
           It can't be revoked yet: deleting the record doesn't stop the grant from working.
+        </p>
+      )}
+    </section>
+  );
+}
+
+/** Lets this server's owner (us) have it push records to another server, saved as a federate record. */
+function FederateForm({ server, busy, run }: { server: string; busy: boolean; run: Run }) {
+  const [url, setUrl] = useState("");
+  const [types, setTypes] = useState("");
+  const [paths, setPaths] = useState("");
+  const [saved, setSaved] = useState("");
+  return (
+    <section className="mt-10">
+      <h2 className="text-xl font-semibold">Federate with another server</h2>
+      <p className="mt-1 text-sm text-gray-500">
+        New records here get pushed to it (and everything so far, to start). Each server passes on only records
+        that are new to it, so loops die out.
+      </p>
+      <div className="mt-3 space-y-2 text-sm">
+        <label className="block">
+          Its URL
+          <input className={`${input} font-mono`} placeholder="http://localhost:8081" value={url} onChange={(e) => setUrl(e.target.value)} />
+        </label>
+        <label className="block">
+          Types <span className="text-gray-500">(comma-separated; empty for all. Deletes always follow.)</span>
+          <input className={`${input} font-mono`} placeholder="post, grant" value={types} onChange={(e) => setTypes(e.target.value)} />
+        </label>
+        <label className="block">
+          Paths <span className="text-gray-500">(one per line, bb://&lt;ID or *&gt;/&lt;path&gt;; empty for all)</span>
+          <textarea
+            className={`${textarea} font-mono`}
+            rows={2}
+            placeholder={"bb://*/posts\nbb://*/"}
+            value={paths}
+            onChange={(e) => setPaths(e.target.value)}
+          />
+        </label>
+        <button
+          className={primary}
+          disabled={busy || !url.trim()}
+          onClick={run(async () => {
+            setSaved("");
+            setSaved(await putFederate(server, url, types, paths));
+          })}
+        >
+          Federate
+        </button>
+      </div>
+      {saved && (
+        <p className="mt-2 text-sm text-gray-600">
+          Saved as <code className="font-mono text-xs break-all">{saved}</code>. Delete that record to stop pushing there.
         </p>
       )}
     </section>
@@ -92,7 +145,7 @@ function GrantForm({ grantee, phrase, busy, run }: { grantee: string; phrase: st
 function UserLink({ user, me }: { user: User; me: string | null }) {
   return (
     <Link href={idPath(user.pubkey)} className={`font-semibold ${link}`} title={user.pubkey}>
-      <span className={phraseHl}>{user.phrase}</span>
+      <span className={hl(user.phrase)}>{user.phrase}</span>
       {user.pubkey === me && <span className="ml-1 font-normal text-gray-500">(you)</span>}
     </Link>
   );
@@ -149,10 +202,12 @@ export function OwnerInfo({
 }) {
   const url = `${location.origin}${idPath(pubkey)}`;
   const mine = me === pubkey;
+  // Only a server's owner holds its /federate grant.
+  const owns = useContext(Compose).canWrite(pubkey, "/federate");
   return (
     <>
       <h1 className="mt-2 text-3xl font-bold tracking-tight break-words">
-        <span className={phraseHl}>{phrase ?? "…"}</span>
+        <span className={hl(phrase ?? "…")}>{phrase ?? "…"}</span>
         {mine && <span className="ml-2 text-lg font-normal text-gray-500">(you)</span>}
       </h1>
 
@@ -170,6 +225,7 @@ export function OwnerInfo({
 
       {grants && <Grants pubkey={pubkey} grants={grants} me={me} />}
       {me && !mine && phrase && <GrantForm grantee={pubkey} phrase={phrase} busy={busy} run={run} />}
+      {owns && <FederateForm server={pubkey} busy={busy} run={run} />}
     </>
   );
 }

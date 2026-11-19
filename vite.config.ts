@@ -5,5 +5,6 @@ import tailwindcss from "@tailwindcss/vite";
 export default defineConfig({
   root: "web",
   plugins: [react(), tailwindcss()],
-  server: { proxy: { "/api": "http://localhost:8080" } },
+  // API: the Rust server this SPA talks to (see `npm run dev:peer` for a second one).
+  server: { proxy: { "/api": process.env.API ?? "http://localhost:8080" } },
 });

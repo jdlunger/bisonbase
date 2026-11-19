@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "concurrently -k -n rust,web -c yellow,cyan \"ORIGIN=http://localhost:5173 nodemon -q -w src -w Cargo.toml -e rs,toml --signal SIGTERM -x 'cargo run'\" \"vite\"",
     "dev:fresh": "cargo run -q -- --drop-db && npm run dev",
+    "dev:peer": "concurrently -k -n peer,peerweb -c magenta,blue \"DB=peer.db PORT=8081 ORIGIN=http://localhost:5174 cargo run\" \"API=http://localhost:8081 vite --port 5174 --strictPort\"",
+    "dev:peer:fresh": "DB=peer.db cargo run -q -- --drop-db && npm run dev:peer",
     "build": "tsc -b && vite build",
     "preview": "vite preview"
   },

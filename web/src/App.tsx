@@ -2,12 +2,16 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   type Grant,
   type Passkey,
+  type ServerInfo,
   type User,
+  claimServer,
   deriveFromExistingPasskey,
   deriveFromNewPasskey,
   forgetKeys,
   forgetRecentPasskey,
+  getServer,
   isRemembering,
+  loadServers,
   myGrants,
   myPasskey,
   myPubkey,
@@ -21,8 +25,8 @@ import {
 } from "./api.ts";
 import { Compose, type Draft, NoteEditor } from "./NoteList.tsx";
 import Browse from "./Record.tsx";
-import { Link, idPath, usePath } from "./router.tsx";
-import { type Run, link, phraseHl, primary, secondary } from "./ui.ts";
+import { Link, idPath, navigate, usePath } from "./router.tsx";
+import { type Run, link, hl, primary, secondary } from "./ui.ts";
 
 /** A recently used passkey, with its keys' phrase. */
 type Recent = Passkey & { phrase: string };
@@ -33,7 +37,7 @@ export default function App() {
   /** undefined while loading remembered keys; then the error restoring them, if any. */
   const [restoreError, setRestoreError] = useState<string | null>();
   useEffect(() => {
-    restoreKeys().then(
+    Promise.all([restoreKeys(), loadServers()]).then(
       () => setRestoreError(null),
       (e) => setRestoreError(`Couldn't restore remembered keys: ${e.message}`),
     );
@@ -54,6 +58,9 @@ const newPathIn = (dir: string) => `${dir}/${newPostPath().split("/").pop()}`;
 
 function Shell({ initialError }: { initialError: string | null }) {
   const route = useRoute();
+  const claiming = usePath() === "/claim";
+  /** The server this page talks to. */
+  const [server, setServer] = useState<ServerInfo | null>(null);
   const [me, setMe] = useState<User | null>(null);
   const [passkey, setPasskey] = useState<Passkey | null>(null);
   const [recent, setRecent] = useState<Recent[]>([]);
@@ -69,12 +76,14 @@ function Shell({ initialError }: { initialError: string | null }) {
     const pubkey = myPubkey();
     const current = myPasskey();
     const others = recentPasskeys().filter((p) => p.credId !== current?.credId);
-    const [m, g, phrases] = await Promise.all([
-      pubkey ? userPhrase(pubkey).then((phrase) => ({ pubkey, phrase })) : null,
+    const [m, g, phrases, s] = await Promise.all([
+      pubkey ? userPhrase(pubkey).then((phrase) => ({ pubkey, phrase, server: false })) : null,
       myGrants(),
       Promise.all(others.map((p) => userPhrase(p.pubkey))),
+      getServer(),
     ]);
     setMe(m);
+    setServer(s);
     setGrants(g);
     setPasskey(current);
     setRecent(others.map((p, i) => ({ ...p, phrase: phrases[i] })));
@@ -112,9 +121,19 @@ function Shell({ initialError }: { initialError: string | null }) {
     <Compose.Provider value={{ canWrite, open }}>
       <main className="mx-auto max-w-3xl px-4 py-6 font-sans text-gray-900">
         <header className="flex items-center justify-between gap-3">
-          <Link href="/" className="text-xl font-bold tracking-tight hover:text-indigo-600">
-            federated crdt
-          </Link>
+          <div className="flex flex-wrap items-baseline gap-x-2">
+            <Link href="/" className="text-xl font-bold tracking-tight hover:text-indigo-600">
+              federated crdt
+            </Link>
+            {server && (
+              <span className="text-sm text-gray-500">
+                on{" "}
+                <Link href={idPath(server.pubkey)} className={link} title={server.pubkey}>
+                  <span className={hl(server.phrase)}>{server.phrase}</span>
+                </Link>
+              </span>
+            )}
+          </div>
           <div className="flex items-center gap-2">
             {me && !draft && (
               <button className={primary} disabled={busy} onClick={newPost}>
@@ -145,10 +164,58 @@ function Shell({ initialError }: { initialError: string | null }) {
         {error && <p className="mt-4 rounded-md bg-red-50 p-3 text-sm text-red-700 ring-1 ring-red-200">{error}</p>}
 
         <div className="mt-6">
-          <Browse owner={route.owner} path={route.path} me={me} busy={busy} run={run} tick={tick} />
+          {claiming ? (
+            <Claim server={server} me={me} busy={busy} run={run} />
+          ) : (
+            <Browse owner={route.owner} path={route.path} me={me} busy={busy} run={run} tick={tick} />
+          )}
         </div>
       </main>
     </Compose.Provider>
+  );
+}
+
+/** /claim#<token>: the one-time link a new server prints, to make whoever signs in here its owner. */
+function Claim({ server, me, busy, run }: { server: ServerInfo | null; me: User | null; busy: boolean; run: Run }) {
+  const token = location.hash.slice(1);
+  if (!server) return <p className="text-gray-500">Loading…</p>;
+  const name = <span className={hl(server.phrase)}>{server.phrase}</span>;
+  return (
+    <section className="space-y-3">
+      <h1 className="text-2xl font-bold tracking-tight">Claim {name}</h1>
+      {server.owner ? (
+        <p>
+          This server already has an owner:{" "}
+          <Link href={idPath(server.owner)} className={link}>
+            see its page
+          </Link>
+          .
+        </p>
+      ) : !token ? (
+        <p>This link is missing its token. Use the whole link the server printed.</p>
+      ) : (
+        <>
+          <p className="text-sm text-gray-600">
+            The owner of a server can federate it with other servers, pushing new records to them. This link works once.
+          </p>
+          {me ? (
+            <button
+              className={secondary}
+              disabled={busy}
+              onClick={run(async () => {
+                const id = await claimServer(token);
+                history.replaceState(null, "", location.pathname); // the token is spent
+                navigate(idPath(id));
+              })}
+            >
+              Claim as <span className={hl(me.phrase)}>{me.phrase}</span>
+            </button>
+          ) : (
+            <p>Sign in first (top right), with the keys that should own this server.</p>
+          )}
+        </>
+      )}
+    </section>
   );
 }
 
@@ -179,14 +246,14 @@ function AuthMenu({ me, passkey, recent, busy, run }: { me: User | null; passkey
   return (
     <div ref={ref} className="relative">
       <button className={me ? secondary : primary} onClick={() => setOpenMenu(!openMenu)} aria-expanded={openMenu}>
-        {me ? <span className={phraseHl}>{me.phrase}</span> : "Sign in"} <span className="text-xs">▾</span>
+        {me ? <span className={hl(me.phrase)}>{me.phrase}</span> : "Sign in"} <span className="text-xs">▾</span>
       </button>
       {openMenu && (
         <div className="absolute right-0 z-10 mt-2 w-80 max-w-[calc(100vw-2rem)] rounded-lg bg-white p-2 shadow-lg ring-1 ring-gray-200">
           {me && (
             <div className="border-b border-gray-200 px-2 pb-2">
               <Link href={idPath(me.pubkey)} className={`font-semibold ${link}`} title={me.pubkey} onClick={() => setOpenMenu(false)}>
-                <span className={phraseHl}>{me.phrase}</span>
+                <span className={hl(me.phrase)}>{me.phrase}</span>
               </Link>
               {passkey && <div className="text-xs text-gray-500">passkey {passkey.name ?? "(unnamed)"}</div>}
               <label className="mt-2 flex items-center gap-1.5 text-sm">
@@ -216,7 +283,7 @@ function AuthMenu({ me, passkey, recent, busy, run }: { me: User | null; passkey
               {recent.map((p) => (
                 <li key={p.credId} className="flex items-center gap-1">
                   <button className={item} disabled={busy} onClick={act(() => deriveFromExistingPasskey(p.credId))} title={p.pubkey}>
-                    <span className={`font-medium ${phraseHl}`}>{p.phrase}</span>
+                    <span className={`font-medium ${hl(p.phrase)}`}>{p.phrase}</span>
                     <span className="text-xs text-gray-500">{p.name ?? "(unnamed)"}</span>
                   </button>
                   <button

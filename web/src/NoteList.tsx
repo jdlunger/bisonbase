@@ -1,7 +1,7 @@
 import { createContext, useContext, useEffect, useRef, useState } from "react";
 import { type Grant, type Post, type User, canEdit, deletePost, newPostPath, putPost } from "./api.ts";
 import { Link, idPath, recordPath } from "./router.tsx";
-import { type Run, badge, danger, fmtTime, input, idHl, link, phraseHl, primary, secondary, textarea } from "./ui.ts";
+import { type Run, badge, danger, fmtTime, input, idHl, link, hl, primary, secondary, textarea } from "./ui.ts";
 
 /** `path` and `grant` are only for new posts: where it goes, and the grant to write in someone else's space. */
 export type Draft = { body: string; path?: string; grant?: Grant };
@@ -86,7 +86,7 @@ const typeColors = [
   "bg-orange-50 text-orange-700 ring-orange-200",
   "bg-lime-50 text-lime-700 ring-lime-200",
 ];
-const knownTypes: Record<string, number> = { post: 0, grant: 1, tombstone: 2 };
+const knownTypes: Record<string, number> = { post: 0, grant: 1, tombstone: 2, server: 6, owner: 6, federate: 6 };
 
 function typeColor(type: string) {
   if (type in knownTypes) return typeColors[knownTypes[type]];
@@ -137,7 +137,7 @@ function Uri({ post: n, short }: { post: Post; short: boolean }) {
         ) : (
           <>
             bb://
-            <span className={phraseHl} title={n.owner.pubkey}>{short ? `${n.owner.phrase.split("_")[0]}_…` : n.owner.phrase}</span>
+            <span className={hl(n.owner.phrase)} title={n.owner.pubkey}>{short && !n.owner.server ? `${n.owner.phrase.split("_")[0]}_…` : n.owner.phrase}</span>
             <span className="font-semibold text-gray-900">{n.rec.path}</span>
           </>
         )}
@@ -160,7 +160,7 @@ function PostItem({ post: n, me, busy, run, name }: ItemProps & { name?: string 
       <div className="flex flex-wrap items-baseline justify-between gap-2 text-sm">
         <span className="flex flex-wrap items-baseline gap-2">
           <Link href={idPath(n.author.pubkey)} className={link} title={n.author.pubkey}>
-            <span className={phraseHl}>{n.author.phrase}</span>
+            <span className={hl(n.author.phrase)}>{n.author.phrase}</span>
             {mine && <span className="ml-1 font-normal text-gray-500">(you)</span>}
           </Link>
           {n.verified ? (
@@ -197,10 +197,34 @@ function PostItem({ post: n, me, busy, run, name }: ItemProps & { name?: string 
             <p className="mt-1">
               🔑 Lets{" "}
               <Link href={idPath(n.grant.grantee.pubkey)} className={`font-semibold ${link}`} title={n.grant.grantee.pubkey}>
-                <span className={phraseHl}>{n.grant.grantee.phrase}</span>
+                <span className={hl(n.grant.grantee.phrase)}>{n.grant.grantee.phrase}</span>
                 {me?.pubkey === n.grant.grantee.pubkey && <span className="ml-1 font-normal text-gray-500">(you)</span>}
               </Link>{" "}
               write at or under <code className="font-mono text-sm">{n.grant.path}</code>
+            </p>
+          ) : n.federate ? (
+            <p className="mt-1">
+              ↔ Pushes to{" "}
+              <Link href={idPath(n.federate.peer.pubkey)} className={`font-semibold ${link}`} title={n.federate.peer.pubkey}>
+                <span className={hl(n.federate.peer.phrase)}>{n.federate.peer.phrase}</span>
+              </Link>{" "}
+              at <code className="font-mono text-sm">{n.federate.url}</code>
+              <span className="block text-sm text-gray-600">
+                Types: {n.federate.types?.join(", ") ?? "all"} · Paths:{" "}
+                <code className="font-mono">{n.federate.paths?.join(" ") ?? "all"}</code>
+              </span>
+            </p>
+          ) : n.rec.type === "server" && n.rec.path === "/server" ? (
+            <p className="mt-1">
+              🖥 A server, at <code className="font-mono text-sm">{String((n.rec.data as { url?: unknown })?.url)}</code>
+            </p>
+          ) : n.claimedBy ? (
+            <p className="mt-1">
+              👑 Owned by{" "}
+              <Link href={idPath(n.claimedBy.pubkey)} className={`font-semibold ${link}`} title={n.claimedBy.pubkey}>
+                <span className={hl(n.claimedBy.phrase)}>{n.claimedBy.phrase}</span>
+                {me?.pubkey === n.claimedBy.pubkey && <span className="ml-1 font-normal text-gray-500">(you)</span>}
+              </Link>
             </p>
           ) : text !== undefined ? (
             <p className="mt-1 whitespace-pre-wrap break-words">{text}</p>
@@ -322,7 +346,7 @@ export function PostTree({ posts, first, ...rest }: { posts: Post[]; first?: str
           <h3 className="font-mono text-sm break-all">
             bb://
             <Link href={idPath(owner.pubkey)} className={`font-semibold ${link}`} title={owner.pubkey}>
-              <span className={phraseHl}>{owner.phrase}</span>
+              <span className={hl(owner.phrase)}>{owner.phrase}</span>
             </Link>
             /
             <NewHere owner={owner.pubkey} dir="" />

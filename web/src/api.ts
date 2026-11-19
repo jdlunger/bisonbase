@@ -3,7 +3,8 @@ import WORDS_TXT from "../../google-10000-english-usa-no-swears.txt?raw";
 
 import { type Cbor, decode, encode } from "./cbor.ts";
 
-export type User = { pubkey: string; phrase: string };
+/** `server`: the key is a server's (its phrase is "server_word"). */
+export type User = { pubkey: string; phrase: string; server: boolean };
 
 async function api<T>(path: string, body?: unknown, method = body === undefined ? "GET" : "POST"): Promise<T> {
   const res = await fetch(
@@ -62,11 +63,20 @@ function decodeId(id: string) {
 /** Whether `s` is an ID: 32 bytes of base58. */
 export const isPubkey = (s: string) => decodeId(s) !== null;
 
-/** An ID's "🦬two_words" nickname, from SHA-256 of its raw bytes; same as `phrase` in src/lib.rs. */
+/** IDs of keys known to be servers', from their /server records and federate records naming them. */
+const servers = new Set<string>();
+export const isServer = (pubkey: string) => servers.has(pubkey);
+export async function loadServers() {
+  for (const s of await api<string[]>("/api/servers")) servers.add(s);
+}
+
+/** An ID's "🦬two_words" nickname, from SHA-256 of its raw bytes; same as `phrase` in src/lib.rs. Servers
+ * get "server_" and the first word instead, as `server_phrase` does. */
 export async function userPhrase(pubkey: string) {
   const pk = decodeId(pubkey);
   if (!pk) throw new Error("not an ID");
   const h = new DataView(await crypto.subtle.digest("SHA-256", pk));
+  if (servers.has(pubkey)) return `server_${WORDS[h.getUint32(0) % WORDS.length]}`;
   const words = [0, 4].map((i) => WORDS[h.getUint32(i) % WORDS.length]).join("_");
   return `${EMOJI[h.getUint32(8) % EMOJI.length]}${words}`;
 }
@@ -323,6 +333,7 @@ export function forgetKeys() {
 
 const RECORD_CONTEXT = enc.encode("bisonbase-record-v1\n");
 const GRANT_CONTEXT = enc.encode("bisonbase-grant-v1\n");
+const CLAIM_CONTEXT = enc.encode("bisonbase-claim-v1\n");
 
 export type Authorization = { path: string; signature: Uint8Array };
 export type Rec = {
@@ -349,6 +360,10 @@ export type Post = {
   text: string | null;
   /** For grant records: who may write, and where. */
   grant?: { grantee: User; path: string };
+  /** For federate records: which server gets pushed what. `types` and `paths` are null for all. */
+  federate?: { peer: User; url: string; types: string[] | null; paths: string[] | null };
+  /** For a server's owner record: who claimed it. */
+  claimedBy?: User;
 };
 
 const concat = (...parts: Uint8Array[]) => {
@@ -432,13 +447,40 @@ function grantData(r: Rec): GrantData | null {
   return r.type === "grant" && isBytes(g?.grantee, 32) && typeof g.path === "string" && isBytes(g.signature, 64) ? g : null;
 }
 
-const toUser = async (pk: Uint8Array): Promise<User> => ({ pubkey: b58(pk), phrase: await userPhrase(b58(pk)) });
+const toUser = async (pk: Uint8Array): Promise<User> => ({ pubkey: b58(pk), phrase: await userPhrase(b58(pk)), server: servers.has(b58(pk)) });
+
+/** A federate record's data, if well-formed, with its peer's ID. See FederateData in src/lib.rs. */
+type PathFilter = { owner?: Uint8Array; path: string };
+type FederateData = { url: string; types?: string[]; paths?: PathFilter[] };
+function federateData(r: Rec): (FederateData & { peer: Uint8Array }) | null {
+  const peer = r.path.startsWith("/federate/") ? decodeId(r.path.slice("/federate/".length)) : null;
+  const f = r.data as FederateData;
+  return r.type === "federate" && peer && typeof f?.url === "string" ? { ...f, peer } : null;
+}
+
+/** A path filter at the edges: bb://<ID or *><path>, where a bare "/" means the whole space. */
+const showFilter = (f: PathFilter) => `bb://${f.owner ? b58(f.owner) : "*"}${f.path}`;
+function parseFilter(s: string): PathFilter {
+  const m = s.match(/^bb:\/\/([^/]+)(\/.*)$/);
+  const owner = m && m[1] !== "*" ? decodeId(m[1]) : undefined;
+  if (!m || owner === null) throw new Error(`${s} isn't bb://<ID or *>/<path>`);
+  const path = m[2] === "/" ? "/" : normalizePath(m[2]);
+  return owner ? { owner, path } : { path };
+}
 
 export async function viewPost(rec: Rec): Promise<Post> {
   const [author, owner] = await Promise.all([toUser(rec.author), toUser(rec.owner)]);
   const g = grantData(rec);
+  const f = federateData(rec);
   return {
     grant: g ? { grantee: await toUser(g.grantee), path: g.path } : undefined,
+    federate: f
+      ? { peer: await toUser(f.peer), url: f.url, types: f.types ?? null, paths: f.paths?.map(showFilter) ?? null }
+      : undefined,
+    claimedBy:
+      rec.type === "owner" && isBytes((rec.data as { user?: Cbor })?.user, 32)
+        ? await toUser((rec.data as { user: Uint8Array }).user)
+        : undefined,
     rec,
     author,
     owner,
@@ -456,6 +498,13 @@ export async function getPosts(q: { owner?: string; author?: string; user?: stri
   if (!res.ok) throw new Error((await res.text()) || res.statusText);
   const list = decode(new Uint8Array(await res.arrayBuffer()));
   if (!Array.isArray(list)) throw new Error("malformed record list");
+  // Learn which keys are servers' first, so they get server phrases.
+  for (const v of list) {
+    const r = v as Rec;
+    if (r?.type === "server" && r.path === "/server" && isBytes(r.owner, 32)) servers.add(b58(r.owner));
+    const f = r?.type === "federate" && typeof r.path === "string" && r.path.startsWith("/federate/") ? r.path.slice(10) : "";
+    if (isPubkey(f)) servers.add(f);
+  }
   return Promise.all(list.map((v) => viewPost(recFromCbor(v))));
 }
 
@@ -560,4 +609,58 @@ export function forgedPost(): Promise<Post> {
     data: "This post was added client-side with a made-up signature, so it should show as a bad signature.",
     signature: new Uint8Array(64),
   });
+}
+
+// ---- this server, and federation ----
+//
+// Each server has its own key and space. Its owner claims it once with a one-time link (printed by the
+// server), and is then granted /federate in its space, where each "federate" record names a peer
+// server to push records to. See src/lib.rs.
+
+export type ServerInfo = { pubkey: string; phrase: string; owner: string | null };
+export const getServer = (url = "") => api<ServerInfo>(`${url}/api/server`);
+
+/** Claims this server as its owner (us), with the token from its claim link. Returns the server's ID. */
+export async function claimServer(token: string) {
+  if (!keys) throw new Error("Sign in first.");
+  const server = await getServer();
+  const t = decodeId(token);
+  if (!t) throw new Error("This claim link is broken: its token isn't 32 bytes of base58.");
+  const signature = await sign(concat(CLAIM_CONTEXT, encode({ server: decodeId(server.pubkey)!, token: t })));
+  await api("/api/claim", { token, user: keys.pubkey, signature: b58(signature) });
+  servers.add(server.pubkey);
+  return server.pubkey;
+}
+
+/** Has `server` (our own server's ID) push records to the server at `url`: those of the given types
+ * (comma- or space-separated; none for all) at the given paths (bb://<ID or *>/<path>, one per line;
+ * none for all). We need its /federate grant, i.e. to be its owner. Returns the record's address. */
+export async function putFederate(server: string, url: string, types: string, paths: string) {
+  if (!keys) throw new Error("Sign in first.");
+  url = url.trim().replace(/\/+$/, "");
+  if (!/^https?:\/\/\S+$/.test(url)) throw new Error("Enter the other server's http:// or https:// URL.");
+  const peer = await getServer(url).then(
+    (s) => s.pubkey,
+    (e) => {
+      throw new Error(`Couldn't reach a server at ${url}: ${e.message}`);
+    },
+  );
+  if (peer === server) throw new Error("That's this server.");
+  const grant = (await myGrants()).find((g) => g.owner.pubkey === server && pathWithin("/federate", g.path));
+  if (!grant) throw new Error("Only this server's owner can federate it.");
+  const t = types.split(/[\s,]+/).filter(Boolean);
+  const p = paths.split("\n").map((s) => s.trim()).filter(Boolean).map(parseFilter);
+  const data: FederateData = { url, ...(t.length && { types: t }), ...(p.length && { paths: p }) };
+  const path = `/federate/${peer}`;
+  servers.add(peer);
+  await putRec({
+    author: keys.pk,
+    owner: grant.ownerPk,
+    authorization: { path: grant.path, signature: grant.signature },
+    path,
+    version: nextVersion(),
+    type: "federate",
+    data: data as unknown as Cbor,
+  });
+  return `bb://${server}${path}`;
 }

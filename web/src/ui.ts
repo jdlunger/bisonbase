@@ -9,8 +9,10 @@ export const input =
   "block w-full rounded-md px-2 py-1 text-sm ring-1 ring-gray-300 ring-inset focus:ring-2 focus:ring-indigo-600 focus:outline-none";
 export const badge = "rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset";
 export const link = "hover:text-indigo-600 hover:underline";
-/** Highlights a public phrase (light blue) or a public ID (light green), wherever one is shown. */
-export const phraseHl = "rounded bg-sky-100 px-1 ring-1 ring-sky-300 ring-inset box-decoration-clone";
+/** Highlights a public phrase (light blue; amber for a server's "server_word"), or a public ID (light green), wherever one is shown. */
+const phraseHl = "rounded bg-sky-100 px-1 ring-1 ring-sky-300 ring-inset box-decoration-clone";
+const serverHl = "rounded bg-amber-100 px-1 ring-1 ring-amber-300 ring-inset box-decoration-clone";
+export const hl = (phrase: string) => (phrase.startsWith("server_") ? serverHl : phraseHl);
 export const idHl = "rounded bg-green-100 px-1 ring-1 ring-green-300 ring-inset box-decoration-clone";
 
 export const fmtTime = (t: number) => new Date(t * 1000).toLocaleString();

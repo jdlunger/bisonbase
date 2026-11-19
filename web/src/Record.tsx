@@ -3,7 +3,7 @@ import { type Post, type User, forgedPost, getPosts, isPubkey, normalizePath, us
 import { OwnerInfo } from "./Identity.tsx";
 import { NewHere, PostTree, Subtree } from "./NoteList.tsx";
 import { Link, idPath, recordPath } from "./router.tsx";
-import { type Run, link, phraseHl } from "./ui.ts";
+import { type Run, link, hl } from "./ui.ts";
 
 type Loaded = {
   posts: Post[];
@@ -109,10 +109,10 @@ export default function Browse({
         <h2 className={`font-mono break-all ${root ? "mt-10 text-xl font-semibold" : "mt-2 text-xl"}`}>
           bb://
           {root ? (
-            <span className={phraseHl} title={owner}>{phrase ?? "…"}</span>
+            <span className={hl(phrase ?? "…")} title={owner}>{phrase ?? "…"}</span>
           ) : (
             <Link href={idPath(owner)} className={link} title={owner}>
-              <span className={phraseHl}>{phrase ?? "…"}</span>
+              <span className={hl(phrase ?? "…")}>{phrase ?? "…"}</span>
             </Link>
           )}
           {root && "/"}
@@ -136,7 +136,7 @@ export default function Browse({
       {data?.elsewhere && data.elsewhere.length > 0 && (
         <>
           <h2 className="mt-10 text-xl font-semibold">In others' spaces</h2>
-          <p className="mt-1 text-sm text-gray-500">What {phrase ? <span className={phraseHl}>{phrase}</span> : "they"} wrote elsewhere, with grants.</p>
+          <p className="mt-1 text-sm text-gray-500">What {phrase ? <span className={hl(phrase)}>{phrase}</span> : "they"} wrote elsewhere, with grants.</p>
           <PostTree posts={data.elsewhere} {...items} />
         </>
       )}
