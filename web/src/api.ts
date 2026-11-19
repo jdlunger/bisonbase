@@ -31,7 +31,60 @@ async function api<T>(path: string, body?: unknown, method = body === undefined 
 
 export const getUsers = () => api<User[]>("/api/users");
 export const getUser = (pubkey: string) => api<User>(`/api/users/${pubkey}`);
-export const getNotes = () => api<Note[]>("/api/notes");
+/** All notes, or just `author`'s. */
+export const getNotes = (author?: string) =>
+  api<Note[]>(author ? `/api/notes?author=${encodeURIComponent(author)}` : "/api/notes");
+
+// ---- user IDs ----
+//
+// A user's ID is their raw 32-byte Ed25519 public key. In the API, URLs and the UI it's written in
+// base58 (Bitcoin alphabet: letters and digits only, so a double-click selects it all, and no 0/O/I/l).
+// Store bytes; base58 and phrases are only for input and output. Keep in sync with src/lib.rs.
+
+const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+
+function b58(bytes: Uint8Array) {
+  let n = 0n;
+  for (const b of bytes) n = (n << 8n) | BigInt(b);
+  let s = "";
+  for (; n > 0n; n /= 58n) s = B58[Number(n % 58n)] + s;
+  for (let i = 0; i < bytes.length && bytes[i] === 0; i++) s = "1" + s; // leading zero bytes
+  return s;
+}
+
+function unb58(s: string) {
+  let n = 0n;
+  for (const c of s) {
+    const d = B58.indexOf(c);
+    if (d < 0) throw new Error("not base58");
+    n = n * 58n + BigInt(d);
+  }
+  const out: number[] = [];
+  for (; n > 0n; n >>= 8n) out.unshift(Number(n & 0xffn));
+  for (let i = 0; i < s.length && s[i] === "1"; i++) out.unshift(0); // leading zero bytes
+  return Uint8Array.from(out);
+}
+
+/** The raw public key for a base58 ID; null unless it's exactly 32 bytes. */
+function decodeId(id: string) {
+  try {
+    const pk = unb58(id);
+    return pk.length === 32 ? pk : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Whether `s` is an ID: 32 bytes of base58. */
+export const isPubkey = (s: string) => decodeId(s) !== null;
+
+/** An ID's four_word nickname, from SHA-256 of its raw bytes; same as `phrase` in src/lib.rs. */
+export async function userPhrase(pubkey: string) {
+  const pk = decodeId(pubkey);
+  if (!pk) throw new Error("not an ID");
+  const h = new DataView(await crypto.subtle.digest("SHA-256", pk));
+  return [0, 4, 8, 12].map((i) => WORDS[h.getUint32(i) % WORDS.length]).join("_");
+}
 
 // ---- bytes ----
 
@@ -133,7 +186,7 @@ async function deriveKeys(secret: Uint8Array<ArrayBuffer>, passkey: PasskeyIds |
     false,
     ["encrypt", "decrypt"],
   );
-  const pubkey = jwk.x!;
+  const pubkey = b58(unb64(jwk.x!));
   return { secret, pubkey, signKey, noteKey, passkey: passkey && { ...passkey, pubkey, lastUsed: Date.now() } };
 }
 
@@ -348,7 +401,8 @@ export async function deleteNote(note: Note) {
 /** Checks a note's signature against its author's ID (their Ed25519 public key), without trusting the server. */
 export async function verifyNote(note: Note): Promise<boolean> {
   try {
-    const pk = unb64(note.author.pubkey);
+    const pk = decodeId(note.author.pubkey);
+    if (!pk) return false;
     const key = await crypto.subtle.importKey("raw", pk, "Ed25519", false, ["verify"]);
     const msg = writePayload(note.id, note.version, note);
     const sig = unb64(note.sig);

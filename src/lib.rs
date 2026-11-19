@@ -1,7 +1,44 @@
 //! Code shared by the server and the `note` CLI.
 
 use ed25519_dalek::{Signature, VerifyingKey};
-use sha2::{Digest, Sha512};
+use sha2::{Digest, Sha256, Sha512};
+use std::sync::LazyLock;
+
+// ---- user IDs ----
+//
+// A user's ID is their raw 32-byte Ed25519 public key, and that's what gets stored. base58 (Bitcoin
+// alphabet: letters and digits only, so a double-click selects it all) and the word phrase are only
+// for showing, typing and passing it around. Keep in sync with web/src/api.ts.
+
+pub type Pubkey = [u8; 32];
+
+/// The ID as shown to people and used in URLs and the API.
+pub fn encode_id(pk: &Pubkey) -> String {
+    bs58::encode(pk).into_string()
+}
+
+/// Parses a base58 ID; None unless it's exactly 32 bytes.
+pub fn decode_id(s: &str) -> Option<Pubkey> {
+    bs58::decode(s).into_vec().ok()?.try_into().ok()
+}
+
+static WORDS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
+    include_str!("../google-10000-english-usa-no-swears.txt")
+        .lines()
+        .map(str::trim)
+        .filter(|w| !w.is_empty())
+        .collect()
+});
+
+/// A readable four_word nickname for an ID, from SHA-256 of its raw bytes. Not unique enough to identify anyone.
+pub fn phrase(pk: &Pubkey) -> String {
+    Sha256::digest(pk)
+        .chunks(4)
+        .take(4)
+        .map(|c| WORDS[u32::from_be_bytes(c.try_into().unwrap()) as usize % WORDS.len()])
+        .collect::<Vec<_>>()
+        .join("_")
+}
 
 /// The exact bytes a note write's signature covers. Keep in sync with writePayload in web/src/api.ts.
 /// `put` is `(encrypted, wrapped_key, body)`; `None` is a delete.

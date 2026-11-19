@@ -11,7 +11,7 @@ use base64::{
 };
 use fedcrdt::{NOTE_NAMESPACE, ed25519_from_blob, put_string, sshsig_blob, sshsig_signed_data, take_string, write_payload};
 use hkdf::Hkdf;
-use serde_json::{Value, json};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::{
     io::{Read, Write},
@@ -72,7 +72,7 @@ fn run() -> Result<(), String> {
 
     let mut agent = Agent::connect()?;
     let pk = pick_key(&mut agent, key_arg.as_deref())?;
-    let author = B64.encode(pk);
+    let author = fedcrdt::encode_id(&pk);
 
     let id = B64.encode(random::<16>());
     let version = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as i64;
@@ -100,15 +100,8 @@ fn run() -> Result<(), String> {
         return Err(format!("server refused the note ({}): {msg}", res.status()));
     }
 
-    let phrase = http
-        .get(format!("{server}/api/users/{author}"))
-        .call()
-        .ok()
-        .and_then(|mut r| r.body_mut().read_json::<Value>().ok())
-        .and_then(|u| u["phrase"].as_str().map(String::from))
-        .unwrap_or_default();
     println!("posted {}note {id}", if encrypt { "encrypted " } else { "" });
-    println!("author {phrase} ({author})");
+    println!("author {} ({author})", fedcrdt::phrase(&pk));
     println!("       ssh-ed25519 {}", STANDARD.encode(fedcrdt::ed25519_key_blob(&pk)));
     Ok(())
 }
