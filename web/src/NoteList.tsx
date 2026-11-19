@@ -1,20 +1,23 @@
 import { useEffect, useState } from "react";
-import { type Note, type User, decryptNote, deleteNote, putNote, verifyNote } from "./api.ts";
+import { type Grant, type Post, type User, canEdit, decryptPost, deletePost, newPostPath, putPost } from "./api.ts";
 import { Link, idPath } from "./router.tsx";
-import { type Run, badge, danger, fmtTime, link, primary, secondary, textarea } from "./ui.ts";
+import { type Run, badge, danger, fmtTime, input, link, primary, secondary, textarea } from "./ui.ts";
 
-export type Draft = { body: string; encrypt: boolean };
+/** `path` and `grant` are only for new posts: where it goes, and the grant to write in someone else's space. */
+export type Draft = { body: string; encrypt: boolean; path?: string; grant?: Grant };
 
-/** Note text plus an "Encrypt" checkbox. Notes are always signed. */
+/** Post text, where it goes (for new posts), and an "Encrypt" checkbox. Posts are always signed. */
 export function NoteEditor(props: {
   draft: Draft;
   setDraft: (d: Draft) => void;
+  /** Grants we hold, offered as places to post besides our own space. */
+  grants?: Grant[];
   busy: boolean;
   submitLabel: string;
   onSubmit: () => void;
   onCancel?: () => void;
 }) {
-  const { draft, setDraft, busy } = props;
+  const { draft, setDraft, busy, grants = [] } = props;
   return (
     <div className="space-y-2">
       <textarea
@@ -25,6 +28,39 @@ export function NoteEditor(props: {
         onChange={(e) => setDraft({ ...draft, body: e.target.value })}
         autoFocus={!!props.onCancel}
       />
+      {draft.path !== undefined && (
+        <div className="flex flex-wrap gap-2 text-sm">
+          {grants.length > 0 && (
+            <label className="flex items-center gap-1.5">
+              In
+              <select
+                className={input}
+                value={draft.grant?.uri ?? ""}
+                onChange={(e) => {
+                  const grant = grants.find((g) => g.uri === e.target.value);
+                  const path = grant ? `${grant.path}/${newPostPath().split("/").pop()}` : newPostPath();
+                  setDraft({ ...draft, grant, path });
+                }}
+              >
+                <option value="">my space</option>
+                {grants.map((g) => (
+                  <option key={g.uri} value={g.uri}>
+                    {g.owner.phrase}'s space, under {g.path}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          <label className="flex min-w-48 flex-1 items-center gap-1.5">
+            Path
+            <input
+              className={`${input} font-mono`}
+              value={draft.path}
+              onChange={(e) => setDraft({ ...draft, path: e.target.value })}
+            />
+          </label>
+        </div>
+      )}
       <label className="flex items-center gap-1.5 text-sm" title="Only your passkey can decrypt it">
         <input type="checkbox" checked={draft.encrypt} onChange={(e) => setDraft({ ...draft, encrypt: e.target.checked })} />
         Encrypt (only you can read it)
@@ -43,112 +79,187 @@ export function NoteEditor(props: {
   );
 }
 
-/** Notes, with signatures checked and (our own) encrypted ones decrypted, entirely client-side. */
-export function NoteList({ notes, me, busy, run }: { notes: Note[]; me: User | null; busy: boolean; run: Run }) {
-  const [editing, setEditing] = useState<(Draft & { note: Note }) | null>(null);
-  /** Per note ID: decrypted text, and whether its signature checks out. */
-  const [plain, setPlain] = useState<Record<string, string>>({});
-  const [verified, setVerified] = useState<Record<string, boolean>>({});
+type ItemProps = { post: Post; me: User | null; busy: boolean; run: Run };
+
+/** One record: author, badges, content, and Edit / Delete when we may. `name` replaces the bb:// address (in trees). */
+function PostItem({ post: n, me, busy, run, name }: ItemProps & { name?: string }) {
+  const [editing, setEditing] = useState<Draft | null>(null);
+  /** Decrypted text of our own encrypted posts. */
+  const [plain, setPlain] = useState<string>();
+  const mine = me?.pubkey === n.author.pubkey;
 
   useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      const v: Record<string, boolean> = {};
-      const p: Record<string, string> = {};
-      for (const n of notes) {
-        v[n.id] = await verifyNote(n);
-        if (n.encrypted && n.author.pubkey === me?.pubkey) {
-          p[n.id] = await decryptNote(n).catch(() => "(couldn't decrypt)");
-        }
-      }
-      if (!cancelled) {
-        setVerified(v);
-        setPlain(p);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [notes, me]);
+    setPlain(undefined);
+    if (n.encrypted && mine) decryptPost(n).then(setPlain, () => setPlain("(couldn't decrypt)"));
+  }, [n, mine]);
 
+  const text = n.encrypted ? plain : (n.text ?? undefined);
+  const elsewhere = n.owner.pubkey !== n.author.pubkey;
+  return (
+    <div className="p-3">
+      <div className="flex flex-wrap items-baseline justify-between gap-2 text-sm">
+        <span className="flex flex-wrap items-baseline gap-2">
+          {name && <span className="font-mono font-semibold">{name}</span>}
+          <Link href={idPath(n.author.pubkey)} className={`font-semibold ${link}`} title={n.author.pubkey}>
+            {n.author.phrase}
+            {mine && <span className="ml-1 font-normal text-gray-500">(you)</span>}
+          </Link>
+          {n.verified ? (
+            <span
+              className={`${badge} bg-green-50 text-green-700 ring-green-200`}
+              title="Signature verified in your browser against the author's public key"
+            >
+              ✓ signed
+            </span>
+          ) : (
+            <span className={`${badge} bg-red-50 text-red-700 ring-red-200`}>✗ bad signature</span>
+          )}
+          {n.encrypted && <span className={`${badge} bg-amber-50 text-amber-800 ring-amber-200`}>🔒 encrypted</span>}
+        </span>
+        <span className="text-xs text-gray-500">{fmtTime(n.rec.version / 1000)}</span>
+      </div>
+      {!name && (
+        <Link
+          href={idPath(n.owner.pubkey)}
+          className={`block font-mono text-xs break-all text-gray-500 ${link}`}
+          title={elsewhere ? `in ${n.owner.phrase}'s space` : undefined}
+        >
+          {n.uri}
+        </Link>
+      )}
+      {editing ? (
+        <div className="mt-2">
+          <NoteEditor
+            draft={editing}
+            setDraft={setEditing}
+            busy={busy}
+            submitLabel="Save"
+            onSubmit={run(async () => {
+              await putPost(editing.body, { encrypt: editing.encrypt }, n);
+              setEditing(null);
+            })}
+            onCancel={() => setEditing(null)}
+          />
+        </div>
+      ) : (
+        <>
+          {n.grant ? (
+            <p className="mt-1">
+              🔑 Lets{" "}
+              <Link href={idPath(n.grant.grantee.pubkey)} className={`font-semibold ${link}`} title={n.grant.grantee.pubkey}>
+                {n.grant.grantee.phrase}
+                {me?.pubkey === n.grant.grantee.pubkey && <span className="ml-1 font-normal text-gray-500">(you)</span>}
+              </Link>{" "}
+              write at or under <code className="font-mono text-sm">{n.grant.path}</code>
+            </p>
+          ) : text !== undefined ? (
+            <p className="mt-1 whitespace-pre-wrap break-words">{text}</p>
+          ) : n.encrypted ? (
+            <p className="mt-1 text-sm text-gray-500 italic">
+              {mine ? "Decrypting…" : "Encrypted. Only the author can read this."}
+            </p>
+          ) : (
+            <p className="mt-1 text-sm text-gray-500 italic">(a {n.rec.type} record this page can't show)</p>
+          )}
+          {me && canEdit(n) && (
+            <div className="mt-2 flex gap-2">
+              {n.rec.type === "post" && (
+                <button
+                  className={secondary}
+                  disabled={busy || text === undefined || (n.encrypted && !mine)}
+                  onClick={() => setEditing({ body: text!, encrypt: n.encrypted })}
+                >
+                  Edit
+                </button>
+              )}
+              <button className={danger} disabled={busy} onClick={run(() => deletePost(n))}>
+                Delete
+              </button>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+/** Records as a flat list, newest first. Signatures were checked (in the browser) when they were fetched. */
+export function NoteList({ posts, ...rest }: { posts: Post[] } & Omit<ItemProps, "post">) {
   return (
     <ul className="mt-4 divide-y divide-gray-200 rounded-lg ring-1 ring-gray-200">
-      {notes.map((n) => {
-        const mine = me?.pubkey === n.author.pubkey;
-        const isEditing = editing?.note.id === n.id;
-        const text = n.encrypted ? plain[n.id] : n.body;
-        const v = verified[n.id];
-        return (
-          <li key={n.id} className="p-3">
-            <div className="flex flex-wrap items-baseline justify-between gap-2 text-sm">
-              <span className="flex flex-wrap items-baseline gap-2">
-                <Link href={idPath(n.author.pubkey)} className={`font-semibold ${link}`} title={n.author.pubkey}>
-                  {n.author.phrase}
-                  {mine && <span className="ml-1 font-normal text-gray-500">(you)</span>}
-                </Link>
-                {v === true ? (
-                  <span
-                    className={`${badge} bg-green-50 text-green-700 ring-green-200`}
-                    title="Signature verified in your browser against the author's public key"
-                  >
-                    ✓ signed
-                  </span>
-                ) : v === false ? (
-                  <span className={`${badge} bg-red-50 text-red-700 ring-red-200`}>✗ bad signature</span>
-                ) : (
-                  <span className={`${badge} bg-gray-50 text-gray-600 ring-gray-200`}>checking…</span>
-                )}
-                {n.encrypted && (
-                  <span className={`${badge} bg-amber-50 text-amber-800 ring-amber-200`}>🔒 encrypted</span>
-                )}
-              </span>
-              <span className="text-xs text-gray-500">
-                {fmtTime(n.created_at)}
-                {n.updated_at !== n.created_at && ` · edited ${fmtTime(n.updated_at)}`}
-              </span>
-            </div>
-            {isEditing ? (
-              <div className="mt-2">
-                <NoteEditor
-                  draft={editing}
-                  setDraft={(d) => setEditing({ ...d, note: n })}
-                  busy={busy}
-                  submitLabel="Save"
-                  onSubmit={run(async () => {
-                    await putNote(editing.body, editing, n);
-                    setEditing(null);
-                  })}
-                  onCancel={() => setEditing(null)}
-                />
+      {posts.map((p) => (
+        <li key={p.uri}>
+          <PostItem post={p} {...rest} />
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+// ---- the whole hierarchy: spaces, then folders (path segments), then records ----
+
+type Node = { post?: Post; children: Map<string, Node> };
+const newNode = (): Node => ({ children: new Map() });
+
+function Folder({ node, ...rest }: { node: Node } & Omit<ItemProps, "post">) {
+  return (
+    <ul className="space-y-2">
+      {[...node.children]
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([seg, child]) => (
+          <li key={seg}>
+            {child.post && (
+              <div className="rounded-lg ring-1 ring-gray-200">
+                <PostItem post={child.post} name={seg} {...rest} />
               </div>
-            ) : (
+            )}
+            {child.children.size > 0 && (
               <>
-                {text !== undefined ? (
-                  <p className="mt-1 whitespace-pre-wrap break-words">{text}</p>
-                ) : (
-                  <p className="mt-1 text-sm text-gray-500 italic">
-                    {mine ? "Decrypting…" : "Encrypted. Only the author can read this."}
-                  </p>
-                )}
-                {mine && (
-                  <div className="mt-2 flex gap-2">
-                    <button
-                      className={secondary}
-                      disabled={busy || text === undefined}
-                      onClick={() => setEditing({ note: n, body: text!, encrypt: n.encrypted })}
-                    >
-                      Edit
-                    </button>
-                    <button className={danger} disabled={busy} onClick={run(() => deleteNote(n))}>
-                      Delete
-                    </button>
-                  </div>
-                )}
+                <div className="mt-1 font-mono text-sm text-gray-700">📁 {seg}/</div>
+                <div className="mt-1 ml-2 border-l border-gray-200 pl-3">
+                  <Folder node={child} {...rest} />
+                </div>
               </>
             )}
           </li>
-        );
-      })}
+        ))}
     </ul>
+  );
+}
+
+/** Every record, grouped by space and nested by path. `first` (a base58 ID) puts that space first. */
+export function PostTree({ posts, first, ...rest }: { posts: Post[]; first?: string } & Omit<ItemProps, "post">) {
+  const spaces = new Map<string, { owner: User; root: Node }>();
+  for (const p of posts) {
+    let space = spaces.get(p.owner.pubkey);
+    if (!space) spaces.set(p.owner.pubkey, (space = { owner: p.owner, root: newNode() }));
+    let node = space.root;
+    for (const seg of p.rec.path.slice(1).split("/")) {
+      let next = node.children.get(seg);
+      if (!next) node.children.set(seg, (next = newNode()));
+      node = next;
+    }
+    node.post = p;
+  }
+  const ordered = [...spaces.values()].sort(
+    (a, b) => Number(b.owner.pubkey === first) - Number(a.owner.pubkey === first) || a.owner.phrase.localeCompare(b.owner.phrase),
+  );
+  return (
+    <div className="mt-4 space-y-6">
+      {ordered.map(({ owner, root }) => (
+        <section key={owner.pubkey}>
+          <h3 className="font-mono text-sm break-all">
+            bb://
+            <Link href={idPath(owner.pubkey)} className={`font-semibold ${link}`} title={owner.pubkey}>
+              {owner.phrase}
+            </Link>
+            /
+          </h3>
+          <div className="mt-2">
+            <Folder node={root} {...rest} />
+          </div>
+        </section>
+      ))}
+    </div>
   );
 }

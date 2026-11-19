@@ -1,9 +1,13 @@
 import { useCallback, useEffect, useState } from "react";
 import {
-  type Note,
   type Passkey,
+  type Post,
   type User,
-  getNotes,
+  forgedPost,
+  getPosts,
+  newPostPath,
+  myGrants,
+  type Grant,
   getUsers,
   isRemembering,
   forgetKeys,
@@ -11,7 +15,7 @@ import {
   myPasskey,
   recentPasskeys,
   myPubkey,
-  putNote,
+  putPost,
   deriveFromNewPasskey,
   restoreKeys,
   setRemember,
@@ -22,19 +26,6 @@ import Identity from "./Identity.tsx";
 import { type Draft, NoteEditor, NoteList } from "./NoteList.tsx";
 import { Link, idPath, usePath } from "./router.tsx";
 import { type Run, link, primary, secondary } from "./ui.ts";
-
-/** A forged note, added client-side to the bottom of the list to show what a bad signature looks like. */
-const FORGED_NOTE: Note = {
-  id: "forged-demo-note",
-  author: { pubkey: "4zvwRjXUKGfvwnParsHAS3HuSVzV5cA4McphgmoCtajS", phrase: "forged_signature_demo_note" },
-  version: 1,
-  body: "This note was added client-side with a made-up signature, so it should show as a bad signature.",
-  encrypted: false,
-  wrapped_key: null,
-  sig: "A".repeat(86),
-  created_at: Math.floor(Date.now() / 1000),
-  updated_at: Math.floor(Date.now() / 1000),
-};
 
 // The composer's Encrypt choice persists across visits.
 const OPTS_KEY = "note-opts";
@@ -70,10 +61,11 @@ export default function App() {
 function Home({ initialError }: { initialError: string | null }) {
   const [me, setMe] = useState<User | null>(null);
   const [users, setUsers] = useState<User[] | null>(null);
-  const [notes, setNotes] = useState<Note[] | null>(null);
+  const [notes, setNotes] = useState<Post[] | null>(null);
+  const [grants, setGrants] = useState<Grant[]>([]);
   const [error, setError] = useState(initialError ?? "");
   const [busy, setBusy] = useState(false);
-  const [draft, setDraftState] = useState<Draft>(() => ({ body: "", encrypt: loadEncrypt() }));
+  const [draft, setDraftState] = useState<Draft>(() => ({ body: "", encrypt: loadEncrypt(), path: newPostPath() }));
   const setDraft = (d: Draft) => {
     setDraftState(d);
     saveEncrypt(d.encrypt);
@@ -87,15 +79,18 @@ function Home({ initialError }: { initialError: string | null }) {
     const pubkey = myPubkey();
     const current = myPasskey();
     const others = recentPasskeys().filter((p) => p.credId !== current?.credId);
-    const [m, u, n, phrases] = await Promise.all([
+    const [m, u, n, forged, g, phrases] = await Promise.all([
       pubkey ? userPhrase(pubkey).then((phrase) => ({ pubkey, phrase })) : null,
       getUsers(),
-      getNotes(),
+      getPosts(),
+      forgedPost(),
+      myGrants(),
       Promise.all(others.map((p) => userPhrase(p.pubkey))),
     ]);
     setMe(m);
     setUsers(u);
-    setNotes([...n, FORGED_NOTE]);
+    setNotes([...n, forged]);
+    setGrants(g);
     setPasskey(current);
     setRecent(others.map((p, i) => ({ ...p, phrase: phrases[i] })));
     setRememberState(isRemembering());
@@ -162,9 +157,9 @@ function Home({ initialError }: { initialError: string | null }) {
               {recent.map((p) => (
                 <li key={p.credId} className="flex flex-wrap items-center justify-between gap-2 p-2">
                   <span>
-                    <strong>{p.name ?? "(unnamed passkey)"}</strong>
+                    <strong title={p.pubkey}>{p.phrase}</strong>
                     <span className="ml-2 text-xs text-gray-500">
-                      keys <span title={p.pubkey}>{p.phrase}</span> ·{" "}
+                      passkey {p.name ?? "(unnamed)"} ·{" "}
                       last used{" "}
                       {new Date(p.lastUsed).toLocaleString()}
                     </span>
@@ -212,29 +207,30 @@ function Home({ initialError }: { initialError: string | null }) {
         <p className="mt-4 rounded-md bg-red-50 p-3 text-sm text-red-700 ring-1 ring-red-200">{error}</p>
       )}
 
-      <h2 className="mt-10 text-xl font-semibold">Notes</h2>
+      <h2 className="mt-10 text-xl font-semibold">Posts</h2>
       {me ? (
         <div className="mt-3">
           <NoteEditor
             draft={draft}
             setDraft={setDraft}
+            grants={grants}
             busy={busy}
-            submitLabel="Add note"
+            submitLabel="Post"
             onSubmit={run(async () => {
-              await putNote(draft.body, draft);
-              setDraft({ ...draft, body: "" });
+              await putPost(draft.body, draft);
+              setDraft({ ...draft, body: "", path: draft.grant ? `${draft.grant.path}/${newPostPath().split("/").pop()}` : newPostPath() });
             })}
           />
         </div>
       ) : (
-        <p className="mt-3 text-sm text-gray-500">Derive keys to write notes.</p>
+        <p className="mt-3 text-sm text-gray-500">Derive keys to post.</p>
       )}
       {notes === null ? (
         <p className="mt-3 text-gray-500">Loading…</p>
       ) : notes.length === 0 ? (
-        <p className="mt-3 text-gray-500">No notes yet.</p>
+        <p className="mt-3 text-gray-500">No posts yet.</p>
       ) : (
-        <NoteList notes={notes} me={me} busy={busy} run={run} />
+        <NoteList posts={notes} me={me} busy={busy} run={run} />
       )}
 
       <h2 className="mt-10 text-xl font-semibold">Users</h2>

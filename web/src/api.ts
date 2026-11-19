@@ -1,22 +1,8 @@
 import WORDS_TXT from "../../google-10000-english-usa-no-swears.txt?raw";
 
+import { type Cbor, decode, encode } from "./cbor.ts";
+
 export type User = { pubkey: string; phrase: string };
-export type Note = {
-  /** Chosen by the author's client (random). */
-  id: string;
-  author: User;
-  /** Milliseconds since the epoch, by the author's clock; the newest signed write wins. */
-  version: number;
-  /** Plain text, or base64url(iv || AES-GCM ciphertext) under a per-note key when `encrypted`. */
-  body: string;
-  encrypted: boolean;
-  /** base64url(iv || the per-note key, AES-GCM-encrypted under the author's note key). */
-  wrapped_key: string | null;
-  /** base64url Ed25519 signature by the author over writePayload(..). */
-  sig: string;
-  created_at: number;
-  updated_at: number;
-};
 
 async function api<T>(path: string, body?: unknown, method = body === undefined ? "GET" : "POST"): Promise<T> {
   const res = await fetch(
@@ -31,9 +17,6 @@ async function api<T>(path: string, body?: unknown, method = body === undefined 
 
 export const getUsers = () => api<User[]>("/api/users");
 export const getUser = (pubkey: string) => api<User>(`/api/users/${pubkey}`);
-/** All notes, or just `author`'s. */
-export const getNotes = (author?: string) =>
-  api<Note[]>(author ? `/api/notes?author=${encodeURIComponent(author)}` : "/api/notes");
 
 // ---- user IDs ----
 //
@@ -43,7 +26,7 @@ export const getNotes = (author?: string) =>
 
 const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
-function b58(bytes: Uint8Array) {
+export function b58(bytes: Uint8Array) {
   let n = 0n;
   for (const b of bytes) n = (n << 8n) | BigInt(b);
   let s = "";
@@ -146,6 +129,7 @@ async function passkeyName(userId: Uint8Array<ArrayBuffer>): Promise<string | nu
 type Keys = {
   secret: Uint8Array<ArrayBuffer>;
   pubkey: string;
+  pk: Uint8Array;
   signKey: CryptoKey;
   noteKey: CryptoKey;
   passkey: Passkey | null;
@@ -186,11 +170,12 @@ async function deriveKeys(secret: Uint8Array<ArrayBuffer>, passkey: PasskeyIds |
     false,
     ["encrypt", "decrypt"],
   );
-  const pubkey = b58(unb64(jwk.x!));
-  return { secret, pubkey, signKey, noteKey, passkey: passkey && { ...passkey, pubkey, lastUsed: Date.now() } };
+  const pk = unb64(jwk.x!);
+  const pubkey = b58(pk);
+  return { secret, pubkey, pk, signKey, noteKey, passkey: passkey && { ...passkey, pubkey, lastUsed: Date.now() } };
 }
 
-const sign = async (data: Uint8Array<ArrayBuffer>) => b64(await crypto.subtle.sign("Ed25519", keys!.signKey, data));
+const sign = async (data: Uint8Array<ArrayBuffer>) => new Uint8Array(await crypto.subtle.sign("Ed25519", keys!.signKey, data));
 
 /** Sets freshly derived keys, records the passkey's use, and updates the remembered copy if remembering. */
 function loadKeys(k: Keys) {
@@ -333,146 +318,286 @@ export function forgetKeys() {
   setRemember(false);
 }
 
-// ---- notes ----
+// ---- records ----
 //
-// Every write (create, edit, delete) is signed by the author and carries a version; the server
-// keeps the newest. Each note is encrypted under its own random key, which is itself encrypted
-// ("wrapped") under the author's note key. Signatures cover exactly what's stored, so anyone can
-// verify an encrypted note without reading it.
+// Everything users write is a record: a deterministic-CBOR map signed by its author, identified by
+// (owner, path), where the newest version wins. Field by field, see src/lib.rs. The server stores
+// and returns records exactly as signed, so everything here is checked in the browser.
+//
+// Encrypted records have a `wrapped_key`: `data` is then iv || AES-GCM(CBOR of the real data) under
+// a random key, itself encrypted ("wrapped") under the author's note key. Signatures cover the
+// ciphertext, so anyone can verify an encrypted record without reading it.
 
-/** The exact bytes a write's signature covers. Keep in sync with write_payload in src/main.rs. */
-function writePayload(id: string, version: number, put?: Pick<Note, "body" | "encrypted" | "wrapped_key">) {
-  const head = `bisonbase-note-v2\n${id}\n${version}`;
-  return enc.encode(
-    put
-      ? `${head}\nput\n${put.encrypted ? "encrypted" : "plain"}\n${put.wrapped_key ?? ""}\n${put.body}`
-      : `${head}\ndelete`,
-  );
-}
+const RECORD_CONTEXT = enc.encode("bisonbase-record-v1\n");
+const GRANT_CONTEXT = enc.encode("bisonbase-grant-v1\n");
 
-/** A version newer than both the clock and `prev`, so quick successive edits still go through. */
-const nextVersion = (prev = 0) => Math.max(Date.now(), prev + 1);
+export type Authorization = { path: string; signature: Uint8Array };
+export type Rec = {
+  author: Uint8Array;
+  owner: Uint8Array;
+  path: string;
+  version: number;
+  type: string;
+  data: Cbor;
+  wrapped_key?: Uint8Array;
+  authorization?: Authorization;
+  signature: Uint8Array;
+};
 
-/** AES-GCM: base64url(iv || ciphertext). */
-async function seal(key: CryptoKey, data: Uint8Array<ArrayBuffer>) {
-  const iv = random(12);
-  const ct = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, data);
-  return b64(new Uint8Array([...iv, ...new Uint8Array(ct)]));
-}
+/** A record as shown: its decoded IDs, its bb:// address, and whether it checks out. */
+export type Post = {
+  rec: Rec;
+  author: User;
+  owner: User;
+  /** bb://<owner><path> */
+  uri: string;
+  /** Whether its signature (and authorization, if any) verified, in this browser. */
+  verified: boolean;
+  encrypted: boolean;
+  /** The text, if it's a plain post. */
+  text: string | null;
+  /** For grant records: who may write, and where. */
+  grant?: { grantee: User; path: string };
+};
 
-async function open(key: CryptoKey, sealed: string) {
-  const bytes = unb64(sealed);
-  return new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: bytes.slice(0, 12) }, key, bytes.slice(12)));
-}
+const concat = (...parts: Uint8Array[]) => {
+  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+  parts.reduce((at, p) => (out.set(p, at), at + p.length), 0);
+  return out;
+};
+const bytesEqual = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((x, i) => x === b[i]);
 
-const aesKey = (raw: Uint8Array<ArrayBuffer>) =>
-  crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["encrypt", "decrypt"]);
+const unsigned = ({ signature: _, ...rest }: Rec) => rest as Cbor;
+const signedBytes = (r: Rec) => concat(RECORD_CONTEXT, encode(unsigned(r)));
+const grantBytes = (author: Uint8Array, owner: Uint8Array, path: string) =>
+  concat(GRANT_CONTEXT, encode({ author, owner, path }));
 
-export async function decryptNote(note: Note) {
-  if (!keys || !note.wrapped_key) throw new Error("locked");
-  const key = await aesKey(await open(keys.noteKey, note.wrapped_key));
-  return new TextDecoder().decode(await open(key, note.body));
-}
-
-/** Creates a note, or replaces `existing`. Signed always; encrypted if asked. */
-export async function putNote(text: string, opts: { encrypt: boolean }, existing?: Note) {
-  if (!keys) throw new Error("Derive keys first.");
-  const id = existing?.id ?? b64(random(16));
-  const version = nextVersion(existing?.version);
-  let body = text.trim();
-  let wrapped_key: string | null = null;
-  if (opts.encrypt) {
-    const raw = random(32);
-    body = await seal(await aesKey(raw), enc.encode(body));
-    wrapped_key = await seal(keys.noteKey, raw);
+/** Paths: "/" then "/"-separated segments: non-empty, not "." or "..", no control characters,
+ * Unicode NFC, ≤ 1024 bytes. Returns the NFC form, or throws. Same rules as check_path in src/lib.rs. */
+export function normalizePath(input: string) {
+  const path = input.trim().normalize("NFC");
+  if (!path.startsWith("/")) throw new Error("A path must start with /");
+  if (enc.encode(path).length > 1024) throw new Error("That path is too long");
+  for (const seg of path.slice(1).split("/")) {
+    if (!seg) throw new Error("A path can't have empty segments (// or a trailing /)");
+    if (seg === "." || seg === "..") throw new Error("Path segments can't be . or ..");
+    if (/\p{Cc}/u.test(seg)) throw new Error("A path can't contain control characters");
   }
-  const put = { body, encrypted: opts.encrypt, wrapped_key };
-  const sig = await sign(writePayload(id, version, put));
-  await api(`/api/notes/${id}`, { ...put, author: keys.pubkey, version, sig }, "PUT");
+  return path;
 }
 
-export async function deleteNote(note: Note) {
-  if (!keys) throw new Error("Derive keys first.");
-  const version = nextVersion(note.version);
-  const sig = await sign(writePayload(note.id, version));
-  await api(`/api/notes/${note.id}`, { author: keys.pubkey, version, sig }, "DELETE");
+/** Whether `path` is `prefix` or below it, by whole segments. */
+export const pathWithin = (path: string, prefix: string) =>
+  path === prefix || path.startsWith(prefix.endsWith("/") ? prefix : prefix + "/");
+
+const isBytes = (v: unknown, n?: number): v is Uint8Array => v instanceof Uint8Array && (n === undefined || v.length === n);
+
+function recFromCbor(v: Cbor): Rec {
+  const r = v as Rec;
+  const a = r?.authorization;
+  if (
+    !isBytes(r?.author, 32) ||
+    !isBytes(r.owner, 32) ||
+    typeof r.path !== "string" ||
+    typeof r.version !== "number" ||
+    typeof r.type !== "string" ||
+    !("data" in r) ||
+    (r.wrapped_key !== undefined && !isBytes(r.wrapped_key)) ||
+    (a !== undefined && (typeof a.path !== "string" || !isBytes(a.signature, 64))) ||
+    !isBytes(r.signature, 64)
+  ) {
+    throw new Error("malformed record");
+  }
+  return r;
 }
 
-/** Checks a note's signature against its author's ID (their Ed25519 public key), without trusting the server. */
-export async function verifyNote(note: Note): Promise<boolean> {
+async function verifySig(pk: Uint8Array<ArrayBuffer>, msg: Uint8Array<ArrayBuffer>, sig: Uint8Array<ArrayBuffer>) {
   try {
-    const pk = decodeId(note.author.pubkey);
-    if (!pk) return false;
     const key = await crypto.subtle.importKey("raw", pk, "Ed25519", false, ["verify"]);
-    const msg = writePayload(note.id, note.version, note);
-    const sig = unb64(note.sig);
-    if (!isSshsig(sig)) return await crypto.subtle.verify("Ed25519", key, sig, msg);
-    const s = await parseSshsig(sig, pk, NOTE_NAMESPACE);
-    return !!s && (await crypto.subtle.verify("Ed25519", key, s.raw, await sshsigSignedData(NOTE_NAMESPACE, s.reserved, msg)));
+    return await crypto.subtle.verify("Ed25519", key, sig, msg);
   } catch {
     return false;
   }
 }
 
-// ---- SSH signatures ----
-//
-// Writes by the `note` CLI (src/bin/note.rs) are signed with an ssh-ed25519 key from the author's
-// SSH agent, in OpenSSH's SSHSIG format (what `ssh-keygen -Y sign` makes), under NOTE_NAMESPACE.
-// The author's ID is then their SSH public key itself. Keep in sync with src/lib.rs.
-
-const NOTE_NAMESPACE = "bisonbase-note";
-const SSHSIG = enc.encode("SSHSIG");
-
-const isSshsig = (sig: Uint8Array) => SSHSIG.every((b, i) => sig[i] === b);
-
-/** SSH wire-format string: u32 big-endian length, then the bytes. */
-const sshString = (b: Uint8Array) => {
-  const out = new Uint8Array(4 + b.length);
-  new DataView(out.buffer).setUint32(0, b.length);
-  out.set(b, 4);
-  return out;
-};
-
-const bytesEqual = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((x, i) => x === b[i]);
-
-/** Picks an SSHSIG blob apart; null unless it's an ssh-ed25519, sha512 signature by `pk` under `namespace`. */
-async function parseSshsig(sig: Uint8Array, pk: Uint8Array, namespace: string) {
-  let at = SSHSIG.length;
-  const dv = new DataView(sig.buffer, sig.byteOffset, sig.byteLength);
-  const u32 = () => {
-    const v = dv.getUint32(at); // throws past the end
-    at += 4;
-    return v;
-  };
-  const str = () => {
-    const n = u32();
-    if (at + n > sig.length) throw new Error("truncated");
-    return sig.slice(at, (at += n));
-  };
-  if (u32() !== 1) return null;
-  const keyBlob = str();
-  const ns = str();
-  const reserved = str();
-  const hash = str();
-  const sigBlob = str();
-  if (at !== sig.length) return null;
-  const want = new Uint8Array([...sshString(enc.encode("ssh-ed25519")), ...sshString(pk)]);
-  if (!bytesEqual(keyBlob, want) || !bytesEqual(ns, enc.encode(namespace))) return null;
-  if (!bytesEqual(hash, enc.encode("sha512"))) return null;
-  const algo = sshString(enc.encode("ssh-ed25519"));
-  if (sigBlob.length !== algo.length + 4 + 64 || !bytesEqual(sigBlob.slice(0, algo.length), algo)) return null;
-  if (new DataView(sigBlob.buffer).getUint32(algo.length) !== 64) return null;
-  return { reserved, raw: sigBlob.slice(algo.length + 4) };
+/** Checks a record's signature and authorization against its author's and owner's IDs, without trusting the server. */
+export async function verifyRec(r: Rec) {
+  const own = bytesEqual(r.author, r.owner);
+  if (r.type === "grant") {
+    const g = grantData(r);
+    if (!own || !g || !(await verifySig(r.owner as any, grantBytes(g.grantee, r.owner, g.path), g.signature as any))) return false;
+  }
+  const a = r.authorization;
+  if (own ? a : !a) return false;
+  if (a && (!pathWithin(r.path, a.path) || !(await verifySig(r.owner as any, grantBytes(r.author, r.owner, a.path), a.signature as any)))) {
+    return false;
+  }
+  return verifySig(r.author as any, signedBytes(r), r.signature as any);
 }
 
-/** The bytes an SSHSIG signature actually covers. */
-async function sshsigSignedData(namespace: string, reserved: Uint8Array, msg: Uint8Array<ArrayBuffer>) {
-  const hash = new Uint8Array(await crypto.subtle.digest("SHA-512", msg));
-  return new Uint8Array([
-    ...SSHSIG,
-    ...sshString(enc.encode(namespace)),
-    ...sshString(reserved),
-    ...sshString(enc.encode("sha512")),
-    ...sshString(hash),
-  ]);
+/** A grant record's data, if well-formed: {grantee, path, signature}. */
+type GrantData = { grantee: Uint8Array; path: string; signature: Uint8Array };
+function grantData(r: Rec): GrantData | null {
+  const g = r.data as GrantData;
+  return r.type === "grant" && isBytes(g?.grantee, 32) && typeof g.path === "string" && isBytes(g.signature, 64) ? g : null;
+}
+
+const toUser = async (pk: Uint8Array): Promise<User> => ({ pubkey: b58(pk), phrase: await userPhrase(b58(pk)) });
+
+export async function viewPost(rec: Rec): Promise<Post> {
+  const [author, owner] = await Promise.all([toUser(rec.author), toUser(rec.owner)]);
+  const g = grantData(rec);
+  return {
+    grant: g ? { grantee: await toUser(g.grantee), path: g.path } : undefined,
+    rec,
+    author,
+    owner,
+    uri: `bb://${owner.pubkey}${rec.path}`,
+    verified: await verifyRec(rec),
+    encrypted: !!rec.wrapped_key,
+    text: !rec.wrapped_key && typeof rec.data === "string" ? rec.data : null,
+  };
+}
+
+/** Live records, newest first; optionally only `owner`'s space, `author`'s, those `user` owns or
+ * wrote, of one `type`, or at or under `prefix`. */
+export async function getPosts(q: { owner?: string; author?: string; user?: string; type?: string; prefix?: string } = {}) {
+  const params = new URLSearchParams(Object.entries(q).filter((e): e is [string, string] => !!e[1]));
+  const res = await fetch(`/api/records?${params}`);
+  if (!res.ok) throw new Error((await res.text()) || res.statusText);
+  const list = decode(new Uint8Array(await res.arrayBuffer()));
+  if (!Array.isArray(list)) throw new Error("malformed record list");
+  return Promise.all(list.map((v) => viewPost(recFromCbor(v))));
+}
+
+/** Signs `r` (as us) and stores it. */
+async function putRec(r: Omit<Rec, "signature">) {
+  const rec = { ...r, signature: new Uint8Array() };
+  rec.signature = await sign(signedBytes(rec));
+  const res = await fetch("/api/records", {
+    method: "POST",
+    headers: { "content-type": "application/cbor" },
+    body: encode(rec as unknown as Cbor),
+  });
+  if (!res.ok) throw new Error((await res.text()) || res.statusText);
+}
+
+/** A version newer than both the clock and `prev`, so quick successive edits still go through. */
+const nextVersion = (prev = 0) => Math.max(Date.now(), prev + 1);
+
+/** AES-GCM: iv || ciphertext. */
+async function seal(key: CryptoKey, data: Uint8Array<ArrayBuffer>) {
+  const iv = random(12);
+  return concat(iv, new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, data)));
+}
+
+async function open(key: CryptoKey, sealed: Uint8Array) {
+  return new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: sealed.slice(0, 12) }, key, sealed.slice(12)));
+}
+
+const aesKey = (raw: Uint8Array<ArrayBuffer>) =>
+  crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["encrypt", "decrypt"]);
+
+/** Decrypts one of our own encrypted posts. */
+export async function decryptPost(p: Post) {
+  if (!keys || !p.rec.wrapped_key || !isBytes(p.rec.data)) throw new Error("locked");
+  const key = await aesKey(await open(keys.noteKey, p.rec.wrapped_key));
+  const data = decode(await open(key, p.rec.data));
+  if (typeof data !== "string") throw new Error("not text");
+  return data;
+}
+
+// ---- grants: letting someone else write in your space ----
+//
+// The owner signs {author: grantee, owner, path} and keeps it in their space as a "grant" record
+// (by default under /grants). The grantee finds it there and copies its signature into their
+// records' `authorization`.
+
+/** A grant given to us: where we may write. */
+export type Grant = { owner: User; ownerPk: Uint8Array; path: string; signature: Uint8Array; uri: string };
+
+/** Lets `grantee` (base58 ID) write at or under `path` in our space, saving the grant as a record. Returns its address. */
+export async function makeGrant(grantee: string, path: string) {
+  if (!keys) throw new Error("Derive keys first.");
+  const g = decodeId(grantee.trim());
+  if (!g) throw new Error("That isn't an ID (32 bytes of base58).");
+  path = normalizePath(path);
+  const signature = await sign(grantBytes(g, keys.pk, path));
+  const at = `/grants/${b58(random(8))}`;
+  await putRec({ author: keys.pk, owner: keys.pk, path: at, version: nextVersion(), type: "grant", data: { grantee: g, path, signature } });
+  return `bb://${keys.pubkey}${at}`;
+}
+
+/** Grants others have given us, from their grant records (verified here). */
+export async function myGrants(): Promise<Grant[]> {
+  if (!keys) return [];
+  const pk = keys.pk;
+  return (await getPosts({ type: "grant" }))
+    .filter((p) => p.verified && p.grant?.grantee.pubkey === keys?.pubkey && !bytesEqual(p.rec.owner, pk))
+    .map((p) => {
+      const g = grantData(p.rec)!;
+      return { owner: p.owner, ownerPk: p.rec.owner, path: g.path, signature: g.signature, uri: p.uri };
+    });
+}
+
+// ---- writing posts ----
+
+/** Who owns the space a write goes to, and the authorization needed if it isn't us. */
+function placement(existing?: Post, grant?: Grant): Pick<Rec, "owner" | "authorization"> {
+  const owner = existing?.rec.owner ?? grant?.ownerPk ?? keys!.pk;
+  if (bytesEqual(owner, keys!.pk)) return { owner };
+  // Writing to an existing record of ours in someone's space reuses the authorization it carries.
+  const authorization =
+    grant && bytesEqual(grant.ownerPk, owner)
+      ? { path: grant.path, signature: grant.signature }
+      : existing && bytesEqual(existing.rec.author, keys!.pk)
+        ? existing.rec.authorization
+        : undefined;
+  if (!authorization) throw new Error("Writing in someone else's space needs a grant from them.");
+  return { owner, authorization };
+}
+
+/** Whether we can delete this record (and edit it, if it's a post): it's in our space, or we wrote it under a grant. */
+export const canEdit = (p: Post) =>
+  !!keys && (bytesEqual(p.rec.owner, keys.pk) || (bytesEqual(p.rec.author, keys.pk) && !!p.rec.authorization));
+
+/** Creates a post at `path` (in our space, or the grant's owner's), or replaces `existing`. Signed always; encrypted if asked. */
+export async function putPost(text: string, opts: { encrypt: boolean; path?: string; grant?: Grant }, existing?: Post) {
+  if (!keys) throw new Error("Derive keys first.");
+  const path = existing?.rec.path ?? normalizePath(opts.path ?? "");
+  const where = placement(existing, opts.grant);
+  if (where.authorization && !pathWithin(path, where.authorization.path)) {
+    throw new Error(`The grant only covers ${where.authorization.path}.`);
+  }
+  let data: Cbor = text.trim();
+  let wrapped_key: Uint8Array | undefined;
+  if (opts.encrypt) {
+    const raw = random(32);
+    data = await seal(await aesKey(raw), encode(data));
+    wrapped_key = await seal(keys.noteKey, raw);
+  }
+  await putRec({ author: keys.pk, ...where, path, version: nextVersion(existing?.rec.version), type: "post", data, wrapped_key });
+}
+
+/** Deletes a post, leaving a signed tombstone at its path. */
+export async function deletePost(p: Post) {
+  if (!keys) throw new Error("Derive keys first.");
+  await putRec({ author: keys.pk, ...placement(p), path: p.rec.path, version: nextVersion(p.rec.version), type: "tombstone", data: null });
+}
+
+/** A random path for a new post. */
+export const newPostPath = () => `/posts/${b58(random(8))}`;
+
+/** A post with a made-up signature, to show what a bad one looks like. */
+export function forgedPost(): Promise<Post> {
+  const pk = unb58("4zvwRjXUKGfvwnParsHAS3HuSVzV5cA4McphgmoCtajS");
+  return viewPost({
+    author: pk,
+    owner: pk,
+    path: "/demo/forged",
+    version: Date.now(),
+    type: "post",
+    data: "This post was added client-side with a made-up signature, so it should show as a bad signature.",
+    signature: new Uint8Array(64),
+  });
 }
