@@ -94,10 +94,10 @@ function PostItem({ post: n, me, busy, run, name }: ItemProps & { name?: string 
           </Link>
           {n.verified ? (
             <span
-              className={`${badge} bg-green-50 text-green-700 ring-green-200`}
+              className="font-semibold text-green-600"
               title="Signature verified in your browser against the author's public key"
             >
-              ✓ signed
+              ✓
             </span>
           ) : (
             <span className={`${badge} bg-red-50 text-red-700 ring-red-200`}>✗ bad signature</span>
