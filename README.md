@@ -25,17 +25,10 @@ When modifying schema, to drop DB on each run:
 npm run dev:fresh
 ```
 
-## Posting from the command line with an SSH key
-
-`note` signs a note with an `ssh-ed25519` key from your SSH agent and posts it to a server:
+### Post via CLI
 
 ```
-cargo run --bin note -- "remember the milk" http://localhost:8080
-echo "for my eyes only" | cargo run --bin note -- --encrypt - http://localhost:8080
-cargo run --bin note -- --key ~/.ssh/work_ed25519.pub "hi" http://localhost:8080
+eval "$(ssh-agent -s)"
+ssh-add ~/.ssh/id_ed25519
+cargo run --bin note -- --encrypt "remember the milk" http://localhost:8080
 ```
-
-- The author ID is the SSH public key itself (its 32 raw bytes, base58), so anyone can match it against e.g. `https://github.com/<user>.keys`.
-- Writes are signed in OpenSSH's SSHSIG format under the namespace `bisonbase-note`, so they can't be confused with SSH logins or git commit signatures. The server and the web app verify both these and the passkey users' bare Ed25519 signatures. To check one with OpenSSH alone, write the note's `sig` as an armored `-----BEGIN SSH SIGNATURE-----` block (standard base64) and run `ssh-keygen -Y verify -f allowed_signers -I <name> -n bisonbase-note -s note.sig < payload`, where `payload` is the signed text (see `write_payload` in `src/lib.rs`) and `allowed_signers` holds `<name> ssh-ed25519 AAAA…` lines from GitHub.
-- `--encrypt` encrypts the note so only that SSH key can read it: the note key is derived from the key's (deterministic) signature over a fixed message under the namespace `bisonbase-notekey`, which nothing else should ever be asked to sign. The browser can't read these, since it has no access to your SSH agent.
-- Only `ssh-ed25519` keys are supported (not RSA, ECDSA or hardware `sk-` keys).

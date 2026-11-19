@@ -1,8 +1,8 @@
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::StatusCode,
-    response::{IntoResponse, Response},
+    http::{StatusCode, Uri},
+    response::{IntoResponse, Redirect, Response},
     routing::get,
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD as B64};
@@ -15,7 +15,6 @@ use std::{
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
-use tower_http::services::{ServeDir, ServeFile};
 
 /// Bump to wipe the database when the schema changes incompatibly.
 /// 3: no sessions; every note write is signed by its author and versioned.
@@ -80,9 +79,6 @@ async fn main() {
 
     let app = Arc::new(App { db: Mutex::new(db) });
 
-    // The React app (web/), built with `npm run build`; unknown paths fall back to index.html.
-    let web_dir = std::env::var("WEB_DIR").unwrap_or("web/dist".into());
-    let spa = ServeDir::new(&web_dir).fallback(ServeFile::new(format!("{web_dir}/index.html")));
 
     let router = Router::new()
         .route("/api/users", get(users))
@@ -90,7 +86,10 @@ async fn main() {
         .route("/api/notes", get(list_notes))
         .route("/api/notes/{id}", axum::routing::put(put_note).delete(delete_note))
         .with_state(app)
-        .fallback_service(spa);
+        .fallback(|uri: Uri| async move {
+            let path = uri.path_and_query().map_or("/", |p| p.as_str());
+            Redirect::temporary(&format!("http://localhost:5173{path}"))
+        });
 
     let port = std::env::var("PORT").unwrap_or("8080".into());
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await.unwrap();
