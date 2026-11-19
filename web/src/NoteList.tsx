@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { createContext, useContext, useEffect, useRef, useState } from "react";
 import { type Grant, type Post, type User, canEdit, deletePost, newPostPath, putPost } from "./api.ts";
 import { Link, idPath, recordPath } from "./router.tsx";
 import { type Run, badge, danger, fmtTime, input, link, primary, secondary, textarea } from "./ui.ts";
@@ -229,20 +229,29 @@ function PostItem({ post: n, me, busy, run, name }: ItemProps & { name?: string 
   );
 }
 
-/** Records as a flat list, newest first. Signatures were checked (in the browser) when they were fetched. */
-export function NoteList({ posts, ...rest }: { posts: Post[] } & Omit<ItemProps, "post">) {
+// ---- the whole hierarchy: spaces, then folders (path segments), then records ----
+
+/** Where we may post, and opening the new-post form there. Provided by the app. */
+export const Compose = createContext<{ canWrite: (owner: string, dir: string) => boolean; open: (owner: string, dir: string) => void }>({
+  canWrite: () => false,
+  open: () => {},
+});
+
+/** A (+) that opens the new-post form in `owner`'s `dir` ("" for the root), if we may write there. */
+export function NewHere({ owner, dir }: { owner: string; dir: string }) {
+  const { canWrite, open } = useContext(Compose);
+  if (!canWrite(owner, dir)) return null;
   return (
-    <ul className="mt-4 divide-y divide-gray-200 rounded-lg ring-1 ring-gray-200">
-      {posts.map((p) => (
-        <li key={p.uri}>
-          <PostItem post={p} {...rest} />
-        </li>
-      ))}
-    </ul>
+    <button
+      onClick={() => open(owner, dir)}
+      title={`New post in ${dir || "/"}`}
+      aria-label="New post here"
+      className="ml-1.5 inline-flex size-5 cursor-pointer items-center justify-center rounded-full align-middle font-sans text-sm leading-none text-gray-500 ring-1 ring-gray-300 hover:bg-indigo-50 hover:text-indigo-600 hover:ring-indigo-300"
+    >
+      +
+    </button>
   );
 }
-
-// ---- the whole hierarchy: spaces, then folders (path segments), then records ----
 
 type Node = { post?: Post; children: Map<string, Node> };
 const newNode = (): Node => ({ children: new Map() });
@@ -278,9 +287,12 @@ function Folder({ node, owner, dir, ...rest }: { node: Node; owner: string; dir:
             )}
             {child.children.size > 0 && (
               <>
-                <Link href={recordPath(owner, `${dir}/${seg}`)} className={`mt-1 block font-mono text-sm text-gray-700 ${link}`}>
-                  📁 {seg}/
-                </Link>
+                <div className="mt-1 font-mono text-sm text-gray-700">
+                  <Link href={recordPath(owner, `${dir}/${seg}`)} className={link}>
+                    📁 {seg}/
+                  </Link>
+                  <NewHere owner={owner} dir={`${dir}/${seg}`} />
+                </div>
                 <div className="mt-1 ml-2 border-l border-gray-200 pl-3">
                   <Folder node={child} owner={owner} dir={`${dir}/${seg}`} {...rest} />
                 </div>
@@ -313,6 +325,7 @@ export function PostTree({ posts, first, ...rest }: { posts: Post[]; first?: str
               {owner.phrase}
             </Link>
             /
+            <NewHere owner={owner.pubkey} dir="" />
           </h3>
           <div className="mt-2">
             <Folder node={buildTree(posts)} owner={owner.pubkey} dir="" {...rest} />

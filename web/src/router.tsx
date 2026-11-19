@@ -21,7 +21,8 @@ export function navigate(to: string) {
   listeners.forEach((fn) => fn());
 }
 
-export const idPath = (pubkey: string) => `/id/${pubkey}`;
+/** A user's page: the root of their space. */
+export const idPath = (pubkey: string) => `/bb/${pubkey}/`;
 
 /** The page for one record: /bb/<owner><path>, each path segment URL-encoded. */
 export const recordPath = (owner: string, path: string) => `/bb/${owner}${path.split("/").map(encodeURIComponent).join("/")}`;

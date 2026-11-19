@@ -1,7 +1,6 @@
-import { type MouseEvent, useCallback, useEffect, useState } from "react";
+import { type MouseEvent, useState } from "react";
 import { encode } from "uqr";
-import { type Post, type User, getPosts, isPubkey, makeGrant, myPubkey, userPhrase } from "./api.ts";
-import { PostTree } from "./NoteList.tsx";
+import { type Post, type User, makeGrant } from "./api.ts";
 import { Link, idPath } from "./router.tsx";
 import { type Run, fmtTime, input, link, primary } from "./ui.ts";
 
@@ -131,104 +130,46 @@ function Grants({ pubkey, grants, me }: { pubkey: string; grants: Post[]; me: st
   );
 }
 
-export default function Identity({ pubkey }: { pubkey: string }) {
-  const valid = isPubkey(pubkey);
-  const url = `${location.origin}${idPath(pubkey)}`;
-  const myId = myPubkey();
-  const mine = myId === pubkey;
-  const [phrase, setPhrase] = useState<string | null>(null);
-  const [myPhrase, setMyPhrase] = useState<string | null>(null);
-  const [notes, setNotes] = useState<Post[] | null>(null);
+/** The top of a user's page (their space's root): who they are, how to link to them, and their grants. */
+export function OwnerInfo({
+  pubkey,
+  phrase,
+  grants,
+  me,
+  busy,
+  run,
+}: {
+  pubkey: string;
+  phrase: string | null;
   /** Valid grants this user gave or received. */
-  const [grants, setGrants] = useState<Post[] | null>(null);
-  const [error, setError] = useState("");
-  const [busy, setBusy] = useState(false);
-  const me: User | null = myId && myPhrase ? { pubkey: myId, phrase: myPhrase } : null;
-
-  const refresh = useCallback(async () => {
-    const [n, g] = await Promise.all([getPosts({ user: pubkey }), getPosts({ type: "grant" })]);
-    setNotes(n);
-    setGrants(g.filter((p) => p.verified && p.grant && (p.owner.pubkey === pubkey || p.grant.grantee.pubkey === pubkey)));
-  }, [pubkey]);
-
-  useEffect(() => {
-    if (myId) userPhrase(myId).then(setMyPhrase);
-  }, [myId]);
-
-  useEffect(() => {
-    if (!valid) return;
-    setPhrase(null);
-    setNotes(null);
-    setGrants(null);
-    setError("");
-    userPhrase(pubkey).then(setPhrase);
-    refresh().catch((e) => setError(`Couldn't load posts: ${e.message}`));
-  }, [pubkey, valid, refresh]);
-  const run: Run = (fn) => async () => {
-    setError("");
-    setBusy(true);
-    try {
-      await fn();
-    } catch (e) {
-      setError((e as Error).message);
-    }
-    await refresh().catch((e) => setError(e.message));
-    setBusy(false);
-  };
-
+  grants: Post[] | null;
+  me: string | null;
+  busy: boolean;
+  run: Run;
+}) {
+  const url = `${location.origin}${idPath(pubkey)}`;
+  const mine = me === pubkey;
   return (
-    <main className="mx-auto max-w-3xl px-4 py-10 font-sans text-gray-900">
-      <Link href="/" className={`text-sm text-gray-500 ${link}`}>
-        ← federated crdt
-      </Link>
-      {!valid ? (
-        <p className="mt-6 rounded-md bg-red-50 p-3 text-sm text-red-700 ring-1 ring-red-200">
-          <code className="break-all">{pubkey}</code> isn't a valid ID (32 bytes of base58).
-        </p>
-      ) : (
-        <>
-          <h1 className="mt-2 text-3xl font-bold tracking-tight break-words">
-            {phrase ?? "…"}
-            {mine && <span className="ml-2 text-lg font-normal text-gray-500">(you)</span>}
-          </h1>
+    <>
+      <h1 className="mt-2 text-3xl font-bold tracking-tight break-words">
+        {phrase ?? "…"}
+        {mine && <span className="ml-2 text-lg font-normal text-gray-500">(you)</span>}
+      </h1>
 
-          <section className="mt-6 flex flex-col gap-6 sm:flex-row sm:items-start">
-            <QrCode text={url} className="w-48 shrink-0 self-center rounded-lg ring-1 ring-gray-200 sm:self-start" />
-            <div className="min-w-0 flex-1 space-y-3">
-              <CopyBox label="Public ID (key)" value={pubkey} />
-              <CopyBox label="Link to this page" value={url} />
-              <p className="text-xs text-gray-500">
-                The ID is an Ed25519 public key. Posts below are checked against their authors' keys in your
-                browser; the phrase is just a readable nickname derived from it.
-              </p>
-            </div>
-          </section>
+      <section className="mt-6 flex flex-col gap-6 sm:flex-row sm:items-start">
+        <QrCode text={url} className="w-48 shrink-0 self-center rounded-lg ring-1 ring-gray-200 sm:self-start" />
+        <div className="min-w-0 flex-1 space-y-3">
+          <CopyBox label="Public ID (key)" value={pubkey} />
+          <CopyBox label="Link to this page" value={url} />
+          <p className="text-xs text-gray-500">
+            The ID is an Ed25519 public key. Records below are checked against their authors' keys in your browser;
+            the phrase is just a readable nickname derived from it.
+          </p>
+        </div>
+      </section>
 
-          {error && (
-            <p className="mt-4 rounded-md bg-red-50 p-3 text-sm text-red-700 ring-1 ring-red-200">{error}</p>
-          )}
-
-          {grants && <Grants pubkey={pubkey} grants={grants} me={myId} />}
-
-          <h2 className="mt-10 text-xl font-semibold">Records</h2>
-          <p className="mt-1 text-sm text-gray-500">Everything in their space, and everything they wrote in others'.</p>
-          {notes === null ? (
-            !error && <p className="mt-3 text-gray-500">Loading…</p>
-          ) : notes.length === 0 ? (
-            <p className="mt-3 text-gray-500">Nothing here yet.</p>
-          ) : (
-            <PostTree posts={notes} first={pubkey} me={me} busy={busy} run={run} />
-          )}
-          {mine && (
-            <p className="mt-3 text-sm">
-              <Link href="/" className={`text-indigo-600 ${link}`}>
-                Write a post
-              </Link>
-            </p>
-          )}
-          {me && !mine && phrase && <GrantForm grantee={pubkey} phrase={phrase} busy={busy} run={run} />}
-        </>
-      )}
-    </main>
+      {grants && <Grants pubkey={pubkey} grants={grants} me={me} />}
+      {me && !mine && phrase && <GrantForm grantee={pubkey} phrase={phrase} busy={busy} run={run} />}
+    </>
   );
 }
