@@ -27,21 +27,6 @@ import { type Draft, NoteEditor, NoteList } from "./NoteList.tsx";
 import { Link, idPath, usePath } from "./router.tsx";
 import { type Run, link, primary, secondary } from "./ui.ts";
 
-// The composer's Encrypt choice persists across visits.
-const OPTS_KEY = "note-opts";
-function loadEncrypt() {
-  try {
-    return !!JSON.parse(localStorage.getItem(OPTS_KEY) ?? "{}").encrypt;
-  } catch {
-    return false;
-  }
-}
-function saveEncrypt(encrypt: boolean) {
-  try {
-    localStorage.setItem(OPTS_KEY, JSON.stringify({ encrypt }));
-  } catch {}
-}
-
 /** Routes: "/" is Home, "/id/<pubkey>" an identity page. Remembered keys load first, for both. */
 export default function App() {
   const path = usePath();
@@ -65,11 +50,7 @@ function Home({ initialError }: { initialError: string | null }) {
   const [grants, setGrants] = useState<Grant[]>([]);
   const [error, setError] = useState(initialError ?? "");
   const [busy, setBusy] = useState(false);
-  const [draft, setDraftState] = useState<Draft>(() => ({ body: "", encrypt: loadEncrypt(), path: newPostPath() }));
-  const setDraft = (d: Draft) => {
-    setDraftState(d);
-    saveEncrypt(d.encrypt);
-  };
+  const [draft, setDraft] = useState<Draft>(() => ({ body: "", path: newPostPath() }));
   const [remember, setRememberState] = useState(isRemembering);
   /** The passkey the loaded keys came from, and others used on this device recently (with their keys' phrases). */
   const [passkey, setPasskey] = useState<Passkey | null>(null);
@@ -147,7 +128,7 @@ function Home({ initialError }: { initialError: string | null }) {
           )}
         </div>
         <p className="text-xs text-gray-500">
-          Everything happens in your browser: your passkey derives a signing key (your ID) and an encryption key.
+          Everything happens in your browser: your passkey derives a signing key, whose public key is your ID.
           A new passkey may ask for confirmation twice: once to create it, once to derive the keys.
         </p>
         {recent.length > 0 && (
@@ -195,7 +176,7 @@ function Home({ initialError }: { initialError: string | null }) {
                 <p className="text-xs text-amber-800">
                   Your key secret is stored unencrypted in this browser's local storage. Anything that can read it
                   (other programs on this computer, browser extensions, malicious scripts on this site) could sign
-                  and decrypt as you, forever. "Forget keys" removes it.
+                  as you, forever. "Forget keys" removes it.
                 </p>
               )}
             </div>

@@ -1,12 +1,12 @@
-import { useEffect, useState } from "react";
-import { type Grant, type Post, type User, canEdit, decryptPost, deletePost, newPostPath, putPost } from "./api.ts";
+import { useState } from "react";
+import { type Grant, type Post, type User, canEdit, deletePost, newPostPath, putPost } from "./api.ts";
 import { Link, idPath } from "./router.tsx";
 import { type Run, badge, danger, fmtTime, input, link, primary, secondary, textarea } from "./ui.ts";
 
 /** `path` and `grant` are only for new posts: where it goes, and the grant to write in someone else's space. */
-export type Draft = { body: string; encrypt: boolean; path?: string; grant?: Grant };
+export type Draft = { body: string; path?: string; grant?: Grant };
 
-/** Post text, where it goes (for new posts), and an "Encrypt" checkbox. Posts are always signed. */
+/** Post text, and where it goes (for new posts). Posts are always signed. */
 export function NoteEditor(props: {
   draft: Draft;
   setDraft: (d: Draft) => void;
@@ -61,10 +61,6 @@ export function NoteEditor(props: {
           </label>
         </div>
       )}
-      <label className="flex items-center gap-1.5 text-sm" title="Only your passkey can decrypt it">
-        <input type="checkbox" checked={draft.encrypt} onChange={(e) => setDraft({ ...draft, encrypt: e.target.checked })} />
-        Encrypt (only you can read it)
-      </label>
       <div className="flex gap-2">
         <button className={primary} disabled={busy || !draft.body.trim()} onClick={props.onSubmit}>
           {props.submitLabel}
@@ -84,16 +80,8 @@ type ItemProps = { post: Post; me: User | null; busy: boolean; run: Run };
 /** One record: author, badges, content, and Edit / Delete when we may. `name` replaces the bb:// address (in trees). */
 function PostItem({ post: n, me, busy, run, name }: ItemProps & { name?: string }) {
   const [editing, setEditing] = useState<Draft | null>(null);
-  /** Decrypted text of our own encrypted posts. */
-  const [plain, setPlain] = useState<string>();
   const mine = me?.pubkey === n.author.pubkey;
-
-  useEffect(() => {
-    setPlain(undefined);
-    if (n.encrypted && mine) decryptPost(n).then(setPlain, () => setPlain("(couldn't decrypt)"));
-  }, [n, mine]);
-
-  const text = n.encrypted ? plain : (n.text ?? undefined);
+  const text = n.text ?? undefined;
   const elsewhere = n.owner.pubkey !== n.author.pubkey;
   return (
     <div className="p-3">
@@ -114,7 +102,6 @@ function PostItem({ post: n, me, busy, run, name }: ItemProps & { name?: string 
           ) : (
             <span className={`${badge} bg-red-50 text-red-700 ring-red-200`}>✗ bad signature</span>
           )}
-          {n.encrypted && <span className={`${badge} bg-amber-50 text-amber-800 ring-amber-200`}>🔒 encrypted</span>}
         </span>
         <span className="text-xs text-gray-500">{fmtTime(n.rec.version / 1000)}</span>
       </div>
@@ -135,7 +122,7 @@ function PostItem({ post: n, me, busy, run, name }: ItemProps & { name?: string 
             busy={busy}
             submitLabel="Save"
             onSubmit={run(async () => {
-              await putPost(editing.body, { encrypt: editing.encrypt }, n);
+              await putPost(editing.body, {}, n);
               setEditing(null);
             })}
             onCancel={() => setEditing(null)}
@@ -154,10 +141,6 @@ function PostItem({ post: n, me, busy, run, name }: ItemProps & { name?: string 
             </p>
           ) : text !== undefined ? (
             <p className="mt-1 whitespace-pre-wrap break-words">{text}</p>
-          ) : n.encrypted ? (
-            <p className="mt-1 text-sm text-gray-500 italic">
-              {mine ? "Decrypting…" : "Encrypted. Only the author can read this."}
-            </p>
           ) : (
             <p className="mt-1 text-sm text-gray-500 italic">(a {n.rec.type} record this page can't show)</p>
           )}
@@ -166,8 +149,8 @@ function PostItem({ post: n, me, busy, run, name }: ItemProps & { name?: string 
               {n.rec.type === "post" && (
                 <button
                   className={secondary}
-                  disabled={busy || text === undefined || (n.encrypted && !mine)}
-                  onClick={() => setEditing({ body: text!, encrypt: n.encrypted })}
+                  disabled={busy || text === undefined}
+                  onClick={() => setEditing({ body: text! })}
                 >
                   Edit
                 </button>

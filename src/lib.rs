@@ -1,4 +1,4 @@
-//! Code shared by the server and the `note` CLI.
+//! Record format, IDs and checks, used by the server.
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
@@ -216,9 +216,6 @@ fn decode_value(b: &mut &[u8], depth: usize) -> Result<Cbor, String> {
 //   type           text       what `data` holds: "post" (data: text), "tombstone" (data: null, a
 //                             delete), or "grant" (see `GrantData`)
 //   data           any        the content, per `type`
-//   wrapped_key    bytes(60)? if present, the record is encrypted: data is iv || AES-GCM(CBOR of the
-//                             real data) under a random key, and this is iv || AES-GCM(that key) under
-//                             the author's note key
 //   authorization  map?       required iff author != owner: {path, signature}, the owner's signature
 //                             (see `grant_signed_bytes`) letting the author write at or under `path`;
 //                             the owner also keeps it as a "grant" record, by default under /grants
@@ -241,7 +238,6 @@ pub struct Record {
     pub version: u64,
     pub kind: String,
     pub data: Cbor,
-    pub wrapped_key: Option<Vec<u8>>,
     pub authorization: Option<Authorization>,
     pub signature: [u8; 64],
 }
@@ -385,9 +381,6 @@ impl Record {
             ("type".into(), Cbor::Text(self.kind.clone())),
             ("data".into(), self.data.clone()),
         ]);
-        if let Some(k) = &self.wrapped_key {
-            m.insert("wrapped_key".into(), Cbor::Bytes(k.clone()));
-        }
         if let Some(a) = &self.authorization {
             let a = BTreeMap::from([
                 ("path".into(), Cbor::Text(a.path.clone())),
@@ -430,7 +423,6 @@ impl Record {
             version: field(&mut m, "version", |v| if let Cbor::Uint(n) = v { Some(n) } else { None })?,
             kind: field(&mut m, "type", text)?,
             data: field(&mut m, "data", Some)?,
-            wrapped_key: opt_field(&mut m, "wrapped_key", |v| if let Cbor::Bytes(b) = v { Some(b) } else { None })?,
             authorization,
             signature: field(&mut m, "signature", bytes)?,
         };
@@ -446,15 +438,12 @@ impl Record {
     /// the authorization, and the author's signature.
     pub fn check(&self) -> Result<(), String> {
         check_path(&self.path)?;
-        match (&self.wrapped_key, self.kind.as_str(), &self.data) {
-            (_, "tombstone", Cbor::Null) if self.wrapped_key.is_none() => {}
-            (_, "tombstone", _) => return Err("a tombstone's data must be null, unencrypted".into()),
-            // 12-byte IV + 32-byte key + 16-byte GCM tag; 12-byte IV + 16-byte GCM tag + content.
-            (Some(k), "post", Cbor::Bytes(c)) if k.len() == 60 && c.len() > 28 => {}
-            (Some(_), _, _) => return Err("an encrypted record's data must be ciphertext, with a 60-byte wrapped key".into()),
-            (None, "post", Cbor::Text(t)) if !t.is_empty() && t.trim() == t => {}
-            (None, "post", _) => return Err("a post's data must be non-empty, trimmed text".into()),
-            (None, "grant", d) => {
+        match (self.kind.as_str(), &self.data) {
+            ("tombstone", Cbor::Null) => {}
+            ("tombstone", _) => return Err("a tombstone's data must be null".into()),
+            ("post", Cbor::Text(t)) if !t.is_empty() && t.trim() == t => {}
+            ("post", _) => return Err("a post's data must be non-empty, trimmed text".into()),
+            ("grant", d) => {
                 if self.author != self.owner {
                     return Err("only the owner can grant access to their space".into());
                 }
@@ -480,39 +469,6 @@ impl Record {
         }
         verify_sig(&self.author, &self.signed_bytes(), &self.signature)
     }
-}
-
-// ---- SSH wire format (for the `note` CLI's ssh-agent client) ----
-
-/// A byte string with a u32 big-endian length prefix.
-pub fn put_string(out: &mut Vec<u8>, s: &[u8]) {
-    out.extend_from_slice(&(s.len() as u32).to_be_bytes());
-    out.extend_from_slice(s);
-}
-
-/// Reads an SSH wire-format string from the front of `buf`.
-pub fn take_string<'a>(buf: &mut &'a [u8]) -> Option<&'a [u8]> {
-    let len = u32::from_be_bytes(buf.get(..4)?.try_into().ok()?) as usize;
-    let s = buf.get(4..4 + len)?;
-    *buf = &buf[4 + len..];
-    Some(s)
-}
-
-/// An ssh-ed25519 public key blob (as in authorized_keys, base64-decoded) for a raw 32-byte key.
-pub fn ed25519_key_blob(pk: &[u8; 32]) -> Vec<u8> {
-    let mut b = Vec::new();
-    put_string(&mut b, b"ssh-ed25519");
-    put_string(&mut b, pk);
-    b
-}
-
-/// The raw 32-byte key in an ssh-ed25519 public key blob; None for other key types.
-pub fn ed25519_from_blob(mut blob: &[u8]) -> Option<[u8; 32]> {
-    if take_string(&mut blob)? != b"ssh-ed25519" {
-        return None;
-    }
-    let pk = take_string(&mut blob)?.try_into().ok()?;
-    blob.is_empty().then_some(pk)
 }
 
 #[cfg(test)]
@@ -557,7 +513,6 @@ mod tests {
             version: 1,
             kind: "post".into(),
             data: Cbor::Text("hi".into()),
-            wrapped_key: None,
             authorization: Some(Authorization { path: "/shared".into(), signature: grant_sig }),
             signature: [0; 64],
         };
@@ -573,7 +528,6 @@ mod tests {
             version: 1,
             kind: "grant".into(),
             data: GrantData { grantee: a, path: "/shared".into(), signature: grant_sig }.to_cbor(),
-            wrapped_key: None,
             authorization: None,
             signature: [0; 64],
         };

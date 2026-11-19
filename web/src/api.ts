@@ -81,8 +81,8 @@ const random = (n: number) => crypto.getRandomValues(new Uint8Array(n));
 // ---- keys ----
 //
 // Everything hangs off one secret: the passkey's PRF output for a fixed salt. Only that passkey
-// can produce it. From it we derive (HKDF) an Ed25519 keypair, whose public key is the user's ID,
-// and an AES-GCM key for encrypting notes. There is no sign-in: having the keys loaded is all; the
+// can produce it. From it we derive (HKDF) an Ed25519 keypair, whose public key is the user's ID.
+// There is no sign-in: having the keys loaded is all; the
 // server has no sessions and never sees the secret or the private keys.
 
 const PRF_SALT = enc.encode("bisonbase keys v1");
@@ -131,7 +131,6 @@ type Keys = {
   pubkey: string;
   pk: Uint8Array;
   signKey: CryptoKey;
-  noteKey: CryptoKey;
   passkey: Passkey | null;
 };
 let keys: Keys | null = null;
@@ -149,7 +148,7 @@ const ED25519_PKCS8_PREFIX = Uint8Array.from([
 
 /** `passkey` is the passkey the secret came from, if known. */
 async function deriveKeys(secret: Uint8Array<ArrayBuffer>, passkey: PasskeyIds | null): Promise<Keys> {
-  const ikm = await crypto.subtle.importKey("raw", secret, "HKDF", false, ["deriveKey", "deriveBits"]);
+  const ikm = await crypto.subtle.importKey("raw", secret, "HKDF", false, ["deriveBits"]);
   const hkdf = (info: string) => ({ name: "HKDF", hash: "SHA-256", salt: new Uint8Array(), info: enc.encode(info) });
 
   const seed = new Uint8Array(await crypto.subtle.deriveBits(hkdf("bisonbase/identity/ed25519"), ikm, 256));
@@ -163,16 +162,9 @@ async function deriveKeys(secret: Uint8Array<ArrayBuffer>, passkey: PasskeyIds |
   seed.fill(0);
   pkcs8.fill(0);
 
-  const noteKey = await crypto.subtle.deriveKey(
-    hkdf("bisonbase/notes/aes-gcm"),
-    ikm,
-    { name: "AES-GCM", length: 256 },
-    false,
-    ["encrypt", "decrypt"],
-  );
   const pk = unb64(jwk.x!);
   const pubkey = b58(pk);
-  return { secret, pubkey, pk, signKey, noteKey, passkey: passkey && { ...passkey, pubkey, lastUsed: Date.now() } };
+  return { secret, pubkey, pk, signKey, passkey: passkey && { ...passkey, pubkey, lastUsed: Date.now() } };
 }
 
 const sign = async (data: Uint8Array<ArrayBuffer>) => new Uint8Array(await crypto.subtle.sign("Ed25519", keys!.signKey, data));
@@ -323,10 +315,6 @@ export function forgetKeys() {
 // Everything users write is a record: a deterministic-CBOR map signed by its author, identified by
 // (owner, path), where the newest version wins. Field by field, see src/lib.rs. The server stores
 // and returns records exactly as signed, so everything here is checked in the browser.
-//
-// Encrypted records have a `wrapped_key`: `data` is then iv || AES-GCM(CBOR of the real data) under
-// a random key, itself encrypted ("wrapped") under the author's note key. Signatures cover the
-// ciphertext, so anyone can verify an encrypted record without reading it.
 
 const RECORD_CONTEXT = enc.encode("bisonbase-record-v1\n");
 const GRANT_CONTEXT = enc.encode("bisonbase-grant-v1\n");
@@ -339,7 +327,6 @@ export type Rec = {
   version: number;
   type: string;
   data: Cbor;
-  wrapped_key?: Uint8Array;
   authorization?: Authorization;
   signature: Uint8Array;
 };
@@ -353,7 +340,6 @@ export type Post = {
   uri: string;
   /** Whether its signature (and authorization, if any) verified, in this browser. */
   verified: boolean;
-  encrypted: boolean;
   /** The text, if it's a plain post. */
   text: string | null;
   /** For grant records: who may write, and where. */
@@ -402,7 +388,6 @@ function recFromCbor(v: Cbor): Rec {
     typeof r.version !== "number" ||
     typeof r.type !== "string" ||
     !("data" in r) ||
-    (r.wrapped_key !== undefined && !isBytes(r.wrapped_key)) ||
     (a !== undefined && (typeof a.path !== "string" || !isBytes(a.signature, 64))) ||
     !isBytes(r.signature, 64)
   ) {
@@ -454,8 +439,7 @@ export async function viewPost(rec: Rec): Promise<Post> {
     owner,
     uri: `bb://${owner.pubkey}${rec.path}`,
     verified: await verifyRec(rec),
-    encrypted: !!rec.wrapped_key,
-    text: !rec.wrapped_key && typeof rec.data === "string" ? rec.data : null,
+    text: typeof rec.data === "string" ? rec.data : null,
   };
 }
 
@@ -484,28 +468,6 @@ async function putRec(r: Omit<Rec, "signature">) {
 
 /** A version newer than both the clock and `prev`, so quick successive edits still go through. */
 const nextVersion = (prev = 0) => Math.max(Date.now(), prev + 1);
-
-/** AES-GCM: iv || ciphertext. */
-async function seal(key: CryptoKey, data: Uint8Array<ArrayBuffer>) {
-  const iv = random(12);
-  return concat(iv, new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, key, data)));
-}
-
-async function open(key: CryptoKey, sealed: Uint8Array) {
-  return new Uint8Array(await crypto.subtle.decrypt({ name: "AES-GCM", iv: sealed.slice(0, 12) }, key, sealed.slice(12)));
-}
-
-const aesKey = (raw: Uint8Array<ArrayBuffer>) =>
-  crypto.subtle.importKey("raw", raw, "AES-GCM", false, ["encrypt", "decrypt"]);
-
-/** Decrypts one of our own encrypted posts. */
-export async function decryptPost(p: Post) {
-  if (!keys || !p.rec.wrapped_key || !isBytes(p.rec.data)) throw new Error("locked");
-  const key = await aesKey(await open(keys.noteKey, p.rec.wrapped_key));
-  const data = decode(await open(key, p.rec.data));
-  if (typeof data !== "string") throw new Error("not text");
-  return data;
-}
 
 // ---- grants: letting someone else write in your space ----
 //
@@ -561,22 +523,15 @@ function placement(existing?: Post, grant?: Grant): Pick<Rec, "owner" | "authori
 export const canEdit = (p: Post) =>
   !!keys && (bytesEqual(p.rec.owner, keys.pk) || (bytesEqual(p.rec.author, keys.pk) && !!p.rec.authorization));
 
-/** Creates a post at `path` (in our space, or the grant's owner's), or replaces `existing`. Signed always; encrypted if asked. */
-export async function putPost(text: string, opts: { encrypt: boolean; path?: string; grant?: Grant }, existing?: Post) {
+/** Creates a post at `path` (in our space, or the grant's owner's), or replaces `existing`. Always signed. */
+export async function putPost(text: string, opts: { path?: string; grant?: Grant }, existing?: Post) {
   if (!keys) throw new Error("Derive keys first.");
   const path = existing?.rec.path ?? normalizePath(opts.path ?? "");
   const where = placement(existing, opts.grant);
   if (where.authorization && !pathWithin(path, where.authorization.path)) {
     throw new Error(`The grant only covers ${where.authorization.path}.`);
   }
-  let data: Cbor = text.trim();
-  let wrapped_key: Uint8Array | undefined;
-  if (opts.encrypt) {
-    const raw = random(32);
-    data = await seal(await aesKey(raw), encode(data));
-    wrapped_key = await seal(keys.noteKey, raw);
-  }
-  await putRec({ author: keys.pk, ...where, path, version: nextVersion(existing?.rec.version), type: "post", data, wrapped_key });
+  await putRec({ author: keys.pk, ...where, path, version: nextVersion(existing?.rec.version), type: "post", data: text.trim() });
 }
 
 /** Deletes a post, leaving a signed tombstone at its path. */
