@@ -26,3 +26,18 @@ When modifying schema, to drop DB on each run:
 ```
 npm run dev:fresh
 ```
+
+## Future Ideas
+
+ - Get rid of owner id root, just have people post to /posts or /fun/ideas or whatever (with permissions)
+ - Link share flow: "share" record signed by user with a random token (hidden, not federated), and when someone opens that token, server signs a "claim" record
+   - Prior to link usage, user can grant things to the future user
+   - But, random token can't be public, so maybe a reference to that record
+ - Blobs (images, files?)
+ - Authorization: only authorize certain users to post
+ - Feed control: pick what users appear on your feed
+ - Vouching: record stating another user is useful to listen to (is human, or at least doesn't spam, etc.)
+ - Shared encryption (generate key, encrypt that key to share with other users, one record per user)
+ - Applications to build
+   - Social network - without API, just plain text & replies?
+   - Shared documents
