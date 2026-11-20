@@ -15,6 +15,7 @@ import {
   encodeRecord,
   pathWithin,
   phrase,
+  readSignedBytes,
   signedBytes,
   twoWords,
   unb58,
@@ -105,7 +106,8 @@ const random = (n: number) => crypto.getRandomValues(new Uint8Array(n));
 // node has no sessions and never sees the secret or the private keys.
 
 const PRF_SALT = enc.encode("bisonbase keys v1");
-const REMEMBER_KEY = "bisonbase-keys";
+/** The credential ID of the passkey whose saved keys to load on startup. */
+const CURRENT_KEY = "bisonbase-keys";
 const RECENT_PASSKEYS_KEY = "bisonbase-recent-passkeys";
 
 /** A passkey that keys were derived from on this device. */
@@ -182,73 +184,141 @@ async function deriveKeys(secret: Uint8Array<ArrayBuffer>, passkey: PasskeyIds |
 const sign = async (data: Uint8Array) =>
   new Uint8Array(await crypto.subtle.sign("Ed25519", keys!.signKey, data as Uint8Array<ArrayBuffer>));
 
-/** Sets freshly derived keys, records the passkey's use, and updates the remembered copy if remembering. */
+/**
+ * Sets freshly derived keys and records the passkey's use. Their secret is saved if it already was,
+ * or if the keys they replace were saved: staying signed in carries over to the next passkey.
+ */
 function loadKeys(k: Keys) {
+  const save = isRemembering() || (!!k.passkey && !!findStored(k.passkey.credId)?.secret);
   keys = k;
   if (k.passkey) k.passkey = rememberPasskeyUse(k.passkey);
-  if (isRemembering()) setRemember(true);
+  setRemember(save);
 }
 
-// ---- remembering keys across reloads (opt-in; stored unencrypted in localStorage) ----
+// ---- recently used passkeys on this device, and optionally their keys (localStorage) ----
+//
+// Each passkey whose keys we derived gets an entry: just IDs, plus, if "stay signed in" was on for it,
+// its secret, stored unencrypted. CURRENT_KEY names the one to load on startup (only ever a saved one).
 
-export function isRemembering() {
+/** A recent passkey as stored. */
+type StoredPasskey = Passkey & { secret?: string };
+
+/** A recent passkey, and whether its keys are saved (so using it needs no prompt). */
+export type RecentPasskey = Passkey & { saved: boolean };
+
+const isStoredPasskey = (p: any): p is StoredPasskey =>
+  typeof p === "object" && p !== null &&
+  typeof p.credId === "string" &&
+  (p.name === null || typeof p.name === "string") &&
+  typeof p.pubkey === "string" && isPubkey(p.pubkey) &&
+  typeof p.lastUsed === "number" &&
+  (p.secret === undefined || typeof p.secret === "string");
+
+/** The stored list. Entries an older version wrote are dropped (and the list saved without them). */
+function storedPasskeys(): StoredPasskey[] {
   try {
-    return localStorage.getItem(REMEMBER_KEY) !== null;
-  } catch {
-    return false;
-  }
-}
-
-export function setRemember(on: boolean) {
-  try {
-    if (on && keys) localStorage.setItem(REMEMBER_KEY, JSON.stringify({ secret: b64(keys.secret), passkey: keys.passkey }));
-    else localStorage.removeItem(REMEMBER_KEY);
-  } catch {}
-}
-
-/** Loads remembered keys, if any. No prompt. */
-export async function restoreKeys() {
-  let stored: string | null = null;
-  try {
-    stored = localStorage.getItem(REMEMBER_KEY);
-  } catch {}
-  if (!stored) return;
-  // Older versions stored just the base64url secret.
-  const { secret, passkey } = stored.startsWith("{")
-    ? (JSON.parse(stored) as { secret: string; passkey: Passkey | null })
-    : { secret: stored, passkey: null };
-  keys = await deriveKeys(unb64(secret), null);
-  if (passkey) keys.passkey = passkey; // keep its last-used time; restoring isn't a passkey use
-}
-
-// ---- recently used passkeys on this device (localStorage; just IDs, nothing secret) ----
-
-export function recentPasskeys(): Passkey[] {
-  try {
-    const list = JSON.parse(localStorage.getItem(RECENT_PASSKEYS_KEY) ?? "[]");
-    return Array.isArray(list) ? list : [];
+    const s = localStorage.getItem(RECENT_PASSKEYS_KEY);
+    if (s === null) return [];
+    let list: unknown;
+    try {
+      list = JSON.parse(s);
+    } catch {}
+    if (!Array.isArray(list)) {
+      console.warn(`Dropping outdated localStorage item ${RECENT_PASSKEYS_KEY}`);
+      localStorage.removeItem(RECENT_PASSKEYS_KEY);
+      return [];
+    }
+    const ok = list.filter(isStoredPasskey);
+    if (ok.length < list.length) {
+      console.warn(`Dropping ${list.length - ok.length} outdated entries of localStorage item ${RECENT_PASSKEYS_KEY}`);
+      saveStoredPasskeys(ok);
+    }
+    return ok;
   } catch {
     return [];
   }
 }
 
-function saveRecentPasskeys(list: Passkey[]) {
+function saveStoredPasskeys(list: StoredPasskey[]) {
   try {
     localStorage.setItem(RECENT_PASSKEYS_KEY, JSON.stringify(list.slice(0, 20)));
   } catch {}
 }
 
-/** Moves the passkey to the top of the recent list; returns its entry. */
+const findStored = (credId: string) => storedPasskeys().find((p) => p.credId === credId);
+
+/** Without the secret. */
+const ids = ({ secret, ...p }: StoredPasskey): Passkey => p;
+
+export function recentPasskeys(): RecentPasskey[] {
+  return storedPasskeys().map((p) => ({ ...ids(p), saved: p.secret !== undefined }));
+}
+
+/** Moves the passkey to the top of the recent list, keeping any saved secret; returns its entry. */
 function rememberPasskeyUse(p: Passkey): Passkey {
-  const list = recentPasskeys();
+  const list = storedPasskeys();
+  const old = list.find((r) => r.credId === p.credId);
   // A sign-in may not report the user handle; keep a name learned earlier (e.g. at creation).
-  const entry = { ...p, name: p.name ?? list.find((r) => r.credId === p.credId)?.name ?? null };
-  saveRecentPasskeys([entry, ...list.filter((r) => r.credId !== p.credId)]);
+  const entry = { ...p, name: p.name ?? old?.name ?? null };
+  saveStoredPasskeys([{ ...entry, secret: old?.secret }, ...list.filter((r) => r.credId !== p.credId)]);
   return entry;
 }
 
+/** Removes the passkey from the recent list, along with its saved keys. */
 export function forgetRecentPasskey(credId: string) {
-  saveRecentPasskeys(recentPasskeys().filter((r) => r.credId !== credId));
+  saveStoredPasskeys(storedPasskeys().filter((r) => r.credId !== credId));
+}
+
+function setCurrent(credId: string | null) {
+  try {
+    if (credId) localStorage.setItem(CURRENT_KEY, credId);
+    else localStorage.removeItem(CURRENT_KEY);
+  } catch {}
+}
+
+/** Whether the loaded keys are saved on this device. */
+export function isRemembering() {
+  const credId = keys?.passkey?.credId;
+  return !!credId && !!findStored(credId)?.secret;
+}
+
+/** Saves the loaded keys on this device (and loads them on startup), or deletes the saved copy. */
+export function setRemember(on: boolean) {
+  const p = keys?.passkey;
+  if (!p) return;
+  const secret = on ? b64(keys!.secret) : undefined;
+  saveStoredPasskeys(storedPasskeys().map((r) => (r.credId === p.credId ? { ...r, secret } : r)));
+  setCurrent(on ? p.credId : null);
+}
+
+/** Loads a recent passkey's saved keys, if they're saved and still derive its ID. No prompt. */
+async function loadSaved(credId: string): Promise<boolean> {
+  const p = findStored(credId);
+  if (!p?.secret) return false;
+  const k = await deriveKeys(unb64(p.secret), null);
+  if (k.pubkey !== p.pubkey) {
+    console.warn(`Dropping saved keys for passkey ${credId}: they don't derive its ID`);
+    forgetRecentPasskey(credId);
+    return false;
+  }
+  k.passkey = ids(p); // keep its last-used time; loading saved keys isn't a passkey use
+  keys = k;
+  setCurrent(credId);
+  return true;
+}
+
+/** Loads the keys saved to load on startup, if any. No prompt. */
+export async function restoreKeys() {
+  let credId: string | null = null;
+  try {
+    credId = localStorage.getItem(CURRENT_KEY);
+  } catch {}
+  if (credId && !(await loadSaved(credId))) setCurrent(null);
+}
+
+/** Loads a recent passkey's keys: its saved ones if any (no prompt), else from the passkey (one prompt). */
+export async function loadPasskey(credId: string) {
+  if (!(await loadSaved(credId))) await deriveFromExistingPasskey(credId);
 }
 
 // ---- passkey ceremonies (entirely client-side) ----
@@ -318,9 +388,10 @@ export async function deriveFromNewPasskey() {
   loadKeys(await deriveKeys(secretBytes, { credId: b64(cred.rawId), name: words }));
 }
 
+/** Unloads the keys, deleting their saved copy. Other passkeys' saved keys stay. */
 export function forgetKeys() {
-  keys = null;
   setRemember(false);
+  keys = null;
 }
 
 // ---- records ----
@@ -416,7 +487,7 @@ export function viewPost(rec: Rec, chain?: { root: Uint8Array; by?: Uint8Array; 
  * `author`, of one `type`, or at or under `prefix`. */
 export async function getPosts(q: { author?: string; type?: string; prefix?: string } = {}) {
   const params = new URLSearchParams(Object.entries(q).filter((e): e is [string, string] => !!e[1]));
-  const res = await fetch(`/api/records?${params}`);
+  const res = await fetch(`/api/records?${params}`, { headers: await readHeaders() });
   if (!res.ok) throw new Error((await res.text()) || res.statusText);
   return decodeEntries(new Uint8Array(await res.arrayBuffer())).map((e) => viewPost(e.rec, e));
 }
@@ -426,7 +497,7 @@ export type Chain = { versions: Post[]; current: Post | null; deleted: Post | nu
 
 /** The chain that the record with this hash (base58) is in. */
 export async function getChain(hash: string): Promise<Chain> {
-  const res = await fetch(`/api/records/${hash}`);
+  const res = await fetch(`/api/records/${hash}`, { headers: await readHeaders() });
   if (!res.ok) throw new Error((await res.text()) || res.statusText);
   const recs = decodeRecords(new Uint8Array(await res.arrayBuffer()));
   // The first record: the one whose `edits` isn't here.
@@ -438,8 +509,32 @@ export async function getChain(hash: string): Promise<Chain> {
   return { versions, current: live.at(-1) ?? null, deleted: versions.find((p) => p.rec.type === "tombstone") ?? null };
 }
 
-/** Signs `d` (as us) and stores it. Returns its hash (base58). */
-async function putRec(d: Draft) {
+// ---- reading private records ----
+//
+// Only this node's owners may read private records. The node has no sessions, so owners send a read
+// token with each read: their ID, an expiry, and their signature over both (see read_signed_bytes in
+// core/src/lib.rs), good on this node only. We sign one now and then, and only while we're an owner.
+
+const READ_TOKEN_MS = 10 * 60 * 1000;
+let readToken: { header: string; pubkey: string; node: string; expires: number } | null = null;
+
+/** Headers for reading records: our read token, if we own this node. */
+async function readHeaders(): Promise<Record<string, string>> {
+  if (!keys || !thisNode || !amOwner()) return {};
+  const t = readToken;
+  if (t && t.pubkey === keys.pubkey && t.node === thisNode.pubkey && t.expires - Date.now() > 60_000) {
+    return { authorization: t.header };
+  }
+  const expires = Date.now() + READ_TOKEN_MS;
+  const signature = await sign(readSignedBytes(decodeId(thisNode.pubkey)!, BigInt(expires)));
+  const header = `Bisonbase ${keys.pubkey}.${expires}.${b58(signature)}`;
+  readToken = { header, pubkey: keys.pubkey, node: thisNode.pubkey, expires };
+  return { authorization: header };
+}
+
+/** Signs `d` (as us) and stores it; public unless it says otherwise. Returns its hash (base58). */
+async function putRec(draft: Omit<Draft, "private"> & { private?: boolean }) {
+  const d: Draft = { ...draft, private: draft.private ?? false };
   const signature = await sign(signedBytes(d));
   const res = await fetch("/api/records", {
     method: "POST",
@@ -547,8 +642,9 @@ export async function redeemClaim(token: string) {
 export const canEdit = (p: Post) =>
   !!keys && p.rec.type !== "node" && (amOwner() || (p.by?.pubkey === keys.pubkey && !pathWithin(p.rec.path, "/node")));
 
-/** Creates a post at `path`, or edits `existing` (possibly moving it to `path`). Returns its hash. */
-export async function putPost(text: string, path: string, existing?: Post) {
+/** Creates a post at `path`, or edits `existing` (possibly moving it to `path`). `isPrivate`: only this
+ * node's owners may read it, and it's never federated. Returns its hash. */
+export async function putPost(text: string, path: string, isPrivate: boolean, existing?: Post) {
   if (!keys) throw new Error("Sign in first.");
   return putRec({
     author: keys.pk,
@@ -556,14 +652,24 @@ export async function putPost(text: string, path: string, existing?: Post) {
     version: nextVersion(existing?.rec.version),
     type: "post",
     edits: existing?.rec.hash,
+    private: isPrivate,
     data: text.trim(),
   });
 }
 
-/** Deletes a record, with a signed tombstone naming its current version. */
+/** Deletes a record, with a signed tombstone naming its current version. The tombstone is as private as
+ * the record, so deleting a private record doesn't tell peers about it. */
 export async function deletePost(p: Post) {
   if (!keys) throw new Error("Sign in first.");
-  await putRec({ author: keys.pk, path: p.rec.path, version: nextVersion(p.rec.version), type: "tombstone", edits: p.rec.hash, data: null });
+  await putRec({
+    author: keys.pk,
+    path: p.rec.path,
+    version: nextVersion(p.rec.version),
+    type: "tombstone",
+    edits: p.rec.hash,
+    private: p.rec.private,
+    data: null,
+  });
 }
 
 /** A post with a made-up signature, to show what a bad one looks like. */
@@ -574,6 +680,7 @@ export function forgedPost(): Post {
     path: "/demo/forged",
     version: Date.now(),
     type: "post",
+    private: false,
     data: "This post was added client-side with a made-up signature, so it should show as a bad signature.",
   };
   return viewPost(decodeRecord(encodeRecord(draft, new Uint8Array(64))));

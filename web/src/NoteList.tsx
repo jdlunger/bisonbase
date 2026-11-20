@@ -3,8 +3,8 @@ import { type Party, type Post, type User, canEdit, deletePost, pathWithin, putP
 import { Link, idPath, pathPath, recordPath } from "./router.tsx";
 import { type Run, badge, danger, fmtTime, input, link, hl, primary, secondary, textarea } from "./ui.ts";
 
-/** Post text, and the path to file it under. */
-export type Draft = { body: string; path: string };
+/** Post text, the path to file it under, and whether only this node's owners may read it. */
+export type Draft = { body: string; path: string; private: boolean };
 
 /** Where we may post, and opening the new-post form there. Provided by the app. */
 export const Compose = createContext<{ canWrite: (path: string) => boolean; open: (path: string) => void; writable: string[] }>({
@@ -47,6 +47,10 @@ export function NoteEditor(props: {
             <option key={p} value={p} />
           ))}
         </datalist>
+      </label>
+      <label className="flex items-center gap-1.5 text-sm" title="Only this node's owners can see it, and it isn't sent to peers">
+        <input type="checkbox" checked={draft.private} onChange={(e) => setDraft({ ...draft, private: e.target.checked })} />
+        🔒 Private <span className="text-gray-500">(only this node's owners can see it)</span>
       </label>
       <div className="flex gap-2">
         <button className={primary} disabled={busy || !draft.body.trim()} onClick={props.onSubmit}>
@@ -224,6 +228,11 @@ export function PostItem({ post: n, me, busy, run, hidePath, history }: ItemProp
             </span>
           )}
           <span className={`${badge} font-mono ${typeColor(n.rec.type)}`}>{n.rec.type}</span>
+          {n.rec.private && (
+            <span className={`${badge} bg-gray-800 text-white ring-gray-800`} title="Only this node's owners can see it, and it isn't sent to peers">
+              🔒 private
+            </span>
+          )}
         </span>
         <span className="flex items-baseline gap-2 text-xs text-gray-500">
           {!history && n.versions > 1 && (
@@ -245,7 +254,7 @@ export function PostItem({ post: n, me, busy, run, hidePath, history }: ItemProp
             busy={busy}
             submitLabel="Save"
             onSubmit={run(async () => {
-              await putPost(editing.body, editing.path, n);
+              await putPost(editing.body, editing.path, editing.private, n);
               setEditing(null);
             })}
             onCancel={() => setEditing(null)}
@@ -257,7 +266,7 @@ export function PostItem({ post: n, me, busy, run, hidePath, history }: ItemProp
           {!history && me && canEdit(n) && (
             <div className="mt-2 flex gap-2">
               {n.rec.type === "post" && (
-                <button className={secondary} disabled={busy || n.text === null} onClick={() => setEditing({ body: n.text!, path: n.rec.path })}>
+                <button className={secondary} disabled={busy || n.text === null} onClick={() => setEditing({ body: n.text!, path: n.rec.path, private: n.rec.private })}>
                   Edit
                 </button>
               )}

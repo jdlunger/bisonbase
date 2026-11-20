@@ -8,8 +8,9 @@ use axum::{
 };
 use ed25519_dalek::{Signer, SigningKey};
 use fedcrdt_core::{
-    CBOR, CLAIM_PATH, ClaimData, GrantData, Hash, Map, NODE_INFO_PATH, NODE_PATH, OWNER_PATH, PeerData, Pubkey, Record,
-    Who, check_prefix, claim_signed_bytes, decode_id, encode_b58, encode_id, node_phrase, path_within, phrase, verify_sig,
+    CBOR, CLAIM_PATH, ClaimData, GrantData, Hash, MAX_READ_TOKEN_MS, Map, NODE_INFO_PATH, NODE_PATH, OWNER_PATH, PeerData, Pubkey,
+    Record, Who, check_prefix, claim_signed_bytes, decode_b58, decode_id, encode_b58, encode_id, node_phrase, path_within, phrase,
+    read_signed_bytes, verify_sig,
 };
 use rusqlite::{Connection, OptionalExtension};
 use serde::Deserialize;
@@ -22,8 +23,8 @@ use std::{
 };
 
 /// Bump to wipe the database when the schema changes incompatibly.
-/// 6: records identified by hash, nodes. 7: chains table, seq as rowid.
-const SCHEMA_VERSION: i64 = 7;
+/// 6: records identified by hash, nodes. 7: chains table, seq as rowid. 8: private records.
+const SCHEMA_VERSION: i64 = 8;
 
 /// How far ahead of the node's clock a write's version may be.
 const MAX_CLOCK_SKEW_MS: u64 = 10 * 60 * 1000;
@@ -130,6 +131,7 @@ fn create_schema(db: &Connection) {
             version INTEGER NOT NULL,
             type TEXT NOT NULL,
             edits BLOB,            -- hash of the version it edits or deletes
+            private INTEGER NOT NULL, -- 1: only this node's owners may read it, and it's never pushed
             root BLOB NOT NULL,    -- its chain's first record: follows `edits` back as far as this node has
             record BLOB NOT NULL,  -- the record's deterministic CBOR, signature included
             received_from BLOB     -- the node that pushed it here, if one did; it isn't pushed back there
@@ -150,9 +152,10 @@ fn create_schema(db: &Connection) {
         CREATE INDEX IF NOT EXISTS chains_by_type ON chains (type) WHERE NOT deleted;
         CREATE INDEX IF NOT EXISTS chains_by_path ON chains (path) WHERE NOT deleted;
         CREATE INDEX IF NOT EXISTS chains_by_author ON chains (author) WHERE NOT deleted;
-        -- Each live chain's current version. `author` is the head's; `by` the root's.
+        -- Each live chain's current version. `author` is the head's; `by` the root's. A chain is private
+        -- if its head is.
         CREATE VIEW IF NOT EXISTS heads AS
-            SELECT c.root, c.head AS hash, c.author AS by, c.path, c.type, c.version, c.versions, r.author, r.record
+            SELECT c.root, c.head AS hash, c.author AS by, c.path, c.type, c.version, c.versions, r.author, r.private, r.record
             FROM chains c JOIN records r ON r.hash = c.head
             WHERE NOT c.deleted;
         -- This node's own key pair: exactly one row.
@@ -242,9 +245,9 @@ fn store(db: &Connection, rec: &Record, from: Option<Pubkey>) -> Result<bool, St
     let tx = db.unchecked_transaction().unwrap();
     tx.execute("INSERT OR IGNORE INTO users (pubkey) VALUES (?1)", [rec.author]).unwrap();
     tx.execute(
-        "INSERT INTO records (hash, author, path, version, type, edits, root, record, received_from)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        (hash, rec.author, &rec.path, rec.version as i64, &rec.kind, rec.edits, root, rec.to_bytes(), from),
+        "INSERT INTO records (hash, author, path, version, type, edits, private, root, record, received_from)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        (hash, rec.author, &rec.path, rec.version as i64, &rec.kind, rec.edits, rec.private, root, rec.to_bytes(), from),
     )
     .unwrap();
     // Edits of this record that arrived before it were filed under it as their root.
@@ -276,6 +279,7 @@ impl App {
             kind: kind.into(),
             data,
             edits,
+            private: false,
             signature: [0; 64],
             extra: Map::new(),
         };
@@ -387,6 +391,32 @@ impl App {
         Ok(())
     }
 
+    /// Whether the request is from one of this node's owners, by its read token (see `read_signed_bytes`
+    /// in core/src/lib.rs): `Authorization: Bisonbase <ID>.<expires>.<signature>`, base58 but for the
+    /// expiry (ms since the epoch). Only owners may read private records. Err if the token isn't valid.
+    fn owner_reading(&self, db: &Connection, headers: &HeaderMap) -> Result<bool, Response> {
+        let Some(v) = headers.get(header::AUTHORIZATION) else { return Ok(false) };
+        let bad = |e: &str| err(StatusCode::UNAUTHORIZED, format!("read token: {e}"));
+        let mut parts = v.to_str().ok().and_then(|v| v.strip_prefix("Bisonbase ")).unwrap_or_default().split('.');
+        let (Some(user), Some(expires), Some(sig), None) = (
+            parts.next().and_then(decode_id),
+            parts.next().and_then(|e| e.parse::<u64>().ok()),
+            parts.next().and_then(decode_b58).and_then(|s| <[u8; 64]>::try_from(s).ok()),
+            parts.next(),
+        ) else {
+            return Err(bad("expected \"Bisonbase <ID>.<expires>.<signature>\""));
+        };
+        let now = now_ms();
+        if expires < now {
+            return Err(bad("expired"));
+        }
+        if expires > now + MAX_READ_TOKEN_MS {
+            return Err(bad("expires too far ahead; check your clock"));
+        }
+        verify_sig(&user, &read_signed_bytes(&self.pk, expires), &sig).map_err(|e| bad(&e))?;
+        Ok(owners(db).contains(&user))
+    }
+
     /// Every node this one knows of: itself, and the peers its peer records name.
     fn nodes(&self, db: &Connection) -> HashSet<Pubkey> {
         let mut keys: HashSet<Pubkey> = peers(db).into_iter().map(|(_, p)| p.node).collect();
@@ -440,8 +470,8 @@ struct RecordsQuery {
 
 /// The current version of every live chain matching the query, newest first, as a CBOR array of
 /// {record, root: its chain's hash, by: who wrote the chain's first record (if this node has it),
-/// versions: how many versions the chain has}.
-async fn list_records(State(app): S, Query(q): Query<RecordsQuery>) -> Response {
+/// versions: how many versions the chain has}. Private ones only for this node's owners.
+async fn list_records(State(app): S, headers: HeaderMap, Query(q): Query<RecordsQuery>) -> Response {
     let author = match q.author.as_deref().map(parse_id).transpose() {
         Ok(a) => a,
         Err(e) => return e,
@@ -451,8 +481,15 @@ async fn list_records(State(app): S, Query(q): Query<RecordsQuery>) -> Response 
         return err(StatusCode::BAD_REQUEST, format!("bad prefix: {e}"));
     }
     let db = app.db.lock().unwrap();
+    let owner = match app.owner_reading(&db, &headers) {
+        Ok(o) => o,
+        Err(e) => return e,
+    };
     // Only the filters given, so the planner can pick an index for them (`?1 IS NULL OR …` defeats that).
     let mut sql = String::from("SELECT record, root, by, versions FROM heads WHERE 1");
+    if !owner {
+        sql += " AND NOT private";
+    }
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![];
     let mut bind = |v: Box<dyn rusqlite::ToSql>| {
         params.push(v);
@@ -489,17 +526,24 @@ async fn list_records(State(app): S, Query(q): Query<RecordsQuery>) -> Response 
     ([(header::CONTENT_TYPE, "application/cbor")], CBOR::from(entries).to_cbor_data()).into_response()
 }
 
-/// Every version of the chain the record with this hash (base58) is in, oldest first, as a CBOR array of records.
-async fn chain(State(app): S, Path(hash): Path<String>) -> Response {
+/// Every version of the chain the record with this hash (base58) is in, oldest first, as a CBOR array of
+/// records. Private versions only for this node's owners: to anyone else, a private record isn't here.
+async fn chain(State(app): S, headers: HeaderMap, Path(hash): Path<String>) -> Response {
     let Some(hash) = bs58::decode(&hash).into_vec().ok().and_then(|h| Hash::try_from(h).ok()) else {
         return err(StatusCode::BAD_REQUEST, "hash isn't 32 bytes of base58");
     };
     let db = app.db.lock().unwrap();
-    let Some(root): Option<Hash> = db.query_row("SELECT root FROM records WHERE hash = ?1", [hash], |r| r.get(0)).optional().unwrap() else {
+    let owner = match app.owner_reading(&db, &headers) {
+        Ok(o) => o,
+        Err(e) => return e,
+    };
+    let found: Option<(Hash, bool)> =
+        db.query_row("SELECT root, private FROM records WHERE hash = ?1", [hash], |r| Ok((r.get(0)?, r.get(1)?))).optional().unwrap();
+    let Some((root, _)) = found.filter(|(_, private)| owner || !private) else {
         return err(StatusCode::NOT_FOUND, "no such record here");
     };
-    let mut stmt = db.prepare("SELECT record FROM records WHERE root = ?1 ORDER BY version, hash").unwrap();
-    let records: Vec<Vec<u8>> = stmt.query_map([root], |r| r.get(0)).unwrap().flatten().collect();
+    let mut stmt = db.prepare("SELECT record FROM records WHERE root = ?1 AND (?2 OR NOT private) ORDER BY version, hash").unwrap();
+    let records: Vec<Vec<u8>> = stmt.query_map((root, owner), |r| r.get(0)).unwrap().flatten().collect();
     ([(header::CONTENT_TYPE, "application/cbor")], cbor_array(&records)).into_response()
 }
 
@@ -598,7 +642,7 @@ fn cbor_array(records: &[Vec<u8>]) -> Vec<u8> {
 // ---- federation: pushing records to peers, and receiving them ----
 
 /// Stores records pushed by another node: a CBOR array of records, with the pusher's ID (base58) in
-/// X-From. Takes any valid record, except node records. Answers, per record, "stored", "have", or why
+/// X-From. Takes any valid record, except node records and private ones. Answers, per record, "stored", "have", or why
 /// it was refused.
 async fn receive(State(app): S, headers: HeaderMap, body: Bytes) -> Response {
     let from = headers.get("x-from").and_then(|v| v.to_str().ok()).and_then(decode_id);
@@ -612,6 +656,9 @@ async fn receive(State(app): S, headers: HeaderMap, body: Bytes) -> Response {
             let r = Record::from_cbor(&v)?;
             if r.is_node_record() {
                 return Err(format!("{NODE_PATH} records aren't federated"));
+            }
+            if r.private {
+                return Err("private records aren't federated".into());
             }
             store(&db, &r, from)
         })
@@ -661,7 +708,7 @@ fn peers(db: &Connection) -> Vec<(Hash, PeerData)> {
 }
 
 /// Pushes everything the peer record `peer_hash` hasn't sent yet, in batches, moving its cursor
-/// after each one the peer accepts. Leaves out node records, and records the peer pushed here.
+/// after each one the peer accepts. Leaves out node records, private ones, and records the peer pushed here.
 async fn push_to(app: &App, peer_hash: Hash, peer: &PeerData) -> Result<(), reqwest::Error> {
     loop {
         let (batch, last) = {
@@ -669,17 +716,19 @@ async fn push_to(app: &App, peer_hash: Hash, peer: &PeerData) -> Result<(), reqw
             let cursor: i64 =
                 db.query_row("SELECT seq FROM peer_cursors WHERE peer = ?1", [peer_hash], |r| r.get(0)).optional().unwrap().unwrap_or(0);
             let mut stmt =
-                db.prepare("SELECT seq, path, type, received_from, record FROM records WHERE seq > ?1 ORDER BY seq LIMIT ?2").unwrap();
-            let rows: Vec<(i64, String, String, Option<Pubkey>, Vec<u8>)> = stmt
-                .query_map((cursor, PUSH_BATCH), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+                db.prepare("SELECT seq, path, type, received_from, private, record FROM records WHERE seq > ?1 ORDER BY seq LIMIT ?2").unwrap();
+            let rows: Vec<(i64, String, String, Option<Pubkey>, bool, Vec<u8>)> = stmt
+                .query_map((cursor, PUSH_BATCH), |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
                 .unwrap()
                 .flatten()
                 .collect();
             let Some(last) = rows.last().map(|r| r.0) else { return Ok(()) };
             let batch: Vec<Vec<u8>> = rows
                 .into_iter()
-                .filter(|(_, path, kind, from, _)| *from != Some(peer.node) && !path_within(path, NODE_PATH) && peer.wants(path, kind))
-                .map(|r| r.4)
+                .filter(|(_, path, kind, from, private, _)| {
+                    *from != Some(peer.node) && !private && !path_within(path, NODE_PATH) && peer.wants(path, kind)
+                })
+                .map(|r| r.5)
                 .collect();
             (batch, last)
         };
@@ -735,11 +784,44 @@ mod tests {
             kind: kind.into(),
             data,
             edits: edits.map(Record::hash),
+            private: false,
             signature: [0; 64],
             extra: Map::new(),
         };
         r.signature = key.sign(&r.signed_bytes()).to_bytes();
         r
+    }
+
+    /// A post only the node's owners may read.
+    fn private_post(key: &SigningKey, path: &str, text: &str, edits: Option<&Record>, version: u64) -> Record {
+        let mut r = post(key, path, text, edits, version);
+        r.private = true;
+        r.signature = key.sign(&r.signed_bytes()).to_bytes();
+        r
+    }
+
+    /// Request headers with `key`'s read token for `app`, good until `expires`.
+    fn reading_as(app: &App, key: &SigningKey, expires: u64) -> HeaderMap {
+        let sig = key.sign(&read_signed_bytes(&app.pk, expires)).to_bytes();
+        let mut h = HeaderMap::new();
+        h.insert(header::AUTHORIZATION, format!("Bisonbase {}.{expires}.{}", encode_id(&id(key)), encode_b58(&sig)).parse().unwrap());
+        h
+    }
+
+    async fn body(res: Response) -> Vec<u8> {
+        axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap().to_vec()
+    }
+
+    /// The texts of the records in a CBOR array (as `chain` answers), or of the records in its entries (as `list_records` does).
+    fn texts(bytes: &[u8]) -> Vec<String> {
+        let items = CBOR::try_from_data(bytes).unwrap().into_array().unwrap();
+        let mut t: Vec<String> = items
+            .iter()
+            .map(|v| v.as_map().and_then(|m| m.get::<_, CBOR>("record")).unwrap_or(v.clone()))
+            .filter_map(|v| Record::from_cbor(&v).unwrap().data.as_text().map(Into::into))
+            .collect();
+        t.sort();
+        t
     }
 
     fn post(key: &SigningKey, path: &str, text: &str, edits: Option<&Record>, version: u64) -> Record {
@@ -949,9 +1031,9 @@ mod tests {
 
         let list = async |author: Option<&SigningKey>, kind: Option<&str>, prefix: Option<&str>| -> Vec<String> {
             let q = RecordsQuery { author: author.map(|k| encode_id(&id(k))), kind: kind.map(Into::into), prefix: prefix.map(Into::into) };
-            let res = list_records(State(app.clone()), Query(q)).await;
+            let res = list_records(State(app.clone()), HeaderMap::new(), Query(q)).await;
             assert_eq!(res.status(), StatusCode::OK);
-            let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            let body = body(res).await;
             let mut paths: Vec<String> = CBOR::try_from_data(&body)
                 .unwrap()
                 .into_array()
@@ -969,5 +1051,62 @@ mod tests {
         assert_eq!(list(Some(&bob), Some("post"), Some("/posts")).await, Vec::<String>::new());
         assert_eq!(list(None, Some("post"), Some("/")).await.len(), 8, "everything but the deleted one");
         assert_eq!(list(None, Some("grant"), None).await, [GRANT_PATH]);
+    }
+
+    #[tokio::test]
+    async fn private_records_are_for_owners() {
+        let (app, alice, bob) = setup();
+        put(&app, &post(&bob, "/post/a", "public", None, 1)).unwrap();
+        let secret = private_post(&bob, "/post/b", "secret", None, 1);
+        put(&app, &secret).unwrap();
+        // A chain that went private: its public first version stays readable, the rest doesn't.
+        let was_public = post(&bob, "/post/c", "was public", None, 1);
+        put(&app, &was_public).unwrap();
+        let now_private = private_post(&bob, "/post/c", "now private", Some(&was_public), 2);
+        put(&app, &now_private).unwrap();
+        let app = Arc::new(app);
+        let expires = now_ms() + 60_000;
+
+        let list = async |h: HeaderMap| {
+            let res = list_records(State(app.clone()), h, Query(RecordsQuery { author: None, kind: Some("post".into()), prefix: None })).await;
+            (res.status(), body(res).await)
+        };
+        let (status, b) = list(HeaderMap::new()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(texts(&b), ["public"]);
+        assert_eq!(texts(&list(reading_as(&app, &bob, expires)).await.1), ["public"], "bob wrote it, but isn't an owner");
+        assert_eq!(texts(&list(reading_as(&app, &alice, expires)).await.1), ["now private", "public", "secret"]);
+
+        // Bad tokens are refused, not ignored.
+        assert_eq!(list(reading_as(&app, &alice, now_ms() - 1)).await.0, StatusCode::UNAUTHORIZED, "expired");
+        assert_eq!(list(reading_as(&app, &alice, now_ms() + MAX_READ_TOKEN_MS + 60_000)).await.0, StatusCode::UNAUTHORIZED);
+        let mut forged = reading_as(&app, &alice, expires);
+        let other = reading_as(&app, &alice, expires + 1);
+        let sig = other[header::AUTHORIZATION].to_str().unwrap().rsplit('.').next().unwrap().to_string();
+        let v = forged[header::AUTHORIZATION].to_str().unwrap().rsplit_once('.').unwrap().0.to_string();
+        forged.insert(header::AUTHORIZATION, format!("{v}.{sig}").parse().unwrap());
+        assert_eq!(list(forged).await.0, StatusCode::UNAUTHORIZED, "signature for another expiry");
+
+        let chain = async |hash: &Record, h: HeaderMap| {
+            let res = chain(State(app.clone()), h, Path(encode_b58(&hash.hash()))).await;
+            (res.status(), body(res).await)
+        };
+        assert_eq!(chain(&secret, HeaderMap::new()).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(texts(&chain(&secret, reading_as(&app, &alice, expires)).await.1), ["secret"]);
+        assert_eq!(chain(&now_private, HeaderMap::new()).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(texts(&chain(&was_public, HeaderMap::new()).await.1), ["was public"]);
+        assert_eq!(texts(&chain(&was_public, reading_as(&app, &alice, expires)).await.1), ["now private", "was public"]);
+    }
+
+    #[tokio::test]
+    async fn private_records_arent_received() {
+        let app = Arc::new(node());
+        let bob = key(2);
+        let records = [post(&bob, "/post/a", "public", None, 1), private_post(&bob, "/post/b", "secret", None, 1)];
+        let items: Vec<Vec<u8>> = records.iter().map(Record::to_bytes).collect();
+        let res = receive(State(app.clone()), HeaderMap::new(), Bytes::from(cbor_array(&items))).await;
+        let results: Vec<String> = serde_json::from_slice(&body(res).await).unwrap();
+        assert_eq!(results[0], "stored");
+        assert!(results[1].contains("private"), "{}", results[1]);
     }
 }

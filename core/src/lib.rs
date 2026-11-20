@@ -109,6 +109,8 @@ fn as_map<'a>(v: &'a CBOR, what: &str) -> Result<&'a Map, String> {
 //   data       any        the content, per `type`
 //   edits      bytes(32)? the hash of the version this one edits (or, for a tombstone, deletes): the
 //                         newest one its author saw. Edits keep the type but may change the path
+//   private    bool       if true, only the node's owners may read it, and it's never federated. Edits
+//                         may change it; a chain is private if its current version is
 //   signature  bytes(64)  author's Ed25519 signature over `RECORD_CONTEXT || CBOR(the record
 //                         without this field)`
 //
@@ -134,12 +136,13 @@ pub struct Record {
     pub kind: String,
     pub data: CBOR,
     pub edits: Option<Hash>,
+    pub private: bool,
     pub signature: [u8; 64],
     /// Fields this version doesn't know about.
     pub extra: Map,
 }
 
-const RECORD_FIELDS: [&str; 7] = ["author", "path", "version", "type", "data", "edits", "signature"];
+const RECORD_FIELDS: [&str; 8] = ["author", "path", "version", "type", "data", "edits", "private", "signature"];
 
 // ---- nodes ----
 //
@@ -176,6 +179,25 @@ pub fn claim_signed_bytes(node: &Pubkey, token: &[u8]) -> Vec<u8> {
     m.insert("node", CBOR::to_byte_string(node));
     m.insert("token", CBOR::to_byte_string(token));
     [CLAIM_CONTEXT, &CBOR::from(m).to_cbor_data()].concat()
+}
+
+// ---- reading private records ----
+//
+// The node has no sessions. To read private records, an owner sends a read token with their requests:
+// their ID, an expiry, and their signature over `read_signed_bytes`. It's good on that node only, until
+// it expires.
+
+pub const READ_CONTEXT: &[u8] = b"bisonbase-read-v1\n";
+
+/// How far ahead of the node's clock a read token's expiry may be.
+pub const MAX_READ_TOKEN_MS: u64 = 60 * 60 * 1000;
+
+/// The bytes a user signs to read `node`'s private records until `expires` (ms since the epoch).
+pub fn read_signed_bytes(node: &Pubkey, expires: u64) -> Vec<u8> {
+    let mut m = Map::new();
+    m.insert("node", CBOR::to_byte_string(node));
+    m.insert("expires", expires);
+    [READ_CONTEXT, &CBOR::from(m).to_cbor_data()].concat()
 }
 
 /// A user, as owner and grant records name them: {user: their ID}, or {claim: the hash of a claim
@@ -412,6 +434,7 @@ impl Record {
         if let Some(e) = self.edits {
             m.insert("edits", CBOR::to_byte_string(e));
         }
+        m.insert("private", self.private);
         m
     }
 
@@ -472,6 +495,7 @@ impl Record {
             kind: field(m, "type", text)?,
             data: field(m, "data", |v| Some(v.clone()))?,
             edits: opt_field(m, "edits", bytes)?,
+            private: field(m, "private", CBOR::as_bool)?,
             signature: field(m, "signature", bytes)?,
             extra,
         })
@@ -532,6 +556,7 @@ mod tests {
             kind: kind.into(),
             data,
             edits,
+            private: false,
             signature: [0; 64],
             extra: Map::new(),
         };
@@ -566,6 +591,16 @@ mod tests {
         assert_eq!(back, x);
         back.check().unwrap();
         assert_ne!(x.hash(), r.hash());
+
+        let mut p = r.clone();
+        p.private = true;
+        p.signature = key.sign(&p.signed_bytes()).to_bytes();
+        let back = Record::from_bytes(&p.to_bytes()).unwrap();
+        assert!(back.private);
+        back.check().unwrap();
+        let mut flipped = p.clone();
+        flipped.private = false;
+        assert!(flipped.check().is_err(), "the signature covers it");
 
         let edit = signed(&key, "/post/cats", "post", "hello".into(), Some(r.hash()));
         assert_eq!(Record::from_bytes(&edit.to_bytes()).unwrap(), edit);

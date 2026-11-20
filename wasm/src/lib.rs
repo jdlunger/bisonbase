@@ -3,7 +3,7 @@
 
 use fedcrdt_core::{
     CBOR, ClaimData, GrantData, Grantees, Map, PeerData, Record, Who, check_path, check_prefix, claim_signed_bytes, decode_b58,
-    decode_id, encode_b58, node_phrase, path_within, phrase, two_words,
+    decode_id, encode_b58, node_phrase, path_within, phrase, read_signed_bytes, two_words,
 };
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
@@ -32,6 +32,8 @@ export type Rec = {
   version: number;
   type: string;
   edits?: Uint8Array;
+  /** Only the node's owners may read it, and it's never federated. */
+  private: boolean;
   signature: Uint8Array;
   /** Whether it checks out: its path, data and signature. */
   verified: boolean;
@@ -60,6 +62,7 @@ export type Draft = {
   version: number;
   type: string;
   edits?: Uint8Array;
+  private: boolean;
   data: string | null | GrantData | PeerData | ClaimData | Who;
 };
 "#;
@@ -95,6 +98,7 @@ struct RecJs {
     kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     edits: Option<ByteBuf>,
+    private: bool,
     signature: ByteBuf,
     verified: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -178,6 +182,7 @@ fn rec_js(r: &Record) -> RecJs {
         version: r.version,
         kind: r.kind.clone(),
         edits: r.edits.map(|e| buf(&e)),
+        private: r.private,
         signature: buf(&r.signature),
         verified: problem.is_none(),
         problem,
@@ -250,6 +255,7 @@ struct DraftJs {
     #[serde(rename = "type")]
     kind: String,
     edits: Option<ByteBuf>,
+    private: bool,
     data: Option<DataJs>,
 }
 
@@ -290,6 +296,7 @@ fn record(draft: JsValue, signature: [u8; 64]) -> Result<Record> {
         kind: d.kind,
         data,
         edits: d.edits.map(|e| fixed(&e, "edits")).transpose()?,
+        private: d.private,
         signature,
         extra: Map::new(),
     })
@@ -311,6 +318,12 @@ pub fn encode_record(#[wasm_bindgen(unchecked_param_type = "Draft")] draft: JsVa
 #[wasm_bindgen(js_name = claimSignedBytes)]
 pub fn claim_signed_bytes_js(node: &[u8], token: &[u8]) -> Result<Vec<u8>> {
     Ok(claim_signed_bytes(&fixed(node, "node")?, token))
+}
+
+/// The bytes an owner signs for a token to read `node`'s private records until `expires` (ms since the epoch).
+#[wasm_bindgen(js_name = readSignedBytes)]
+pub fn read_signed_bytes_js(node: &[u8], expires: u64) -> Result<Vec<u8>> {
+    Ok(read_signed_bytes(&fixed(node, "node")?, expires))
 }
 
 // ---- IDs and paths ----

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import {
   type NodeInfo,
   type Passkey,
+  type RecentPasskey,
   type User,
   amOwner,
   deriveFromExistingPasskey,
@@ -10,6 +11,7 @@ import {
   forgetKeys,
   forgetRecentPasskey,
   isRemembering,
+  loadPasskey,
   loadNode,
   myGrants,
   myPasskey,
@@ -28,7 +30,7 @@ import { Link, idPath, navigate, recordPath, useRoute } from "./router.tsx";
 import { type Run, link, hl, primary, secondary, useLoad } from "./ui.ts";
 
 /** A recently used passkey, with its keys' phrase. */
-type Recent = Passkey & { phrase: string };
+type Recent = RecentPasskey & { phrase: string };
 
 /** Loads remembered keys and this node's info first. */
 export default function App() {
@@ -93,7 +95,7 @@ function Shell({ initialError }: { initialError: string | null }) {
   const owner = !!me && amOwner();
   const canWrite = (path: string) => !!me && (owner || grants.some((g) => pathWithin(path, g)));
   const open = (path: string) => {
-    setDraft({ body: "", path });
+    setDraft({ body: "", path, private: false });
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
   // "New post" goes where we're looking, if we may write there; else the first place we may.
@@ -135,7 +137,7 @@ function Shell({ initialError }: { initialError: string | null }) {
               busy={busy}
               submitLabel="Post"
               onSubmit={run(async () => {
-                const hash = await putPost(draft.body, draft.path);
+                const hash = await putPost(draft.body, draft.path, draft.private);
                 setDraft(null);
                 navigate(recordPath(hash));
               })}
@@ -284,15 +286,18 @@ function AuthMenu({ me, passkey, recent, busy, run }: { me: User | null; passkey
             <ul className="border-b border-gray-200 py-1">
               {recent.map((p) => (
                 <li key={p.credId} className="flex items-center gap-1">
-                  <button className={item} disabled={busy} onClick={act(() => deriveFromExistingPasskey(p.credId))} title={p.pubkey}>
+                  <button className={item} disabled={busy} onClick={act(() => loadPasskey(p.credId))} title={p.pubkey}>
                     <span className={`font-medium ${hl(p.phrase)}`}>{p.phrase}</span>
-                    <span className="text-xs text-gray-500">{p.name ?? "(unnamed)"}</span>
+                    <span className="text-xs text-gray-500">
+                      {p.name ?? "(unnamed)"}
+                      {p.saved && <span title="Keys saved on this device: no prompt"> · saved</span>}
+                    </span>
                   </button>
                   <button
                     className="cursor-pointer rounded-md px-1.5 py-1 text-gray-400 hover:bg-gray-100 hover:text-red-600"
                     disabled={busy}
                     onClick={run(() => forgetRecentPasskey(p.credId))}
-                    title="Remove from this list"
+                    title={p.saved ? "Remove from this list, deleting its saved keys" : "Remove from this list"}
                     aria-label={`Remove ${p.phrase} from this list`}
                   >
                     ×

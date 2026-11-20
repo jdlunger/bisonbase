@@ -41,6 +41,7 @@ npm run dev:fresh
    - Nodes: node_word
  - Each server has 1 or more owners: users identified by a node owner record.
  - Every record is signed by either a user or the node, and goes at a categorical path.
+ - Every record is public or private (a signed `private` flag, chosen by its author; edits can change it). Private records can only be read by the node's owners, who prove who they are with a short-lived signed read token, and are never pushed to peers.
    - /node/owner contains all owner records.
    - /node/grant contains all user authorization grant records (e.g. anyone can create a record under /post)
    - /node/peer contains all node peer federation records (other server instances to push records to)
