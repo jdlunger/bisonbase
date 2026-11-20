@@ -8,7 +8,7 @@ use axum::{
 };
 use ed25519_dalek::{Signer, SigningKey};
 use fedcrdt_core::{
-    CBOR, CLAIM_PATH, ClaimData, GrantData, Hash, MAX_READ_TOKEN_MS, Map, NODE_INFO_PATH, NODE_PATH, OWNER_PATH, PeerData, Pubkey,
+    CBOR, CLAIM_PATH, ClaimData, DocUpdateData, GrantData, Hash, MAX_READ_TOKEN_MS, Map, NODE_INFO_PATH, NODE_PATH, OWNER_PATH, PeerData, Pubkey,
     Record, Who, check_prefix, claim_signed_bytes, decode_b58, decode_id, encode_b58, encode_id, node_phrase, path_within, phrase,
     read_signed_bytes, verify_sig,
 };
@@ -23,8 +23,8 @@ use std::{
 };
 
 /// Bump to wipe the database when the schema changes incompatibly.
-/// 6: records identified by hash, nodes. 7: chains table, seq as rowid. 8: private records.
-const SCHEMA_VERSION: i64 = 8;
+/// 6: records identified by hash, nodes. 7: chains table, seq as rowid. 8: private records. 9: records.doc.
+const SCHEMA_VERSION: i64 = 9;
 
 /// How far ahead of the node's clock a write's version may be.
 const MAX_CLOCK_SKEW_MS: u64 = 10 * 60 * 1000;
@@ -79,6 +79,7 @@ async fn main() {
         .route("/api/users/{pubkey}", get(user))
         .route("/api/records", get(list_records).post(put_record))
         .route("/api/records/{hash}", get(chain))
+        .route("/api/docs/{hash}/updates", get(doc_updates))
         .route("/api/node", get(node_info))
         .route("/api/nodes", get(nodes))
         .route("/api/claim", post(claim))
@@ -134,9 +135,11 @@ fn create_schema(db: &Connection) {
             private INTEGER NOT NULL, -- 1: only this node's owners may read it, and it's never pushed
             root BLOB NOT NULL,    -- its chain's first record: follows `edits` back as far as this node has
             record BLOB NOT NULL,  -- the record's deterministic CBOR, signature included
-            received_from BLOB     -- the node that pushed it here, if one did; it isn't pushed back there
+            received_from BLOB,    -- the node that pushed it here, if one did; it isn't pushed back there
+            doc BLOB               -- for a doc update: its doc (the doc chain's first record's hash)
         );
         CREATE INDEX IF NOT EXISTS records_by_root ON records (root, version, hash);
+        CREATE INDEX IF NOT EXISTS records_by_doc ON records (doc, seq) WHERE doc IS NOT NULL;
         -- One row per chain (by root), kept up to date by `store`: its current version (newest by
         -- version, then hash) and a summary. path, type and version are the head's, for querying.
         CREATE TABLE IF NOT EXISTS chains (
@@ -245,9 +248,9 @@ fn store(db: &Connection, rec: &Record, from: Option<Pubkey>) -> Result<bool, St
     let tx = db.unchecked_transaction().unwrap();
     tx.execute("INSERT OR IGNORE INTO users (pubkey) VALUES (?1)", [rec.author]).unwrap();
     tx.execute(
-        "INSERT INTO records (hash, author, path, version, type, edits, private, root, record, received_from)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        (hash, rec.author, &rec.path, rec.version as i64, &rec.kind, rec.edits, rec.private, root, rec.to_bytes(), from),
+        "INSERT INTO records (hash, author, path, version, type, edits, private, root, record, received_from, doc)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        (hash, rec.author, &rec.path, rec.version as i64, &rec.kind, rec.edits, rec.private, root, rec.to_bytes(), from, rec.doc_update().map(|u| u.doc)),
     )
     .unwrap();
     // Edits of this record that arrived before it were filed under it as their root.
@@ -353,6 +356,9 @@ impl App {
         if rec.is_node_record() && !owner {
             return Err(format!("only this node's owners can write under {NODE_PATH}"));
         }
+        if let Some(u) = rec.doc_update() {
+            return self.authorize_doc_update(db, rec, &u, owner);
+        }
         let Some(prev_hash) = rec.edits else {
             return if may_write(db, &rec.author, &rec.path) { Ok(()) } else { Err(format!("writing at {} needs a grant", rec.path)) };
         };
@@ -366,6 +372,9 @@ impl App {
         }
         if prev.kind == "node" {
             return Err("only the node itself writes its node record".into());
+        }
+        if prev.kind == "doc_update" {
+            return Err("doc updates are never edited or deleted; delete the doc instead".into());
         }
         if rec.kind != "tombstone" && rec.kind != prev.kind {
             return Err("an edit can't change a record's type".into());
@@ -387,6 +396,27 @@ impl App {
             if others == 0 && rec.kind == "tombstone" {
                 return Err("a node needs at least one owner".into());
             }
+        }
+        Ok(())
+    }
+
+    /// Whether `rec`, an update to the doc `u.doc`, may be written here: the doc is live, the update is
+    /// at its current path, and its author is the doc's author, one of its editors, or an owner.
+    fn authorize_doc_update(&self, db: &Connection, rec: &Record, u: &DocUpdateData, owner: bool) -> Result<(), String> {
+        let (by, head): (Option<Pubkey>, Vec<u8>) = db
+            .query_row("SELECT by, record FROM heads WHERE root = ?1 AND type = 'doc'", [u.doc], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()
+            .unwrap()
+            .ok_or("this node has no live doc with that hash")?;
+        let head = parse_record(head);
+        let (Some(by), Some(doc)) = (by, head.doc()) else {
+            return Err("this node doesn't have that doc's first version".into());
+        };
+        if rec.path != head.path {
+            return Err(format!("this doc's updates go at its path, {}", head.path));
+        }
+        if !owner && !doc.may_edit(&by, &rec.author, |c| claimed_by(db, c)) {
+            return Err("only the doc's author and editors can edit it".into());
         }
         Ok(())
     }
@@ -468,7 +498,8 @@ struct RecordsQuery {
     prefix: Option<String>,
 }
 
-/// The current version of every live chain matching the query, newest first, as a CBOR array of
+/// The current version of every live chain matching the query (but doc updates, unless `type` asks for
+/// them), newest first, as a CBOR array of
 /// {record, root: its chain's hash, by: who wrote the chain's first record (if this node has it),
 /// versions: how many versions the chain has}. Private ones only for this node's owners.
 async fn list_records(State(app): S, headers: HeaderMap, Query(q): Query<RecordsQuery>) -> Response {
@@ -504,8 +535,10 @@ async fn list_records(State(app): S, headers: HeaderMap, Query(q): Query<Records
         let p = bind(Box::new(p));
         sql += &format!(" AND path >= {p} AND path < {p} || '0' AND (path = {p} OR path >= {p} || '/')");
     }
-    if let Some(k) = q.kind {
-        sql += &format!(" AND type = {}", bind(Box::new(k)));
+    match q.kind {
+        Some(k) => sql += &format!(" AND type = {}", bind(Box::new(k))),
+        // There are lots, and they only mean something together: see `doc_updates`.
+        None => sql += " AND type != 'doc_update'",
     }
     sql += " ORDER BY version DESC";
     let mut stmt = db.prepare(&sql).unwrap();
@@ -570,6 +603,39 @@ async fn put_record(State(app): S, body: Bytes) -> Response {
     }
 }
 
+#[derive(Deserialize)]
+struct UpdatesQuery {
+    /// Only updates that arrived after this one: the X-Seq of an earlier answer.
+    after: Option<i64>,
+}
+
+/// The updates to the live doc whose chain starts with the record with this hash (base58), in the order
+/// they arrived here, as a CBOR array of records. X-Seq: where to continue from (`after`); X-Doc-Head:
+/// the doc's current version's hash (base58), so readers see when its title or editors change. Includes
+/// updates by anyone: readers check who wrote them (see `DocData::may_edit`).
+async fn doc_updates(State(app): S, Path(hash): Path<String>, Query(q): Query<UpdatesQuery>) -> Response {
+    let Some(root) = decode_b58(&hash).and_then(|h| Hash::try_from(h).ok()) else {
+        return err(StatusCode::BAD_REQUEST, "hash isn't 32 bytes of base58");
+    };
+    let db = app.db.lock().unwrap();
+    let Some(head): Option<Hash> =
+        db.query_row("SELECT hash FROM heads WHERE root = ?1 AND type = 'doc'", [root], |r| r.get(0)).optional().unwrap()
+    else {
+        return err(StatusCode::NOT_FOUND, "no live doc with that hash here");
+    };
+    let after = q.after.unwrap_or(0);
+    let mut stmt = db.prepare("SELECT seq, record FROM records WHERE doc = ?1 AND seq > ?2 AND type = 'doc_update' ORDER BY seq").unwrap();
+    let rows: Vec<(i64, Vec<u8>)> = stmt.query_map((root, after), |r| Ok((r.get(0)?, r.get(1)?))).unwrap().flatten().collect();
+    let seq = rows.last().map_or(after, |r| r.0);
+    let records: Vec<Vec<u8>> = rows.into_iter().map(|r| r.1).collect();
+    let headers = [
+        (header::CONTENT_TYPE, "application/cbor".to_string()),
+        (header::HeaderName::from_static("x-seq"), seq.to_string()),
+        (header::HeaderName::from_static("x-doc-head"), encode_b58(&head)),
+    ];
+    (headers, cbor_array(&records)).into_response()
+}
+
 // ---- this node, and claiming it ----
 
 /// Who this node is, and who owns it. Readable from any origin, so a node's owner can look up a peer's ID.
@@ -620,15 +686,18 @@ async fn claim(State(app): S, Json(c): Json<Claim>) -> Response {
         .query_map([], |r| Ok((r.get::<_, Hash>(0)?, r.get::<_, Hash>(1)?, r.get::<_, Vec<u8>>(2)?)))
         .unwrap()
         .flatten()
-        .find_map(|(h, root, b)| Some((h, root, parse_record(b).claim().filter(|c| c.token_hash == token_hash)?)));
-    let Some((head, root, data)) = found else {
+        .find_map(|(h, root, b)| {
+            let r = parse_record(b);
+            Some((h, root, r.claim().filter(|c| c.token_hash == token_hash)?, r.path))
+        });
+    let Some((head, root, data, path)) = found else {
         return err(StatusCode::NOT_FOUND, "This claim link isn't for this node, or its claim was deleted.");
     };
     if data.user.is_some() {
         return err(StatusCode::FORBIDDEN, "This claim link was already used.");
     }
     db.execute("INSERT OR IGNORE INTO users (pubkey) VALUES (?1)", [user]).unwrap();
-    app.write(&db, CLAIM_PATH, "claim", ClaimData { user: Some(user), ..data }.to_cbor(), Some(head));
+    app.write(&db, &path, "claim", ClaimData { user: Some(user), ..data }.to_cbor(), Some(head));
     println!("claim {} claimed by {} ({})", encode_b58(&root), encode_id(&user), phrase(&user));
     Json(json!({ "claim": encode_b58(&root) })).into_response()
 }
@@ -642,7 +711,7 @@ fn cbor_array(records: &[Vec<u8>]) -> Vec<u8> {
 // ---- federation: pushing records to peers, and receiving them ----
 
 /// Stores records pushed by another node: a CBOR array of records, with the pusher's ID (base58) in
-/// X-From. Takes any valid record, except node records and private ones. Answers, per record, "stored", "have", or why
+/// X-From. Takes any valid record, except node records, claims and private ones. Answers, per record, "stored", "have", or why
 /// it was refused.
 async fn receive(State(app): S, headers: HeaderMap, body: Bytes) -> Response {
     let from = headers.get("x-from").and_then(|v| v.to_str().ok()).and_then(decode_id);
@@ -659,6 +728,9 @@ async fn receive(State(app): S, headers: HeaderMap, body: Bytes) -> Response {
             }
             if r.private {
                 return Err("private records aren't federated".into());
+            }
+            if r.kind == "claim" {
+                return Err("claims aren't federated".into());
             }
             store(&db, &r, from)
         })
@@ -708,7 +780,7 @@ fn peers(db: &Connection) -> Vec<(Hash, PeerData)> {
 }
 
 /// Pushes everything the peer record `peer_hash` hasn't sent yet, in batches, moving its cursor
-/// after each one the peer accepts. Leaves out node records, private ones, and records the peer pushed here.
+/// after each one the peer accepts. Leaves out node records, claims, private ones, and records the peer pushed here.
 async fn push_to(app: &App, peer_hash: Hash, peer: &PeerData) -> Result<(), reqwest::Error> {
     loop {
         let (batch, last) = {
@@ -726,7 +798,7 @@ async fn push_to(app: &App, peer_hash: Hash, peer: &PeerData) -> Result<(), reqw
             let batch: Vec<Vec<u8>> = rows
                 .into_iter()
                 .filter(|(_, path, kind, from, private, _)| {
-                    *from != Some(peer.node) && !private && !path_within(path, NODE_PATH) && peer.wants(path, kind)
+                    *from != Some(peer.node) && !private && kind != "claim" && !path_within(path, NODE_PATH) && peer.wants(path, kind)
                 })
                 .map(|r| r.5)
                 .collect();
@@ -1108,5 +1180,88 @@ mod tests {
         let results: Vec<String> = serde_json::from_slice(&body(res).await).unwrap();
         assert_eq!(results[0], "stored");
         assert!(results[1].contains("private"), "{}", results[1]);
+    }
+
+    fn doc_update(key: &SigningKey, doc: &Record, path: &str, update: &[u8]) -> Record {
+        sign(key, path, "doc_update", DocUpdateData { doc: doc.hash(), update: update.to_vec() }.to_cbor(), None, 1)
+    }
+
+    /// The updates `doc_updates` answers with (their bytes), and its X-Seq.
+    async fn updates(app: &Arc<App>, doc: &Record, after: i64) -> (Vec<Vec<u8>>, i64) {
+        let res = doc_updates(State(app.clone()), Path(encode_b58(&doc.hash())), Query(UpdatesQuery { after: Some(after) })).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let seq = res.headers()["x-seq"].to_str().unwrap().parse().unwrap();
+        let items = CBOR::try_from_data(body(res).await).unwrap().into_array().unwrap();
+        (items.iter().map(|v| Record::from_cbor(v).unwrap().doc_update().unwrap().update).collect(), seq)
+    }
+
+    #[tokio::test]
+    async fn docs() {
+        use fedcrdt_core::DocData;
+        let (app, alice, bob) = setup();
+        let carol = key(3);
+        let grant = GrantData { path: "/doc".into(), grantees: Grantees::Anyone };
+        put(&app, &sign(&alice, GRANT_PATH, "grant", grant.to_cbor(), None, 1)).unwrap();
+
+        let doc = sign(&bob, "/doc", "doc", DocData { title: "Plans".into(), editors: vec![] }.to_cbor(), None, 1);
+        put(&app, &doc).unwrap();
+        put(&app, &doc_update(&bob, &doc, "/doc", b"bob")).unwrap();
+        put(&app, &doc_update(&alice, &doc, "/doc", b"alice")).expect("owners may edit anything");
+        let err = put(&app, &doc_update(&carol, &doc, "/doc", b"carol")).unwrap_err();
+        assert!(err.contains("author and editors"), "{err}");
+        let err = put(&app, &doc_update(&bob, &doc, "/doc/x", b"elsewhere")).unwrap_err();
+        assert!(err.contains("at its path"), "{err}");
+        let not_a_doc = post(&bob, "/post/x", "hi", None, 1);
+        put(&app, &not_a_doc).unwrap();
+        let err = put(&app, &doc_update(&bob, &not_a_doc, "/post/x", b"x")).unwrap_err();
+        assert!(err.contains("no live doc"), "{err}");
+
+        // Bob invites whoever opens a claim link, which he makes next to the doc; carol opens it.
+        let token = [42u8; 32];
+        let claim_rec = sign(&bob, "/doc", "claim", ClaimData { token_hash: Sha256::digest(token).into(), user: None }.to_cbor(), None, 1);
+        put(&app, &claim_rec).expect("claims go anywhere one may write");
+        let v2 = sign(&bob, "/doc", "doc", DocData { title: "Plans".into(), editors: vec![Who::Claim(claim_rec.hash())] }.to_cbor(), Some(&doc), 2);
+        put(&app, &v2).unwrap();
+        let app = Arc::new(app);
+        let sig = carol.sign(&claim_signed_bytes(&app.pk, &token)).to_bytes();
+        let c = Claim { token: encode_b58(&token), user: encode_id(&id(&carol)), signature: encode_b58(&sig) };
+        assert_eq!(claim(State(app.clone()), Json(c)).await.status(), StatusCode::OK);
+        let claimed = claim_head(&app.db.lock().unwrap(), &claim_rec.hash()).unwrap();
+        assert_eq!(claimed.1.user, Some(id(&carol)));
+        let path: String = app.db.lock().unwrap().query_row("SELECT path FROM records WHERE hash = ?1", [claimed.0], |r| r.get(0)).unwrap();
+        assert_eq!(path, "/doc", "the node's version stays where the claim was");
+        let carols = doc_update(&carol, &doc, "/doc", b"carol");
+        put(&app, &carols).unwrap();
+
+        let err = put(&app, &tombstone(&bob, &carols, 2)).unwrap_err();
+        assert!(err.contains("never edited or deleted"), "{err}");
+
+        let (all, seq) = updates(&app, &doc, 0).await;
+        assert_eq!(all, [b"bob".to_vec(), b"alice".to_vec(), b"carol".to_vec()]);
+        assert_eq!(updates(&app, &doc, seq).await, (vec![], seq));
+        let list = list_records(State(app.clone()), HeaderMap::new(), Query(RecordsQuery { author: None, kind: None, prefix: Some("/doc".into()) })).await;
+        let kinds: Vec<String> = CBOR::try_from_data(body(list).await)
+            .unwrap()
+            .into_array()
+            .unwrap()
+            .iter()
+            .map(|e| Record::from_cbor(&e.as_map().unwrap().get::<_, CBOR>("record").unwrap()).unwrap().kind)
+            .collect();
+        assert!(!kinds.contains(&"doc_update".into()), "listing leaves out doc updates: {kinds:?}");
+
+        // Claims stay on their node.
+        let mut h = HeaderMap::new();
+        h.insert("x-from", encode_id(&[7; 32]).parse().unwrap());
+        let other = sign(&bob, "/doc", "claim", ClaimData { token_hash: [1; 32], user: None }.to_cbor(), None, 3);
+        let res = receive(State(app.clone()), h, cbor_array(&[other.to_bytes()]).into()).await;
+        let results: Vec<String> = serde_json::from_slice(&body(res).await).unwrap();
+        assert!(results[0].contains("claims aren't federated"), "{}", results[0]);
+
+        // Deleting the doc ends it.
+        put(&app, &tombstone(&bob, &v2, 3)).unwrap();
+        let err = put(&app, &doc_update(&bob, &doc, "/doc", b"late")).unwrap_err();
+        assert!(err.contains("no live doc"), "{err}");
+        let res = doc_updates(State(app.clone()), Path(encode_b58(&doc.hash())), Query(UpdatesQuery { after: None })).await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
     }
 }

@@ -45,7 +45,7 @@ npm run dev:fresh
    - /node/owner contains all owner records.
    - /node/grant contains all user authorization grant records (e.g. anyone can create a record under /post)
    - /node/peer contains all node peer federation records (other server instances to push records to)
-   - /node/claim lists one-time-use token records, which can be pointed to to grant permissions to an as-of-yet-unknown user. The tokens in these records are set by the author and never shared by the server, although the existence of them is known. On claim, they are edited to reference the claiming user.
+   - Claims, which can live anywhere, are one-time-use token records, which can be pointed to to grant permissions to an as-of-yet-unknown user. The tokens in these records are set by the author and never shared by the server, although the existence of them is known. On claim, they are edited to reference the claiming user.
    - /node/info has a "node" record listing info (just URL for now).
    - /node records are not federated / pushed to other servers.
    - Other paths will be usage & applicaton specific - for now, we have /post (use singular!) for random text posts.

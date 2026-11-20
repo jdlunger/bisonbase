@@ -72,9 +72,9 @@ export async function loadNode() {
 /** Who claimed each claim on this node (by its hash, base58): their ID, or null while unclaimed. */
 const claims = new Map<string, string | null>();
 
-/** Loads who claimed which claim, for showing owner and grant records that name claims. */
-async function loadClaims() {
-  const list = await getPosts({ type: "claim", prefix: CLAIM_PATH });
+/** Loads who claimed which claim, for showing owner, grant and doc records that name claims. */
+export async function loadClaims() {
+  const list = await getPosts({ type: "claim" });
   claims.clear();
   for (const c of list) if (c.verified && c.claim) claims.set(c.root, c.claim.claimedBy?.pubkey ?? null);
 }
@@ -432,6 +432,8 @@ export type Post = {
   nodeUrl?: string;
   /** For an owner record: who. */
   owner?: Party;
+  /** For a doc: its title, and who may edit it besides its author (`by`). */
+  doc?: { title: string; editors: Party[] };
 };
 
 const bytesEqual = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((x, i) => x === b[i]);
@@ -472,6 +474,7 @@ export function viewPost(rec: Rec, chain?: { root: Uint8Array; by?: Uint8Array; 
     claim: rec.claim && { claimedBy: rec.claim.user ? toUser(rec.claim.user) : null },
     nodeUrl: rec.nodeUrl,
     owner: rec.owner && toParty(rec.owner),
+    doc: rec.doc && { title: rec.doc.title, editors: rec.doc.editors.map(toParty) },
     rec,
     hash: b58(rec.hash),
     root: b58(chain?.root ?? rec.hash),
@@ -573,11 +576,12 @@ export async function myGrants(): Promise<string[]> {
 /** Who a form names: a user (ID), a new claim link, or (for grants) anyone. */
 export type Choice = { kind: "user"; id: string } | { kind: "claim" } | { kind: "anyone" };
 
-/** A new claim, made by us (an owner), to name in an owner or grant record. */
-async function newClaim() {
+/** A new claim, made by us, to name in an owner, grant or doc record. It goes at `path`: owners' under
+ * /node, others' wherever they may write. */
+async function newClaim(path = CLAIM_PATH) {
   const token = random(32);
   const tokenHash = new Uint8Array(await crypto.subtle.digest("SHA-256", token));
-  const hash = await putRec({ author: keys!.pk, path: CLAIM_PATH, version: nextVersion(), type: "claim", data: { tokenHash } });
+  const hash = await putRec({ author: keys!.pk, path, version: nextVersion(), type: "claim", data: { tokenHash } });
   return { who: { claim: unb58(hash)! } as Who, link: `${location.origin}/claim#${b58(token)}` };
 }
 
@@ -610,18 +614,19 @@ export async function addOwner(c: Choice): Promise<Written> {
 }
 
 /** What a claim link's token is for: its claim (null if this node has none with that token), and the
- * owner and grant records that name it. */
+ * owner, grant and doc records that name it. */
 export async function findClaim(token: string) {
   const t = unb58(token);
   if (!t) throw new Error("This claim link is broken: its token isn't base58.");
   const tokenHash = new Uint8Array(await crypto.subtle.digest("SHA-256", t as Uint8Array<ArrayBuffer>));
-  const records = await getPosts({ prefix: "/node" });
-  const claim = records.find((p) => p.verified && p.rec.claim && bytesEqual(p.rec.claim.tokenHash, tokenHash)) ?? null;
+  const [claims, records, docs] = await Promise.all([getPosts({ type: "claim" }), getPosts({ prefix: "/node" }), getPosts({ type: "doc" })]);
+  const claim = claims.find((p) => p.verified && p.rec.claim && bytesEqual(p.rec.claim.tokenHash, tokenHash)) ?? null;
   const names = (w?: Party) => !!claim && w?.claim === claim.root;
   return {
     claim,
     owner: records.some((p) => p.verified && names(p.owner)),
     grants: records.filter((p) => p.verified && p.grant?.grantees !== "anyone" && p.grant?.grantees.some(names)).map((p) => p.grant!.path),
+    docs: docs.filter((p) => p.verified && p.doc?.editors.some(names)),
   };
 }
 
@@ -638,9 +643,9 @@ export async function redeemClaim(token: string) {
 
 // ---- writing posts ----
 
-/** Whether we may edit or delete this record: we wrote it, or we own this node. */
+/** Whether we may edit or delete this record: we wrote it, or we own this node. (Doc updates never change.) */
 export const canEdit = (p: Post) =>
-  !!keys && p.rec.type !== "node" && (amOwner() || (p.by?.pubkey === keys.pubkey && !pathWithin(p.rec.path, "/node")));
+  !!keys && p.rec.type !== "node" && p.rec.type !== "doc_update" && (amOwner() || (p.by?.pubkey === keys.pubkey && !pathWithin(p.rec.path, "/node")));
 
 /** Creates a post at `path`, or edits `existing` (possibly moving it to `path`). `isPrivate`: only this
  * node's owners may read it, and it's never federated. Returns its hash. */
@@ -714,4 +719,77 @@ export async function putPeer(url: string, types: string, paths: string) {
     type: "peer",
     data: { node: decodeId(node)!, url, ...(t.length && { types: t }), ...(p.length && { paths: p }) },
   });
+}
+
+// ---- shared documents ----
+//
+// A doc is a "doc" chain: its title, and who may edit it besides its author. Its text is a Yjs CRDT,
+// built from "doc_update" records, each a signed batch of Yjs updates naming the doc by its chain's
+// hash. They merge in any order, so it doesn't matter how they get here. See core/src/lib.rs.
+
+export const DOC_PATH = "/doc";
+
+/** Starts a doc at `path`. Returns its hash (base58): its chain's, for good. */
+export async function createDoc(path = DOC_PATH, title = "") {
+  if (!keys) throw new Error("Sign in first.");
+  return putRec({ author: keys.pk, path: normalizePath(path), version: nextVersion(), type: "doc", data: { title, editors: [] } });
+}
+
+/** Writes a new version of `doc` with this title and these editors. Its author or an owner only. */
+async function saveDoc(doc: Post, title: string, editors: Who[]) {
+  if (!keys) throw new Error("Sign in first.");
+  return putRec({
+    author: keys.pk,
+    path: doc.rec.path,
+    version: nextVersion(doc.rec.version),
+    type: "doc",
+    edits: doc.rec.hash,
+    data: { title: title.trim(), editors },
+  });
+}
+
+const editorsOf = (doc: Post) => doc.rec.doc?.editors ?? [];
+
+export const renameDoc = (doc: Post, title: string) => saveDoc(doc, title, editorsOf(doc));
+
+/** Lets the user with this ID edit `doc`. */
+export async function addDocEditor(doc: Post, id: string) {
+  const pk = decodeId(id.trim());
+  if (!pk) throw new Error("That isn't an ID (32 bytes of base58).");
+  if (doc.doc?.editors.some((e) => e.user?.pubkey === b58(pk)) || doc.by?.pubkey === b58(pk)) throw new Error("They can already edit it.");
+  return saveDoc(doc, doc.doc!.title, [...editorsOf(doc), { user: pk }]);
+}
+
+/** Stops `doc`'s `i`th editor from editing it. What they wrote stays. */
+export const removeDocEditor = (doc: Post, i: number) => saveDoc(doc, doc.doc!.title, editorsOf(doc).filter((_, j) => j !== i));
+
+/** Makes a claim link, next to `doc`, for whoever opens it to become an editor. Returns the link. */
+export async function inviteToDoc(doc: Post) {
+  const { who, link } = await newClaim(doc.rec.path);
+  await saveDoc(doc, doc.doc!.title, [...editorsOf(doc), who]);
+  return link;
+}
+
+/** Whether `pubkey` may write updates to `doc`: they started it, it names them as an editor, or they own
+ * this node. Checked here for every update, as peers pass records along without checking. */
+export const mayEditDoc = (doc: Post, pubkey: string) =>
+  doc.by?.pubkey === pubkey || !!doc.doc?.editors.some((e) => e.user?.pubkey === pubkey) || !!thisNode?.owners.includes(pubkey);
+
+/** Whether some editor of `doc` is named by a claim we don't know to be claimed (as of `loadClaims`). */
+export const docHasOpenClaims = (doc: Post) => !!doc.doc?.editors.some((e) => e.claim && !e.user);
+
+/** `doc`'s updates that arrived at this node after `after` (0 for all), in order; where to continue
+ * from; and the hash of the doc's current version (base58). null if the doc's gone. */
+export async function getDocUpdates(root: string, after: number) {
+  const res = await fetch(`/api/docs/${root}/updates?after=${after}`);
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error((await res.text()) || res.statusText);
+  const updates = decodeRecords(new Uint8Array(await res.arrayBuffer()));
+  return { updates, seq: Number(res.headers.get("x-seq")), head: res.headers.get("x-doc-head")! };
+}
+
+/** Writes a Yjs update to `doc`'s text, as us. */
+export async function putDocUpdate(doc: Post, update: Uint8Array) {
+  if (!keys) throw new Error("Sign in first.");
+  return putRec({ author: keys.pk, path: doc.rec.path, version: nextVersion(), type: "doc_update", data: { doc: unb58(doc.root)!, update } });
 }

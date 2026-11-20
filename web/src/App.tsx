@@ -4,7 +4,9 @@ import {
   type Passkey,
   type RecentPasskey,
   type User,
+  DOC_PATH,
   amOwner,
+  createDoc,
   deriveFromExistingPasskey,
   findClaim,
   deriveFromNewPasskey,
@@ -25,8 +27,9 @@ import {
   userPhrase,
 } from "./api.ts";
 import { Compose, type Draft, NoteEditor } from "./NoteList.tsx";
+import { DocPage } from "./Doc.tsx";
 import { PathPage, RecordPage, UserPage } from "./Record.tsx";
-import { Link, idPath, navigate, recordPath, useRoute } from "./router.tsx";
+import { Link, docPath, idPath, navigate, recordPath, useRoute } from "./router.tsx";
 import { type Run, link, hl, primary, secondary, useLoad } from "./ui.ts";
 
 /** A recently used passkey, with its keys' phrase. */
@@ -101,6 +104,9 @@ function Shell({ initialError }: { initialError: string | null }) {
   // "New post" goes where we're looking, if we may write there; else the first place we may.
   const here = route.page === "path" && route.path !== "/" ? route.path : null;
   const newPost = () => open(here && canWrite(here) ? here : owner || !grants.length ? "/post" : grants[0]);
+  // A new doc goes where we're looking too, if we may write there; else under /doc.
+  const docHere = here && pathWithin(here, DOC_PATH) && canWrite(here) ? here : canWrite(DOC_PATH) ? DOC_PATH : null;
+  const newDoc = run(async () => navigate(docPath(await createDoc(docHere!))));
 
   return (
     <Compose.Provider value={{ canWrite, open, writable: owner ? ["/"] : grants }}>
@@ -120,6 +126,11 @@ function Shell({ initialError }: { initialError: string | null }) {
             )}
           </div>
           <div className="flex items-center gap-2">
+            {me && docHere && (
+              <button className={secondary} disabled={busy} onClick={newDoc}>
+                + New doc
+              </button>
+            )}
             {me && !draft && (
               <button className={primary} disabled={busy} onClick={newPost}>
                 + New post
@@ -153,6 +164,8 @@ function Shell({ initialError }: { initialError: string | null }) {
             <Claim me={me} busy={busy} run={run} tick={tick} />
           ) : route.page === "user" ? (
             <UserPage pubkey={route.pubkey} node={node} me={me} busy={busy} run={run} tick={tick} />
+          ) : route.page === "doc" ? (
+            <DocPage hash={route.hash} me={me} busy={busy} run={run} tick={tick} />
           ) : route.page === "record" ? (
             <RecordPage hash={route.hash} me={me} busy={busy} run={run} tick={tick} />
           ) : (
@@ -178,7 +191,7 @@ function Claim({ me, busy, run, tick }: { me: User | null; busy: boolean; run: R
   if (!token) return box(<p>This link is missing its token. Use the whole link.</p>);
   if (error) return box(<p className="text-red-700">{error}</p>);
   if (!data) return box(<p className="text-gray-500">Loading…</p>);
-  const { claim, owner, grants } = data;
+  const { claim, owner, grants, docs } = data;
   if (!claim) return box(<p>This link isn't for this node, or its claim was deleted.</p>);
   const by = claim.claim?.claimedBy;
   if (by) {
@@ -202,7 +215,15 @@ function Claim({ me, busy, run, tick }: { me: User | null; busy: boolean; run: R
             🔑 Writing at or under <code className="font-mono">{g}</code>
           </li>
         ))}
-        {!owner && !grants.length && <li>Nothing yet (no owner or grant record names it)</li>}
+        {docs.map((d) => (
+          <li key={d.root}>
+            📄 Editing the doc{" "}
+            <Link href={docPath(d.root)} className={`font-semibold ${link}`}>
+              {d.doc!.title || "Untitled"}
+            </Link>
+          </li>
+        ))}
+        {!owner && !grants.length && !docs.length && <li>Nothing yet (no owner, grant or doc record names it)</li>}
       </ul>
       {me ? (
         <button
@@ -211,7 +232,7 @@ function Claim({ me, busy, run, tick }: { me: User | null; busy: boolean; run: R
           onClick={run(async () => {
             await redeemClaim(token);
             history.replaceState(null, "", location.pathname); // the token is spent
-            navigate(idPath(me.pubkey));
+            navigate(docs.length === 1 && !owner && !grants.length ? docPath(docs[0].root) : idPath(me.pubkey));
           })}
         >
           Claim as <span className={hl(me.phrase)}>{me.phrase}</span>

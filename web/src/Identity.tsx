@@ -88,7 +88,7 @@ function Saved({ saved, children }: { saved: Written | null; children?: React.Re
 }
 
 /** A new claim link, to pass on. It's only shown this once: the node keeps just its token's hash. */
-function ClaimLink({ link }: { link: string }) {
+export function ClaimLink({ link }: { link: string }) {
   return (
     <div className="flex flex-col gap-3 rounded-lg bg-amber-50 p-3 ring-1 ring-amber-200 sm:flex-row sm:items-start">
       <QrCode text={link} className="w-32 shrink-0 self-center rounded ring-1 ring-gray-200 sm:self-start" />

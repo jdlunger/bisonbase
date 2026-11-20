@@ -21,8 +21,8 @@ export function navigate(to: string) {
   listeners.forEach((fn) => fn());
 }
 
-// Routes: /u/<ID> a user's page, /r/<hash> a record (and its edits), /claim a node's claim link, and any
-// other path the records at or under that path.
+// Routes: /u/<ID> a user's page, /r/<hash> a record (and its edits), /d/<hash> a shared doc, /claim a
+// claim link, and any other path the records at or under that path.
 
 /** A user's page. */
 export const idPath = (pubkey: string) => `/u/${pubkey}`;
@@ -30,12 +30,16 @@ export const idPath = (pubkey: string) => `/u/${pubkey}`;
 /** The page for one record, by its chain's hash (base58). */
 export const recordPath = (hash: string) => `/r/${hash}`;
 
+/** A shared doc's page, by its chain's hash (base58). */
+export const docPath = (hash: string) => `/d/${hash}`;
+
 /** The page for a path ("/" for everything), each segment URL-encoded. */
 export const pathPath = (path: string) => path.split("/").map(encodeURIComponent).join("/") || "/";
 
 export type Route =
   | { page: "user"; pubkey: string }
   | { page: "record"; hash: string }
+  | { page: "doc"; hash: string }
   | { page: "claim" }
   | { page: "path"; path: string };
 
@@ -44,6 +48,7 @@ export function useRoute(): Route {
   let m;
   if ((m = p.match(/^\/u\/([^/]+)\/?$/))) return { page: "user", pubkey: decodeURIComponent(m[1]) };
   if ((m = p.match(/^\/r\/([^/]+)\/?$/))) return { page: "record", hash: decodeURIComponent(m[1]) };
+  if ((m = p.match(/^\/d\/([^/]+)\/?$/))) return { page: "doc", hash: decodeURIComponent(m[1]) };
   if (p === "/claim") return { page: "claim" };
   return { page: "path", path: p.replace(/\/+$/, "").split("/").map(decodeURIComponent).join("/") || "/" };
 }

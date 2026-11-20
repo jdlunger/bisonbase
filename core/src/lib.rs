@@ -105,6 +105,7 @@ fn as_map<'a>(v: &'a CBOR, what: &str) -> Result<&'a Map, String> {
 //                         any number of records share a path
 //   version    uint       ms since the epoch, by the author's clock
 //   type       text       what `data` holds: "post" (data: text), "tombstone" (data: null, a delete),
+//                         "claim" (see `ClaimData`), "doc" / "doc_update" (see "shared documents"),
 //                         or one of the node types below
 //   data       any        the content, per `type`
 //   edits      bytes(32)? the hash of the version this one edits (or, for a tombstone, deletes): the
@@ -152,23 +153,25 @@ const RECORD_FIELDS: [&str; 8] = ["author", "path", "version", "type", "data", "
 //   /node/owner  type "owner", data a `Who`: one per owner
 //   /node/grant  type "grant" (see `GrantData`): lets users write at or under a path
 //   /node/peer   type "peer" (see `PeerData`): has the node push records to another node
-//   /node/claim  type "claim" (see `ClaimData`): a one-time link, for a user nobody knows yet
 //
 // Owners write all of these (except /node/info) and may write anything, anywhere. Others need a grant
 // covering the path, except to edit or delete their own records. A node checks all of that when a
 // record is written to it, against its own /node records; records pushed by peers are taken as they are.
 //
-// Owner and grant records name users directly, or name a claim: then they're for whoever claims it.
-// A claim holds the SHA-256 of a random token; the token itself only travels in the claim link. Whoever
-// opens the link signs `claim_signed_bytes` with it, and the node then writes a new version of the claim
-// naming them. On a fresh database the node writes a claim and an owner record naming it, and prints the
-// link: that's how a node gets its first owner.
+// Owner, grant and doc records name users directly, or name a claim: then they're for whoever claims
+// it. A claim (type "claim", at any path: the node's own go under /node/claim) holds the SHA-256 of a
+// random token; the token itself only travels in the claim link. Whoever opens the link signs
+// `claim_signed_bytes` with it, and the node then writes a new version of the claim naming them. Claims
+// are never federated: they only mean something on the node that holds the token's hash. On a fresh
+// database the node writes a claim and an owner record naming it, and prints the link: that's how a
+// node gets its first owner.
 
 pub const NODE_PATH: &str = "/node";
 pub const NODE_INFO_PATH: &str = "/node/info";
 pub const OWNER_PATH: &str = "/node/owner";
 pub const GRANT_PATH: &str = "/node/grant";
 pub const PEER_PATH: &str = "/node/peer";
+/// Where the node's own claims go, and owners' by default. Others' claims may go anywhere they may write.
 pub const CLAIM_PATH: &str = "/node/claim";
 
 pub const CLAIM_CONTEXT: &[u8] = b"bisonbase-claim-v2\n";
@@ -371,6 +374,77 @@ impl PeerData {
     }
 }
 
+// ---- shared documents ----
+//
+// A document is a "doc" chain, named by its first record's hash. Its data holds the title and who may
+// edit it besides its author; only the author (or the node's owners) edits that, as with any chain. The
+// text is a Yjs CRDT, built from "doc_update" records: each a signed batch of Yjs updates naming its
+// doc. Updates merge in any order and any number of times, so they arrive however federation brings
+// them. They're never edited or deleted; deleting the doc deletes them all.
+//
+// A node takes an update from the doc's author, its editors and the node's owners, for a live doc,
+// at the doc's current path. Readers check the authors themselves (see `DocData::may_edit`), as peers
+// pass along records without checking who may write them. Neither is ever private, for now.
+
+/// A "doc" record's data: its title, and who may edit its text besides its author.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DocData {
+    pub title: String,
+    pub editors: Vec<Who>,
+}
+
+impl DocData {
+    pub fn from_cbor(v: &CBOR) -> Result<Self, String> {
+        let m = as_map(v, "a doc's data")?;
+        let d = DocData {
+            title: field(m, "title", text)?,
+            editors: field(m, "editors", |v| Some(v.as_array()?.to_vec()))?.iter().map(Who::from_cbor).collect::<Result<_, _>>()?,
+        };
+        if d.title.trim() != d.title {
+            return Err("a doc's title must be trimmed".into());
+        }
+        Ok(d)
+    }
+
+    pub fn to_cbor(&self) -> CBOR {
+        let mut m = Map::new();
+        m.insert("title", self.title.as_str());
+        m.insert("editors", self.editors.iter().map(Who::to_cbor).collect::<Vec<_>>());
+        m.into()
+    }
+
+    /// Whether `user` may write updates to the doc, which `author` started, given who claimed what (see
+    /// `Who::resolve`). The node's owners may too; that's up to the node.
+    pub fn may_edit(&self, author: &Pubkey, user: &Pubkey, claimed: impl Fn(&Hash) -> Option<Pubkey>) -> bool {
+        author == user || self.editors.iter().any(|w| w.resolve(&claimed).as_ref() == Some(user))
+    }
+}
+
+/// A "doc_update" record's data: the doc (its chain's first record's hash), and a Yjs update to its text.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DocUpdateData {
+    pub doc: Hash,
+    pub update: Vec<u8>,
+}
+
+impl DocUpdateData {
+    pub fn from_cbor(v: &CBOR) -> Result<Self, String> {
+        let m = as_map(v, "a doc update's data")?;
+        let d = DocUpdateData { doc: field(m, "doc", bytes)?, update: field(m, "update", |v| v.as_byte_string().map(<[u8]>::to_vec))? };
+        if d.update.is_empty() {
+            return Err("a doc update can't be empty".into());
+        }
+        Ok(d)
+    }
+
+    pub fn to_cbor(&self) -> CBOR {
+        let mut m = Map::new();
+        m.insert("doc", CBOR::to_byte_string(self.doc));
+        m.insert("update", CBOR::to_byte_string(&self.update));
+        m.into()
+    }
+}
+
 /// Paths: "/" then one or more "/"-separated segments. Segments are non-empty, not "." or "..",
 /// and free of control characters; the whole is at most MAX_PATH_BYTES. Case matters. (Paths in
 /// records are Unicode NFC, as all dCBOR text is.)
@@ -418,7 +492,6 @@ fn node_type_path(kind: &str) -> Option<&'static str> {
         "owner" => OWNER_PATH,
         "grant" => GRANT_PATH,
         "peer" => PEER_PATH,
-        "claim" => CLAIM_PATH,
         _ => return None,
     })
 }
@@ -452,6 +525,16 @@ impl Record {
     /// A claim record's data.
     pub fn claim(&self) -> Option<ClaimData> {
         (self.kind == "claim").then(|| ClaimData::from_cbor(&self.data).ok()).flatten()
+    }
+
+    /// A doc record's data.
+    pub fn doc(&self) -> Option<DocData> {
+        (self.kind == "doc").then(|| DocData::from_cbor(&self.data).ok()).flatten()
+    }
+
+    /// A doc update's data.
+    pub fn doc_update(&self) -> Option<DocUpdateData> {
+        (self.kind == "doc_update").then(|| DocUpdateData::from_cbor(&self.data).ok()).flatten()
     }
 
     /// Whether it's one of a node's own records, which are never federated.
@@ -511,7 +594,7 @@ impl Record {
         check_path(&self.path)?;
         match node_type_path(&self.kind) {
             Some(p) if self.path != p => return Err(format!("a {} record belongs at {p}", self.kind)),
-            None if self.kind != "tombstone" && self.is_node_record() => {
+            None if !["tombstone", "claim"].contains(&self.kind.as_str()) && self.is_node_record() => {
                 return Err(format!("{NODE_PATH} is for the node's own records, not {:?}", self.kind));
             }
             _ => {}
@@ -536,6 +619,14 @@ impl Record {
             }
             "claim" => {
                 ClaimData::from_cbor(&self.data)?;
+            }
+            "doc" | "doc_update" if self.private => return Err(format!("a {} can't be private", self.kind)),
+            "doc" => {
+                DocData::from_cbor(&self.data).map_err(|e| format!("doc: {e}"))?;
+            }
+            "doc_update" if self.edits.is_some() => return Err("doc updates are never edited".into()),
+            "doc_update" => {
+                DocUpdateData::from_cbor(&self.data)?;
             }
             _ => return Err(format!("unknown record type {:?}", self.kind)),
         }
@@ -640,11 +731,39 @@ mod tests {
         assert!(signed(&key, OWNER_PATH, "owner", both.into(), None).check().is_err());
 
         let c = ClaimData { token_hash: [5; 32], user: None };
+        signed(&key, "/doc", "claim", c.to_cbor(), None).check().expect("claims go anywhere");
         assert_eq!(ClaimData::from_cbor(&c.to_cbor()).unwrap(), c);
         let claimed = ClaimData { user: Some([2; 32]), ..c.clone() };
         let r = signed(&key, CLAIM_PATH, "claim", claimed.to_cbor(), None);
         r.check().unwrap();
         assert_eq!(r.claim(), Some(claimed));
+    }
+
+    #[test]
+    fn docs() {
+        let key = SigningKey::from_bytes(&[1; 32]);
+        let d = DocData { title: "Notes".into(), editors: vec![Who::User([2; 32]), Who::Claim([9; 32])] };
+        assert_eq!(DocData::from_cbor(&d.to_cbor()).unwrap(), d);
+        let r = signed(&key, "/doc", "doc", d.to_cbor(), None);
+        r.check().unwrap();
+        assert_eq!(r.doc(), Some(d.clone()));
+        let author = key.verifying_key().to_bytes();
+        let none = |_: &Hash| None;
+        assert!(d.may_edit(&author, &author, none) && d.may_edit(&author, &[2; 32], none) && !d.may_edit(&author, &[3; 32], none));
+        assert!(d.may_edit(&author, &[3; 32], |c: &Hash| (*c == [9; 32]).then_some([3; 32])), "via a claim");
+        assert!(signed(&key, "/doc", "doc", DocData { title: " x".into(), ..d.clone() }.to_cbor(), None).check().is_err());
+
+        let u = DocUpdateData { doc: r.hash(), update: vec![1, 2, 3] };
+        assert_eq!(DocUpdateData::from_cbor(&u.to_cbor()).unwrap(), u);
+        let ur = signed(&key, "/doc", "doc_update", u.to_cbor(), None);
+        ur.check().unwrap();
+        assert_eq!(ur.doc_update(), Some(u.clone()));
+        assert!(signed(&key, "/doc", "doc_update", DocUpdateData { update: vec![], ..u.clone() }.to_cbor(), None).check().is_err());
+        assert!(signed(&key, "/doc", "doc_update", u.to_cbor(), Some(ur.hash())).check().is_err(), "never edited");
+        let mut p = ur.clone();
+        p.private = true;
+        p.signature = key.sign(&p.signed_bytes()).to_bytes();
+        assert!(p.check().is_err(), "never private");
     }
 
     #[test]

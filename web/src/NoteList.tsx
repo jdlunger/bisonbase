@@ -1,6 +1,6 @@
 import { createContext, useContext, useState } from "react";
-import { type Party, type Post, type User, canEdit, deletePost, pathWithin, putPost } from "./api.ts";
-import { Link, idPath, pathPath, recordPath } from "./router.tsx";
+import { type Party, type Post, type User, b58, canEdit, deletePost, pathWithin, putPost } from "./api.ts";
+import { Link, docPath, idPath, pathPath, recordPath } from "./router.tsx";
 import { type Run, badge, danger, fmtTime, input, link, hl, primary, secondary, textarea } from "./ui.ts";
 
 /** Post text, the path to file it under, and whether only this node's owners may read it. */
@@ -77,7 +77,7 @@ const typeColors = [
   "bg-orange-50 text-orange-700 ring-orange-200",
   "bg-lime-50 text-lime-700 ring-lime-200",
 ];
-const knownTypes: Record<string, number> = { post: 0, grant: 1, tombstone: 2, node: 6, owner: 6, peer: 6, claim: 6 };
+const knownTypes: Record<string, number> = { post: 0, grant: 1, tombstone: 2, node: 6, owner: 6, peer: 6, claim: 6, doc: 5, doc_update: 5 };
 
 function typeColor(type: string) {
   if (type in knownTypes) return typeColors[knownTypes[type]];
@@ -114,7 +114,7 @@ export function PathLinks({ path, className = "" }: { path: string; className?: 
 }
 
 /** Who an owner or grant record names: a user, or a claim link (and who claimed it, once someone has). */
-function PartyLink({ party, me }: { party: Party; me: User | null }) {
+export function PartyLink({ party, me }: { party: Party; me: User | null }) {
   const user = party.user && <UserLink user={party.user} me={me} className="font-semibold" />;
   if (!party.claim) return user;
   const claim = (
@@ -189,6 +189,30 @@ function Content({ post: n, me }: { post: Post; me: User | null }) {
     return (
       <p className="mt-1">
         👑 Owned by <PartyLink party={n.owner} me={me} />
+      </p>
+    );
+  }
+  if (n.doc) {
+    const editors = n.doc.editors.length;
+    return (
+      <p className="mt-1">
+        📄{" "}
+        <Link href={docPath(n.root)} className={`font-semibold ${link}`}>
+          {n.doc.title || "Untitled"}
+        </Link>
+        <span className="text-sm text-gray-500"> · a shared doc{editors > 0 && `, with ${editors} more editor${editors > 1 ? "s" : ""}`}</span>
+      </p>
+    );
+  }
+  if (n.rec.docUpdate) {
+    const doc = b58(n.rec.docUpdate.doc);
+    return (
+      <p className="mt-1 text-sm">
+        ✏️ An edit to the doc{" "}
+        <Link href={docPath(doc)} className={`font-mono ${link}`}>
+          #{doc.slice(0, 8)}
+        </Link>{" "}
+        <span className="text-gray-500">({n.rec.docUpdate.update.length} bytes of Yjs update)</span>
       </p>
     );
   }

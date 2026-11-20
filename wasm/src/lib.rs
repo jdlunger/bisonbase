@@ -2,7 +2,7 @@
 //! Built into wasm/pkg by `npm run wasm`.
 
 use fedcrdt_core::{
-    CBOR, ClaimData, GrantData, Grantees, Map, PeerData, Record, Who, check_path, check_prefix, claim_signed_bytes, decode_b58,
+    CBOR, ClaimData, DocData, DocUpdateData, GrantData, Grantees, Map, PeerData, Record, Who, check_path, check_prefix, claim_signed_bytes, decode_b58,
     decode_id, encode_b58, node_phrase, path_within, phrase, read_signed_bytes, two_words,
 };
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,12 @@ export type PeerData = { node: Uint8Array; url: string; types?: string[]; paths?
 
 /** A claim's data: SHA-256 of its link's token, and who claimed it, once someone has. */
 export type ClaimData = { tokenHash: Uint8Array; user?: Uint8Array };
+
+/** A doc's data: its title, and who may edit its text besides its author. */
+export type DocData = { title: string; editors: Who[] };
+
+/** A doc update's data: the doc (its chain's first record's hash) and a Yjs update to its text. */
+export type DocUpdateData = { doc: Uint8Array; update: Uint8Array };
 
 /** A record, decoded and checked. Field by field, see core/src/lib.rs. */
 export type Rec = {
@@ -48,6 +54,8 @@ export type Rec = {
   nodeUrl?: string;
   /** An owner record's user. */
   owner?: Who;
+  doc?: DocData;
+  docUpdate?: DocUpdateData;
 };
 
 /** A chain's current version, as GET /api/records lists them: `root` is the chain's first record's
@@ -55,7 +63,7 @@ export type Rec = {
 export type Entry = { rec: Rec; root: Uint8Array; by?: Uint8Array; versions: number };
 
 /** A record to sign and write. `data` is the text of a "post", null for a "tombstone", or a grant's,
- * peer record's, claim's or owner record's data. */
+ * peer record's, claim's, owner record's, doc's or doc update's data. */
 export type Draft = {
   author: Uint8Array;
   path: string;
@@ -63,7 +71,7 @@ export type Draft = {
   type: string;
   edits?: Uint8Array;
   private: boolean;
-  data: string | null | GrantData | PeerData | ClaimData | Who;
+  data: string | null | GrantData | PeerData | ClaimData | Who | DocData | DocUpdateData;
 };
 "#;
 
@@ -115,6 +123,22 @@ struct RecJs {
     node_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     owner: Option<WhoJs>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    doc: Option<DocJs>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    doc_update: Option<DocUpdateJs>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct DocJs {
+    title: String,
+    editors: Vec<WhoJs>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct DocUpdateJs {
+    doc: ByteBuf,
+    update: ByteBuf,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -198,6 +222,8 @@ fn rec_js(r: &Record) -> RecJs {
         claim: r.claim().map(|c| ClaimJs { token_hash: buf(&c.token_hash), user: c.user.map(|u| buf(&u)) }),
         node_url: r.node_url(),
         owner: r.owner().as_ref().map(WhoJs::from),
+        doc: r.doc().map(|d| DocJs { title: d.title, editors: d.editors.iter().map(WhoJs::from).collect() }),
+        doc_update: r.doc_update().map(|u| DocUpdateJs { doc: buf(&u.doc), update: ByteBuf::from(u.update) }),
     }
 }
 
@@ -267,6 +293,8 @@ enum DataJs {
     Peer(PeerJs),
     Claim(ClaimJs),
     Owner(WhoJs),
+    Doc(DocJs),
+    DocUpdate(DocUpdateJs),
 }
 
 fn record(draft: JsValue, signature: [u8; 64]) -> Result<Record> {
@@ -288,6 +316,8 @@ fn record(draft: JsValue, signature: [u8; 64]) -> Result<Record> {
             ClaimData { token_hash: fixed(&c.token_hash, "tokenHash")?, user: c.user.map(|u| fixed(&u, "user")).transpose()? }.to_cbor()
         }
         Some(DataJs::Owner(w)) => w.to()?.to_cbor(),
+        Some(DataJs::Doc(d)) => DocData { title: d.title, editors: d.editors.iter().map(WhoJs::to).collect::<Result<_>>()? }.to_cbor(),
+        Some(DataJs::DocUpdate(u)) => DocUpdateData { doc: fixed(&u.doc, "doc")?, update: u.update.into_vec() }.to_cbor(),
     };
     Ok(Record {
         author: fixed(&d.author, "author")?,
