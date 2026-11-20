@@ -1,17 +1,19 @@
 # federated crdt
 
-Simple Rust web server that:
+Simple Rust web server (a **node**) that:
  - Serves a React + Tailwind SPA
- - Shares one Rust core (`core/`: record format, signing, checks, IDs and phrases) between the server and the SPA, which loads it as wasm (`wasm/`)
+ - Shares one Rust core (`core/`: record format, signing, checks, IDs and phrases) between the node and the SPA, which loads it as wasm (`wasm/`)
  - Uses SQLite (users, records); no sessions: every write is signed by its author
  - On main page, offers A) a list of all users (if any) and B) "Derive keys: [with new passkey] [with existing passkey]"; once derived, shows "Keys loaded (<word phrase>)" with the same buttons to derive different keys. If deriving fails, tells the user and suggests a new passkey
  - No sign-in: the passkey is only used, client-side, to derive the user's keys
- - Identifies users only by an Ed25519 public key derived from their passkey (via the WebAuthn PRF extension; nobody without the passkey can derive the private key). The passkey flow runs entirely client-side; the server never sees the passkey and has no sign-in flow
+ - Identifies users only by an Ed25519 public key derived from their passkey (via the WebAuthn PRF extension; nobody without the passkey can derive the private key). The passkey flow runs entirely client-side; the node never sees the passkey and has no sign-in flow
  - For human convenience, when listing users, displays both their derived public key (their main ID, in base58: letters and digits only, so a double-click selects it), along with a unique deterministic english phrase, built from the word list in this repo (thank you to https://github.com/first20hours/google-10000-english), e.g. "🦬river_candle".
- - Everything users write is a **record**: a [dCBOR](https://datatracker.ietf.org/doc/draft-mcnally-deterministic-cbor/) (deterministic CBOR) map with `author`, `owner`, `path`, `version`, `type`, `data`, optional `authorization`, and the author's Ed25519 `signature` over the rest (field details in `core/src/lib.rs`). Records are passed around and stored exactly as signed
- - Each user has a space, shown as one tree on their ID page (with what they wrote in others' spaces): a record lives at `bb://<owner ID><path>`, e.g. `bb://4E8C…/posts/hello`. Per (owner, path) the newest version wins; deletes are signed `tombstone` records
- - Types so far: `post` (text), `grant` and `tombstone`
- - Owners can sign a **grant** letting another user write at or under a path in their space, saved as a `grant` record (under `/grants`). The grantee picks it when posting, and their records carry its signature as their `authorization`. Grants can't be revoked yet
+ - Everything users write is a **record**: a [dCBOR](https://datatracker.ietf.org/doc/draft-mcnally-deterministic-cbor/) (deterministic CBOR) map with `author`, `path`, `version`, `type`, `data`, optional `edits`, and the author's Ed25519 `signature` over the rest (field details in `core/src/lib.rs`). Records are passed around and stored exactly as signed
+ - A record is identified by its hash (SHA-256 of its bytes), linked as `/r/<hash>`. Records never change: an edit or delete (`tombstone`) is a new record whose `edits` names the version it replaces. A record and its edits form a chain; the newest version wins, a tombstone anywhere deletes it, and every version stays viewable
+ - Paths (e.g. `/posts/dogs`) are only categories: they're not unique and say nothing about ownership. `/posts/dogs` in the app lists everything at or under it
+ - Types so far: `post` (text), `tombstone`, and the node types below
+ - Each **node** has its own key and keeps its own records under `/node`, which are never federated: `/node/info` (its URL), `/node/owner` (one per owner), `/node/grants` and `/node/federate`. Whoever opens the one-time claim link the node prints becomes its first owner; owners can add and remove owners (not the last one), write anywhere, and edit or delete any record. A **grant** lets a list of users, or anyone, write at or under a path. Authors can edit and delete their own records. A node checks all of this for records written to it; records pushed by peers are taken as they are. Grants can't be revoked yet
+ - A **federate** record has the node push new records to a peer node, optionally only some types and paths
  - The signing key (derived from one PRF secret) lives in memory; an opt-in "remember keys on this device" toggle stores the secret in localStorage so it survives reloads
 
 ## Run
@@ -32,12 +34,10 @@ npm run dev:fresh
 
 ## Future Ideas
 
- - Get rid of owner id root, just have people post to /posts or /fun/ideas or whatever (with permissions)
- - Link share flow: "share" record signed by user with a random token (hidden, not federated), and when someone opens that token, server signs a "claim" record
+ - Link share flow: "share" record signed by user with a random token (hidden, not federated), and when someone opens that token, the node signs a "claim" record
    - Prior to link usage, user can grant things to the future user
    - But, random token can't be public, so maybe a reference to that record
  - Blobs (images, files?)
- - Authorization: only authorize certain users to post
  - Feed control: pick what users appear on your feed
  - Vouching: record stating another user is useful to listen to (is human, or at least doesn't spam, etc.)
  - Shared encryption (generate key, encrypt that key to share with other users, one record per user)

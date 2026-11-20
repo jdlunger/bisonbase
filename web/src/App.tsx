@@ -1,21 +1,19 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  type Grant,
+  type NodeInfo,
   type Passkey,
-  type ServerInfo,
   type User,
-  claimServer,
+  amOwner,
+  claimNode,
   deriveFromExistingPasskey,
   deriveFromNewPasskey,
   forgetKeys,
   forgetRecentPasskey,
-  getServer,
   isRemembering,
-  loadServers,
+  loadNode,
   myGrants,
   myPasskey,
   myPubkey,
-  newPostPath,
   pathWithin,
   putPost,
   recentPasskeys,
@@ -24,47 +22,35 @@ import {
   userPhrase,
 } from "./api.ts";
 import { Compose, type Draft, NoteEditor } from "./NoteList.tsx";
-import Browse from "./Record.tsx";
-import { Link, idPath, navigate, usePath } from "./router.tsx";
+import { PathPage, RecordPage, UserPage } from "./Record.tsx";
+import { Link, idPath, navigate, recordPath, useRoute } from "./router.tsx";
 import { type Run, link, hl, primary, secondary } from "./ui.ts";
 
 /** A recently used passkey, with its keys' phrase. */
 type Recent = Passkey & { phrase: string };
 
-/** Routes: "/" is every space, "/bb/<pubkey><path>" a place in one space and what's under it ("/bb/<pubkey>/" is
- * that user's page). Remembered keys load first. */
+/** Loads remembered keys and this node's info first. */
 export default function App() {
-  /** undefined while loading remembered keys; then the error restoring them, if any. */
+  /** undefined while loading; then the error, if any. */
   const [restoreError, setRestoreError] = useState<string | null>();
   useEffect(() => {
-    Promise.all([restoreKeys(), loadServers()]).then(
+    Promise.all([restoreKeys(), loadNode()]).then(
       () => setRestoreError(null),
-      (e) => setRestoreError(`Couldn't restore remembered keys: ${e.message}`),
+      (e) => setRestoreError(`Couldn't load: ${e.message}`),
     );
   }, []);
   return restoreError === undefined ? null : <Shell initialError={restoreError} />;
 }
 
-/** The route as (owner, path): no owner for "/". */
-function useRoute(): { owner?: string; path: string } {
-  const m = usePath().match(/^\/bb\/([^/]+)(\/.*)?$/);
-  if (!m) return { path: "/" };
-  const path = (m[2] ?? "/").replace(/\/$/, "").split("/").map(decodeURIComponent).join("/") || "/";
-  return { owner: decodeURIComponent(m[1]), path };
-}
-
-/** A fresh name for a new post in `dir` ("" for the root). */
-const newPathIn = (dir: string) => `${dir}/${newPostPath().split("/").pop()}`;
-
 function Shell({ initialError }: { initialError: string | null }) {
   const route = useRoute();
-  const claiming = usePath() === "/claim";
-  /** The server this page talks to. */
-  const [server, setServer] = useState<ServerInfo | null>(null);
+  /** The node this page talks to. */
+  const [node, setNode] = useState<NodeInfo | null>(null);
   const [me, setMe] = useState<User | null>(null);
   const [passkey, setPasskey] = useState<Passkey | null>(null);
   const [recent, setRecent] = useState<Recent[]>([]);
-  const [grants, setGrants] = useState<Grant[]>([]);
+  /** Paths we hold grants at. */
+  const [grants, setGrants] = useState<string[]>([]);
   const [error, setError] = useState(initialError ?? "");
   const [busy, setBusy] = useState(false);
   /** Bumped after every action, so the page reloads its records. */
@@ -76,10 +62,10 @@ function Shell({ initialError }: { initialError: string | null }) {
     const pubkey = myPubkey();
     const current = myPasskey();
     const others = recentPasskeys().filter((p) => p.credId !== current?.credId);
-    const [g, s] = await Promise.all([myGrants(), getServer()]);
-    const m = pubkey ? { pubkey, phrase: userPhrase(pubkey), server: false } : null;
+    const [g, n] = await Promise.all([myGrants(), loadNode()]);
+    const m = pubkey ? { pubkey, phrase: userPhrase(pubkey), node: false } : null;
     setMe(m);
-    setServer(s);
+    setNode(n);
     setGrants(g);
     setPasskey(current);
     setRecent(others.map((p) => ({ ...p, phrase: userPhrase(p.pubkey) })));
@@ -103,29 +89,29 @@ function Shell({ initialError }: { initialError: string | null }) {
     setBusy(false);
   };
 
-  const grantFor = (owner: string, dir: string) => grants.find((g) => g.owner.pubkey === owner && pathWithin(dir, g.path));
-  const canWrite = (owner: string, dir: string) => !!me && (owner === me.pubkey || !!grantFor(owner, dir));
-  const open = (owner: string, dir: string) => {
-    setDraft({ body: "", path: newPathIn(dir), grant: owner === me?.pubkey ? undefined : grantFor(owner, dir) });
+  const owner = !!me && amOwner();
+  const canWrite = (path: string) => !!me && (owner || grants.some((g) => pathWithin(path, g)));
+  const open = (path: string) => {
+    setDraft({ body: "", path });
     window.scrollTo({ top: 0, behavior: "smooth" });
   };
-  // "New post" goes where we're looking, if we may write there; else our own /posts.
-  const here = route.owner && route.path !== "/" ? route.path : "";
-  const newPost = () => (route.owner && canWrite(route.owner, here) ? open(route.owner, here) : open(me!.pubkey, "/posts"));
+  // "New post" goes where we're looking, if we may write there; else the first place we may.
+  const here = route.page === "path" && route.path !== "/" ? route.path : null;
+  const newPost = () => open(here && canWrite(here) ? here : owner || !grants.length ? "/posts" : grants[0]);
 
   return (
-    <Compose.Provider value={{ canWrite, open }}>
+    <Compose.Provider value={{ canWrite, open, writable: owner ? ["/"] : grants }}>
       <main className="mx-auto max-w-3xl px-4 py-6 font-sans text-gray-900">
         <header className="flex items-center justify-between gap-3">
           <div className="flex flex-wrap items-baseline gap-x-2">
             <Link href="/" className="text-xl font-bold tracking-tight hover:text-indigo-600">
               federated crdt
             </Link>
-            {server && (
+            {node && (
               <span className="text-sm text-gray-500">
                 on{" "}
-                <Link href={idPath(server.pubkey)} className={link} title={server.pubkey}>
-                  <span className={hl(server.phrase)}>{server.phrase}</span>
+                <Link href={idPath(node.pubkey)} className={link} title={node.pubkey}>
+                  <span className={hl(node.phrase)}>{node.phrase}</span>
                 </Link>
               </span>
             )}
@@ -145,12 +131,12 @@ function Shell({ initialError }: { initialError: string | null }) {
             <NoteEditor
               draft={draft}
               setDraft={setDraft}
-              grants={grants}
               busy={busy}
               submitLabel="Post"
               onSubmit={run(async () => {
-                await putPost(draft.body, draft);
+                const hash = await putPost(draft.body, draft.path);
                 setDraft(null);
+                navigate(recordPath(hash));
               })}
               onCancel={() => setDraft(null)}
             />
@@ -160,10 +146,14 @@ function Shell({ initialError }: { initialError: string | null }) {
         {error && <p className="mt-4 rounded-md bg-red-50 p-3 text-sm text-red-700 ring-1 ring-red-200">{error}</p>}
 
         <div className="mt-6">
-          {claiming ? (
-            <Claim server={server} me={me} busy={busy} run={run} />
+          {route.page === "claim" ? (
+            <Claim node={node} me={me} busy={busy} run={run} />
+          ) : route.page === "user" ? (
+            <UserPage pubkey={route.pubkey} node={node} me={me} busy={busy} run={run} tick={tick} />
+          ) : route.page === "record" ? (
+            <RecordPage hash={route.hash} me={me} busy={busy} run={run} tick={tick} />
           ) : (
-            <Browse owner={route.owner} path={route.path} me={me} busy={busy} run={run} tick={tick} />
+            <PathPage path={route.path} me={me} busy={busy} run={run} tick={tick} />
           )}
         </div>
       </main>
@@ -171,35 +161,36 @@ function Shell({ initialError }: { initialError: string | null }) {
   );
 }
 
-/** /claim#<token>: the one-time link a new server prints, to make whoever signs in here its owner. */
-function Claim({ server, me, busy, run }: { server: ServerInfo | null; me: User | null; busy: boolean; run: Run }) {
+/** /claim#<token>: the one-time link a new node prints, to make whoever signs in here its first owner. */
+function Claim({ node, me, busy, run }: { node: NodeInfo | null; me: User | null; busy: boolean; run: Run }) {
   const token = location.hash.slice(1);
-  if (!server) return <p className="text-gray-500">Loading…</p>;
-  const name = <span className={hl(server.phrase)}>{server.phrase}</span>;
+  if (!node) return <p className="text-gray-500">Loading…</p>;
+  const name = <span className={hl(node.phrase)}>{node.phrase}</span>;
   return (
     <section className="space-y-3">
       <h1 className="text-2xl font-bold tracking-tight">Claim {name}</h1>
-      {server.owner ? (
+      {node.owners.length ? (
         <p>
-          This server already has an owner:{" "}
-          <Link href={idPath(server.owner)} className={link}>
+          This node already has an owner:{" "}
+          <Link href={idPath(node.pubkey)} className={link}>
             see its page
           </Link>
           .
         </p>
       ) : !token ? (
-        <p>This link is missing its token. Use the whole link the server printed.</p>
+        <p>This link is missing its token. Use the whole link the node printed.</p>
       ) : (
         <>
           <p className="text-sm text-gray-600">
-            The owner of a server can federate it with other servers, pushing new records to them. This link works once.
+            A node's owners can write anywhere on it, let others write under paths, add owners, and federate it with
+            other nodes. This link works once.
           </p>
           {me ? (
             <button
               className={secondary}
               disabled={busy}
               onClick={run(async () => {
-                const id = await claimServer(token);
+                const id = await claimNode(token);
                 history.replaceState(null, "", location.pathname); // the token is spent
                 navigate(idPath(id));
               })}
@@ -207,7 +198,7 @@ function Claim({ server, me, busy, run }: { server: ServerInfo | null; me: User 
               Claim as <span className={hl(me.phrase)}>{me.phrase}</span>
             </button>
           ) : (
-            <p>Sign in first (top right), with the keys that should own this server.</p>
+            <p>Sign in first (top right), with the keys that should own this node.</p>
           )}
         </>
       )}

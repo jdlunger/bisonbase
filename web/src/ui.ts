@@ -1,3 +1,5 @@
+import { useEffect, useState } from "react";
+
 export const btn =
   "rounded-md px-3 py-1.5 text-sm font-medium shadow-sm transition disabled:opacity-50 cursor-pointer";
 export const primary = `${btn} bg-indigo-600 text-white hover:bg-indigo-500`;
@@ -9,13 +11,33 @@ export const input =
   "block w-full rounded-md px-2 py-1 text-sm ring-1 ring-gray-300 ring-inset focus:ring-2 focus:ring-indigo-600 focus:outline-none";
 export const badge = "rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset";
 export const link = "hover:text-indigo-600 hover:underline";
-/** Highlights a public phrase (light blue; amber for a server's "server_word"), or a public ID (light green), wherever one is shown. */
+/** Highlights a public phrase (light blue; amber for a node's "node_word"), or a public ID (light green), wherever one is shown. */
 const phraseHl = "rounded bg-sky-100 px-1 ring-1 ring-sky-300 ring-inset box-decoration-clone";
-const serverHl = "rounded bg-amber-100 px-1 ring-1 ring-amber-300 ring-inset box-decoration-clone";
-export const hl = (phrase: string) => (phrase.startsWith("server_") ? serverHl : phraseHl);
+const nodeHl = "rounded bg-amber-100 px-1 ring-1 ring-amber-300 ring-inset box-decoration-clone";
+export const hl = (phrase: string) => (phrase.startsWith("node_") ? nodeHl : phraseHl);
 export const idHl = "rounded bg-green-100 px-1 ring-1 ring-green-300 ring-inset box-decoration-clone";
 
 export const fmtTime = (t: number) => new Date(t * 1000).toLocaleString();
 
 /** Wraps an action: clears the error, sets busy, reports failures, then refreshes. */
 export type Run = (fn: () => unknown) => () => Promise<void>;
+
+/** Loads `load()` whenever `deps` or `tick` change; null while loading. */
+export function useLoad<T>(load: (() => Promise<T>) | null, deps: unknown[], tick: number) {
+  const [data, setData] = useState<T | null>(null);
+  const [error, setError] = useState("");
+  useEffect(() => setData(null), deps); // a new place: start over
+  useEffect(() => {
+    if (!load) return;
+    let live = true;
+    setError("");
+    load().then(
+      (d) => live && setData(d),
+      (e) => live && setError(e.message),
+    );
+    return () => {
+      live = false;
+    };
+  }, [...deps, tick]);
+  return { data, error };
+}

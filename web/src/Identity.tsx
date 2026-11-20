@@ -1,9 +1,9 @@
-import { type MouseEvent, useContext, useState } from "react";
+import { type MouseEvent, useState } from "react";
 import { encode } from "uqr";
-import { type Post, type User, makeGrant, putFederate } from "./api.ts";
-import { Compose } from "./NoteList.tsx";
-import { Link, idPath } from "./router.tsx";
-import { type Run, fmtTime, idHl, input, link, hl, primary, textarea } from "./ui.ts";
+import { type NodeInfo, type Post, type User, addOwner, amOwner, getPosts, makeGrant, putFederate, userPhrase } from "./api.ts";
+import { PostItem, UserLink } from "./NoteList.tsx";
+import { Link, idPath, recordPath } from "./router.tsx";
+import { type Run, hl, input, link, primary, secondary, textarea, useLoad } from "./ui.ts";
 
 /** A QR code as an SVG, encoded entirely client-side. */
 function QrCode({ text, className }: { text: string; className?: string }) {
@@ -56,159 +56,137 @@ function CopyBox({ label, value, id }: { label: string; value: string; id?: bool
   );
 }
 
-/** Lets the owner (us) grant this page's user write access under a path in our space, saved as a grant record. */
-function GrantForm({ grantee, phrase, busy, run }: { grantee: string; phrase: string; busy: boolean; run: Run }) {
-  const [path, setPath] = useState("/shared");
+/** A form's result: the record it wrote, linked. */
+function Saved({ hash, children }: { hash: string; children?: React.ReactNode }) {
+  if (!hash) return null;
+  return (
+    <p className="mt-2 text-sm text-gray-600">
+      Saved as{" "}
+      <Link href={recordPath(hash)} className={`font-mono ${link}`}>
+        #{hash.slice(0, 8)}
+      </Link>
+      . {children}
+    </p>
+  );
+}
+
+/** Lets an owner (us) let users (IDs, or "anyone") write at or under a path, saved as a grant record. */
+function GrantForm({ grantee = "", busy, run }: { grantee?: string; busy: boolean; run: Run }) {
+  const [who, setWho] = useState(grantee);
+  const [path, setPath] = useState("/posts");
   const [saved, setSaved] = useState("");
   return (
-    <section className="mt-10">
-      <h2 className="text-xl font-semibold">Let <span className={hl(phrase)}>{phrase}</span> write in your space</h2>
-      <div className="mt-3 flex flex-wrap items-center gap-2 text-sm">
+    <div className="mt-3 space-y-2 text-sm">
+      {!grantee && (
+        <label className="block">
+          Who <span className="text-gray-500">(IDs, separated by spaces or commas, or "anyone")</span>
+          <input className={`${input} font-mono`} placeholder="anyone" value={who} onChange={(e) => setWho(e.target.value)} />
+        </label>
+      )}
+      <div className="flex flex-wrap items-center gap-2">
         <label className="flex min-w-48 flex-1 items-center gap-1.5 whitespace-nowrap">
-          At or under
+          May write at or under
           <input className={`${input} font-mono`} value={path} onChange={(e) => setPath(e.target.value)} />
         </label>
         <button
           className={primary}
-          disabled={busy}
+          disabled={busy || !who.trim()}
           onClick={run(async () => {
             setSaved("");
-            setSaved(await makeGrant(grantee, path));
+            setSaved(await makeGrant(who, path));
           })}
         >
           Grant
         </button>
       </div>
-      {saved && (
-        <p className="mt-2 text-sm text-gray-600">
-          Saved as <code className="font-mono text-xs break-all">{saved}</code>. <span className={hl(phrase)}>{phrase}</span> can now pick it when posting.
-          It can't be revoked yet: deleting the record doesn't stop the grant from working.
-        </p>
-      )}
-    </section>
+      <Saved hash={saved}>It can't be revoked yet: deleting the record doesn't take back what was written under it.</Saved>
+    </div>
   );
 }
 
-/** Lets this server's owner (us) have it push records to another server, saved as a federate record. */
-function FederateForm({ server, busy, run }: { server: string; busy: boolean; run: Run }) {
+/** Lets an owner (us) have this node push records to another node, saved as a federate record. */
+function FederateForm({ busy, run }: { busy: boolean; run: Run }) {
   const [url, setUrl] = useState("");
   const [types, setTypes] = useState("");
   const [paths, setPaths] = useState("");
   const [saved, setSaved] = useState("");
   return (
-    <section className="mt-10">
-      <h2 className="text-xl font-semibold">Federate with another server</h2>
-      <p className="mt-1 text-sm text-gray-500">
-        New records here get pushed to it (and everything so far, to start). Each server passes on only records
-        that are new to it, so loops die out.
-      </p>
-      <div className="mt-3 space-y-2 text-sm">
-        <label className="block">
-          Its URL
-          <input className={`${input} font-mono`} placeholder="http://localhost:8081" value={url} onChange={(e) => setUrl(e.target.value)} />
-        </label>
-        <label className="block">
-          Types <span className="text-gray-500">(comma-separated; empty for all. Deletes always follow.)</span>
-          <input className={`${input} font-mono`} placeholder="post, grant" value={types} onChange={(e) => setTypes(e.target.value)} />
-        </label>
-        <label className="block">
-          Paths <span className="text-gray-500">(one per line, bb://&lt;ID or *&gt;/&lt;path&gt;; empty for all)</span>
-          <textarea
-            className={`${textarea} font-mono`}
-            rows={2}
-            placeholder={"bb://*/posts\nbb://*/"}
-            value={paths}
-            onChange={(e) => setPaths(e.target.value)}
-          />
-        </label>
-        <button
-          className={primary}
-          disabled={busy || !url.trim()}
-          onClick={run(async () => {
-            setSaved("");
-            setSaved(await putFederate(server, url, types, paths));
-          })}
-        >
-          Federate
-        </button>
-      </div>
-      {saved && (
-        <p className="mt-2 text-sm text-gray-600">
-          Saved as <code className="font-mono text-xs break-all">{saved}</code>. Delete that record to stop pushing there.
-        </p>
-      )}
-    </section>
+    <div className="mt-3 space-y-2 text-sm">
+      <label className="block">
+        Its URL
+        <input className={`${input} font-mono`} placeholder="http://localhost:8081" value={url} onChange={(e) => setUrl(e.target.value)} />
+      </label>
+      <label className="block">
+        Types <span className="text-gray-500">(comma-separated; empty for all. Deletes always follow.)</span>
+        <input className={`${input} font-mono`} placeholder="post" value={types} onChange={(e) => setTypes(e.target.value)} />
+      </label>
+      <label className="block">
+        Paths <span className="text-gray-500">(one per line, each with what's under it; empty for all)</span>
+        <textarea className={`${textarea} font-mono`} rows={2} placeholder={"/posts"} value={paths} onChange={(e) => setPaths(e.target.value)} />
+      </label>
+      <button
+        className={primary}
+        disabled={busy || !url.trim()}
+        onClick={run(async () => {
+          setSaved("");
+          setSaved(await putFederate(url, types, paths));
+        })}
+      >
+        Federate
+      </button>
+      <Saved hash={saved}>Delete that record to stop pushing there.</Saved>
+    </div>
   );
 }
 
-/** A user, linked to their page; "(you)" if it's us. */
-function UserLink({ user, me }: { user: User; me: string | null }) {
+/** Lets an owner (us) add an owner. */
+function AddOwnerForm({ busy, run }: { busy: boolean; run: Run }) {
+  const [who, setWho] = useState("");
   return (
-    <Link href={idPath(user.pubkey)} className={`font-semibold ${link}`} title={user.pubkey}>
-      <span className={hl(user.phrase)}>{user.phrase}</span>
-      {user.pubkey === me && <span className="ml-1 font-normal text-gray-500">(you)</span>}
-    </Link>
+    <div className="mt-3 flex flex-wrap items-center gap-2 text-sm">
+      <input className={`${input} min-w-48 flex-1 font-mono`} placeholder="Their ID" value={who} onChange={(e) => setWho(e.target.value)} />
+      <button
+        className={secondary}
+        disabled={busy || !who.trim()}
+        onClick={run(async () => {
+          await addOwner(who);
+          setWho("");
+        })}
+      >
+        Add owner
+      </button>
+    </div>
   );
 }
 
-/** Grants this user has given, and been given: who may write where. */
-function Grants({ pubkey, grants, me }: { pubkey: string; grants: Post[]; me: string | null }) {
-  const given = grants.filter((g) => g.owner.pubkey === pubkey);
-  const received = grants.filter((g) => g.grant!.grantee.pubkey === pubkey);
-  const row = (g: Post, who: User, dir: "given" | "received") => (
-    <li key={g.uri} className="flex flex-wrap items-baseline justify-between gap-2 p-3 text-sm">
-      <span>
-        🔑 {dir === "given" ? "Lets " : "Can write in "}
-        <UserLink user={who} me={me} />
-        {dir === "given" ? " write at or under " : "'s space, at or under "}
-        <code className="font-mono">{g.grant!.path}</code>
-      </span>
-      <span className="text-xs text-gray-500" title={g.uri}>
-        {fmtTime(g.rec.version / 1000)}
-      </span>
-    </li>
-  );
-  return (
-    <>
-      <h2 className="mt-10 text-xl font-semibold">Grants</h2>
-      {given.length + received.length === 0 ? (
-        <p className="mt-3 text-gray-500">None yet.</p>
-      ) : (
-        <ul className="mt-3 divide-y divide-gray-200 rounded-lg ring-1 ring-gray-200">
-          {received.map((g) => row(g, g.owner, "received"))}
-          {given.map((g) => row(g, g.grant!.grantee, "given"))}
-        </ul>
-      )}
-    </>
-  );
-}
-
-/** The top of a user's page (their space's root): who they are, how to link to them, and their grants. */
-export function OwnerInfo({
+/** The top of a user's page: who they are, how to link to them, and the grants that name them. */
+export function Identity({
   pubkey,
-  phrase,
-  grants,
+  node,
   me,
+  grants,
   busy,
   run,
 }: {
   pubkey: string;
-  phrase: string | null;
-  /** Valid grants this user gave or received. */
+  node: NodeInfo | null;
+  me: User | null;
+  /** Valid grants that name this user. */
   grants: Post[] | null;
-  me: string | null;
   busy: boolean;
   run: Run;
 }) {
   const url = `${location.origin}${idPath(pubkey)}`;
-  const mine = me === pubkey;
-  // Only a server's owner holds its /federate grant.
-  const owns = useContext(Compose).canWrite(pubkey, "/federate");
+  const phrase = userPhrase(pubkey);
+  const mine = me?.pubkey === pubkey;
+  const isOwner = !!node?.owners.includes(pubkey);
+  const owner = !!me && amOwner();
   return (
     <>
       <h1 className="mt-2 text-3xl font-bold tracking-tight break-words">
-        <span className={hl(phrase ?? "…")}>{phrase ?? "…"}</span>
+        <span className={hl(phrase)}>{phrase}</span>
         {mine && <span className="ml-2 text-lg font-normal text-gray-500">(you)</span>}
+        {isOwner && <span className="ml-2 text-lg font-normal text-gray-500">👑 owns this node</span>}
       </h1>
 
       <section className="mt-6 flex flex-col gap-6 sm:flex-row sm:items-start">
@@ -223,9 +201,78 @@ export function OwnerInfo({
         </div>
       </section>
 
-      {grants && <Grants pubkey={pubkey} grants={grants} me={me} />}
-      {me && !mine && phrase && <GrantForm grantee={pubkey} phrase={phrase} busy={busy} run={run} />}
-      {owns && <FederateForm server={pubkey} busy={busy} run={run} />}
+      {grants && grants.length > 0 && (
+        <>
+          <h2 className="mt-10 text-xl font-semibold">May write at</h2>
+          <ul className="mt-3 divide-y divide-gray-200 rounded-lg ring-1 ring-gray-200">
+            {grants.map((g) => (
+              <li key={g.root} className="flex flex-wrap items-baseline justify-between gap-2 p-3 text-sm">
+                <span>
+                  🔑 <code className="font-mono">{g.grant!.path}</code> and under it, granted by <UserLink user={g.author} me={me} />
+                </span>
+                <Link href={recordPath(g.root)} className={`font-mono text-xs text-gray-500 ${link}`}>
+                  #{g.root.slice(0, 8)}
+                </Link>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+      {owner && !mine && node?.pubkey !== pubkey && (
+        <section className="mt-10">
+          <h2 className="text-xl font-semibold">
+            Let <span className={hl(phrase)}>{phrase}</span> write here
+          </h2>
+          <GrantForm grantee={pubkey} busy={busy} run={run} />
+          {!isOwner && (
+            <button className={`${secondary} mt-3`} disabled={busy} onClick={run(() => addOwner(pubkey))}>
+              👑 Make <span className={hl(phrase)}>{phrase}</span> an owner
+            </button>
+          )}
+        </section>
+      )}
+    </>
+  );
+}
+
+/** On this node's page: its owners, grants and peers (its /node records), and forms to add them if we own it. */
+export function NodeAdmin({ me, busy, run, tick }: { me: User | null; busy: boolean; run: Run; tick: number }) {
+  const { data } = useLoad(() => getPosts({ prefix: "/node" }), [], tick);
+  const owner = !!me && amOwner();
+  const items = { me, busy, run };
+  const section = (title: string, type: string, form: React.ReactNode, note?: string) => {
+    const posts = data?.filter((p) => p.rec.type === type) ?? [];
+    return (
+      <section className="mt-10">
+        <h2 className="text-xl font-semibold">{title}</h2>
+        {note && <p className="mt-1 text-sm text-gray-500">{note}</p>}
+        {data === null ? (
+          <p className="mt-3 text-gray-500">Loading…</p>
+        ) : posts.length === 0 ? (
+          <p className="mt-3 text-gray-500">None yet.</p>
+        ) : (
+          <ul className="mt-3 divide-y divide-gray-200 rounded-lg ring-1 ring-gray-200">
+            {posts.map((p) => (
+              <li key={p.root}>
+                <PostItem post={p} hidePath {...items} />
+              </li>
+            ))}
+          </ul>
+        )}
+        {owner && form}
+      </section>
+    );
+  };
+  return (
+    <>
+      {section("Owners", "owner", <AddOwnerForm busy={busy} run={run} />, "They can write anything, anywhere on this node, and edit or delete any record.")}
+      {section("Grants", "grant", <GrantForm busy={busy} run={run} />, "Who else may write where.")}
+      {section(
+        "Federation",
+        "federate",
+        <FederateForm busy={busy} run={run} />,
+        "Nodes this one pushes new records to (and everything so far, to start). Each passes on only records new to it, so loops die out. Records under /node never leave.",
+      )}
     </>
   );
 }

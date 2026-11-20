@@ -22,6 +22,11 @@ pub fn encode_b58(b: &[u8]) -> String {
     bs58::encode(b).into_string()
 }
 
+/// Bytes from base58, e.g. a record's hash; None if it isn't base58.
+pub fn decode_b58(s: &str) -> Option<Vec<u8>> {
+    bs58::decode(s).into_vec().ok()
+}
+
 /// Parses a base58 ID; None unless it's exactly 32 bytes.
 pub fn decode_id(s: &str) -> Option<Pubkey> {
     bs58::decode(s).into_vec().ok()?.try_into().ok()
@@ -57,9 +62,9 @@ pub fn phrase(pk: &Pubkey) -> String {
     format!("{}{}", EMOJI[pick(pk, 8, EMOJI.len())], two_words(pk))
 }
 
-/// A server's nickname instead: "server_" and the phrase's first word.
-pub fn server_phrase(pk: &Pubkey) -> String {
-    format!("server_{}", WORDS[pick(pk, 0, WORDS.len())])
+/// A node's nickname instead: "node_" and the phrase's first word.
+pub fn node_phrase(pk: &Pubkey) -> String {
+    format!("node_{}", WORDS[pick(pk, 0, WORDS.len())])
 }
 
 // ---- CBOR ----
@@ -95,152 +100,140 @@ fn as_map<'a>(v: &'a CBOR, what: &str) -> Result<&'a Map, String> {
 //
 // Everything users write is a record: a CBOR map, signed by its author.
 //
-//   author         bytes(32)  Ed25519 public key of whoever wrote and signed it
-//   owner          bytes(32)  whose space it lives in; may differ from the author (see `authorization`)
-//   path           text       where in the owner's space, e.g. "/posts/hello" (see `check_path`);
-//                             written bb://<owner, base58><path> at the edges
-//   version        uint       ms since the epoch, by the author's clock; per (owner, path), the newest wins
-//   type           text       what `data` holds: "post" (data: text), "tombstone" (data: null, a
-//                             delete), "grant" (see `GrantData`), or one of the server types below
-//   data           any        the content, per `type`
-//   authorization  map?       required iff author != owner: {path, signature}, the owner's signature
-//                             (see `grant_signed_bytes`) letting the author write at or under `path`;
-//                             the owner also keeps it as a "grant" record, by default under /grants
-//   signature      bytes(64)  author's Ed25519 signature over `RECORD_CONTEXT || CBOR(the record
-//                             without this field)`
+//   author     bytes(32)  Ed25519 public key of whoever wrote and signed it
+//   path       text       a category to find it by, e.g. "/posts/dogs" (see `check_path`). Not unique:
+//                         any number of records share a path
+//   version    uint       ms since the epoch, by the author's clock
+//   type       text       what `data` holds: "post" (data: text), "tombstone" (data: null, a delete),
+//                         or one of the node types below
+//   data       any        the content, per `type`
+//   edits      bytes(32)? the hash of the version this one edits (or, for a tombstone, deletes): the
+//                         newest one its author saw. Edits keep the type but may change the path
+//   signature  bytes(64)  author's Ed25519 signature over `RECORD_CONTEXT || CBOR(the record
+//                         without this field)`
 //
-// Any other fields are kept (the signature covers them) but otherwise ignored. Records are
-// identified by (owner, path).
+// Any other fields are kept (the signature covers them) but otherwise ignored.
+//
+// A record is identified by its hash: SHA-256 of its CBOR, signature included. Records never change;
+// an edit is a new record. A record and its edits form a chain, named by its first record's hash.
+// The chain's current version is its newest (by version, then by hash), unless any version in it is
+// a tombstone: then it's deleted.
 
 /// Prefixed to the bytes of each kind of signature, so one can never pass for another.
-pub const RECORD_CONTEXT: &[u8] = b"bisonbase-record-v1\n";
-pub const GRANT_CONTEXT: &[u8] = b"bisonbase-grant-v1\n";
+pub const RECORD_CONTEXT: &[u8] = b"bisonbase-record-v2\n";
 
 pub const MAX_PATH_BYTES: usize = 1024;
+
+pub type Hash = [u8; 32];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Record {
     pub author: Pubkey,
-    pub owner: Pubkey,
     pub path: String,
     pub version: u64,
     pub kind: String,
     pub data: CBOR,
-    pub authorization: Option<Authorization>,
+    pub edits: Option<Hash>,
     pub signature: [u8; 64],
     /// Fields this version doesn't know about.
     pub extra: Map,
 }
 
-const RECORD_FIELDS: [&str; 8] = ["author", "owner", "path", "version", "type", "data", "authorization", "signature"];
+const RECORD_FIELDS: [&str; 7] = ["author", "path", "version", "type", "data", "edits", "signature"];
 
-/// The owner's permission for the record's author to write at or under `path`.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Authorization {
-    pub path: String,
-    pub signature: [u8; 64],
+// ---- nodes ----
+//
+// Each node has its own key. Its own records live under /node, and are never federated:
+//
+//   /node/info      type "node", data {url}: written by the node itself
+//   /node/owner     type "owner", data {user: bytes(32)}: one per owner. The node writes the first when
+//                   someone claims it with its one-time link (see `claim_signed_bytes`); after that,
+//                   owners add (and delete) them
+//   /node/grants    type "grant" (see `GrantData`): written by owners, lets users write at or under a path
+//   /node/federate  type "federate" (see `FederateData`): written by owners, pushes records to a peer
+//
+// Owners may write anything, anywhere. Others need a grant covering the path, except to edit or delete
+// their own records. A node checks all of that when a record is written to it, against its own /node
+// records; records pushed by peers are taken as they are.
+
+pub const NODE_PATH: &str = "/node";
+pub const NODE_INFO_PATH: &str = "/node/info";
+pub const OWNER_PATH: &str = "/node/owner";
+pub const GRANTS_PATH: &str = "/node/grants";
+pub const FEDERATE_PATH: &str = "/node/federate";
+
+pub const CLAIM_CONTEXT: &[u8] = b"bisonbase-claim-v1\n";
+
+/// The bytes a user signs to claim `node`, with the token from its one-time claim link.
+pub fn claim_signed_bytes(node: &Pubkey, token: &[u8]) -> Vec<u8> {
+    let mut m = Map::new();
+    m.insert("node", CBOR::to_byte_string(node));
+    m.insert("token", CBOR::to_byte_string(token));
+    [CLAIM_CONTEXT, &CBOR::from(m).to_cbor_data()].concat()
 }
 
-/// A "grant" record's data: the owner (who must also be the record's author) lets `grantee` write
-/// at or under `path` in their space. `signature` is what the grantee's records carry as their
-/// `authorization`.
+/// Who a grant lets write.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Grantees {
+    Anyone,
+    Users(Vec<Pubkey>),
+}
+
+/// A "grant" record's data: lets `grantees` write at or under `path` ("/" for everywhere).
 #[derive(Clone, Debug, PartialEq)]
 pub struct GrantData {
-    pub grantee: Pubkey,
     pub path: String,
-    pub signature: [u8; 64],
+    pub grantees: Grantees,
 }
 
 impl GrantData {
     pub fn from_cbor(v: &CBOR) -> Result<Self, String> {
         let m = as_map(v, "a grant's data")?;
-        Ok(GrantData { grantee: field(m, "grantee", bytes)?, path: field(m, "path", text)?, signature: field(m, "signature", bytes)? })
+        let grantees = match m.get::<_, CBOR>("grantees") {
+            Some(g) if g.as_text() == Some("anyone") => Grantees::Anyone,
+            Some(g) => Grantees::Users(
+                g.as_array()
+                    .ok_or("grantees must be \"anyone\" or a list of IDs")?
+                    .iter()
+                    .map(|u| bytes(u).ok_or("grantees must be 32-byte IDs"))
+                    .collect::<Result<_, _>>()?,
+            ),
+            None => return Err("missing field \"grantees\"".into()),
+        };
+        let g = GrantData { path: field(m, "path", text)?, grantees };
+        check_prefix(&g.path)?;
+        Ok(g)
     }
 
     pub fn to_cbor(&self) -> CBOR {
         let mut m = Map::new();
-        m.insert("grantee", CBOR::to_byte_string(self.grantee));
         m.insert("path", self.path.as_str());
-        m.insert("signature", CBOR::to_byte_string(self.signature));
+        match &self.grantees {
+            Grantees::Anyone => m.insert("grantees", "anyone"),
+            Grantees::Users(u) => m.insert("grantees", u.iter().map(CBOR::to_byte_string).collect::<Vec<_>>()),
+        }
         m.into()
     }
-}
 
-/// The bytes an owner signs to let `author` write at or under `path` in their space.
-pub fn grant_signed_bytes(author: &Pubkey, owner: &Pubkey, path: &str) -> Vec<u8> {
-    let mut m = Map::new();
-    m.insert("author", CBOR::to_byte_string(author));
-    m.insert("owner", CBOR::to_byte_string(owner));
-    m.insert("path", path);
-    [GRANT_CONTEXT, &CBOR::from(m).to_cbor_data()].concat()
-}
-
-// ---- servers and federation ----
-//
-// Each server has its own key, and these records in its space:
-//
-//   /server          type "server", data {url}: self-signed; marks the key as a server's
-//   /owner           type "owner", data {user: bytes(32)}: self-signed when someone claims the server
-//                    with its one-time link (see `claim_signed_bytes`); the server also grants them /federate
-//   /federate/<ID>   type "federate" (see `FederateData`): push records to the server with that ID.
-//                    Written by the owner under that grant, and never pushed themselves
-
-pub const CLAIM_CONTEXT: &[u8] = b"bisonbase-claim-v1\n";
-
-/// The bytes a user signs to claim `server`, with the token from its one-time claim link.
-pub fn claim_signed_bytes(server: &Pubkey, token: &[u8]) -> Vec<u8> {
-    let mut m = Map::new();
-    m.insert("server", CBOR::to_byte_string(server));
-    m.insert("token", CBOR::to_byte_string(token));
-    [CLAIM_CONTEXT, &CBOR::from(m).to_cbor_data()].concat()
-}
-
-/// The peer a federate record's path names: /federate/<ID>.
-pub fn federate_peer(path: &str) -> Option<Pubkey> {
-    decode_id(path.strip_prefix("/federate/")?)
-}
-
-/// Which records go to a peer: everything at or under `path` ("/" for all of it), in `owner`'s space, or
-/// in every space if None. Written bb://<owner, base58 or *><path> at the edges.
-#[derive(Clone, Debug, PartialEq)]
-pub struct PathFilter {
-    pub owner: Option<Pubkey>,
-    pub path: String,
-}
-
-impl PathFilter {
-    /// Parses bb://<ID or *><path>, where a bare "/" means the whole space.
-    pub fn parse(s: &str) -> Result<Self, String> {
-        let bad = || format!("{s} isn't bb://<ID or *>/<path>");
-        let rest = s.strip_prefix("bb://").ok_or_else(bad)?;
-        let (owner, path) = rest.split_at(rest.find('/').ok_or_else(bad)?);
-        let owner = if owner == "*" { None } else { Some(decode_id(owner).ok_or_else(bad)?) };
-        if path != "/" {
-            check_path(path)?;
-        }
-        Ok(PathFilter { owner, path: path.into() })
-    }
-
-    pub fn matches(&self, owner: &Pubkey, path: &str) -> bool {
-        self.owner.is_none_or(|o| &o == owner) && (self.path == "/" || path_within(path, &self.path))
+    /// Whether this lets `author` write at `path`.
+    pub fn covers(&self, author: &Pubkey, path: &str) -> bool {
+        path_within(path, &self.path)
+            && match &self.grantees {
+                Grantees::Anyone => true,
+                Grantees::Users(u) => u.contains(author),
+            }
     }
 }
 
-impl std::fmt::Display for PathFilter {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let owner = self.owner.as_ref().map_or("*".into(), encode_id);
-        write!(f, "bb://{owner}{}", self.path)
-    }
-}
-
-/// A "federate" record's data: push records to the server at `url`, if their type is in `types` and
-/// they match one of `paths`. Either missing means all. Tombstones always pass the type filter, so
-/// deletes follow what they delete.
+/// A "federate" record's data: push records to the node `peer` at `url`, if their type is in `types`
+/// and they're at or under one of `paths`. Either missing means all. Tombstones always pass the type
+/// filter, so deletes follow what they delete.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FederateData {
+    pub peer: Pubkey,
     pub url: String,
     pub types: Option<Vec<String>>,
-    pub paths: Option<Vec<PathFilter>>,
+    pub paths: Option<Vec<String>>,
 }
 
 fn check_url(url: &str) -> Result<(), String> {
@@ -250,59 +243,43 @@ fn check_url(url: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn text_list(v: &CBOR) -> Option<Vec<String>> {
+    v.as_array()?.iter().map(text).collect()
+}
+
 impl FederateData {
     pub fn from_cbor(v: &CBOR) -> Result<Self, String> {
         let m = as_map(v, "a federate record's data")?;
-        let list = |v: &CBOR| v.as_array().map(<[CBOR]>::to_vec);
-        let types = opt_field(m, "types", list)?
-            .map(|a| a.iter().map(|t| text(t).ok_or("types must be text")).collect::<Result<Vec<_>, _>>())
-            .transpose()?;
-        let paths = opt_field(m, "paths", list)?
-            .map(|a| {
-                a.iter()
-                    .map(|p| {
-                        let p = as_map(p, "paths")?;
-                        let f = PathFilter { owner: opt_field(p, "owner", bytes)?, path: field(p, "path", text)? };
-                        if f.path != "/" {
-                            check_path(&f.path)?;
-                        }
-                        Ok(f)
-                    })
-                    .collect::<Result<Vec<_>, String>>()
-            })
-            .transpose()?;
-        let d = FederateData { url: field(m, "url", text)?, types, paths };
+        let d = FederateData {
+            peer: field(m, "peer", bytes)?,
+            url: field(m, "url", text)?,
+            types: opt_field(m, "types", text_list)?,
+            paths: opt_field(m, "paths", text_list)?,
+        };
         check_url(&d.url)?;
+        for p in d.paths.iter().flatten() {
+            check_prefix(p)?;
+        }
         Ok(d)
     }
 
     pub fn to_cbor(&self) -> CBOR {
         let mut m = Map::new();
+        m.insert("peer", CBOR::to_byte_string(self.peer));
         m.insert("url", self.url.as_str());
         if let Some(t) = &self.types {
             m.insert("types", t.clone());
         }
         if let Some(p) = &self.paths {
-            let p: Vec<CBOR> = p
-                .iter()
-                .map(|f| {
-                    let mut m = Map::new();
-                    m.insert("path", f.path.as_str());
-                    if let Some(o) = f.owner {
-                        m.insert("owner", CBOR::to_byte_string(o));
-                    }
-                    m.into()
-                })
-                .collect();
-            m.insert("paths", p);
+            m.insert("paths", p.clone());
         }
         m.into()
     }
 
-    /// Whether a record of type `kind` at (`owner`, `path`) goes to this peer.
-    pub fn wants(&self, owner: &Pubkey, path: &str, kind: &str) -> bool {
+    /// Whether a record of type `kind` at `path` goes to this peer.
+    pub fn wants(&self, path: &str, kind: &str) -> bool {
         (kind == "tombstone" || self.types.as_ref().is_none_or(|t| t.iter().any(|t| t == kind)))
-            && self.paths.as_ref().is_none_or(|p| p.iter().any(|f| f.matches(owner, path)))
+            && self.paths.as_ref().is_none_or(|p| p.iter().any(|p| path_within(path, p)))
     }
 }
 
@@ -330,23 +307,15 @@ pub fn check_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// A record's address as shown at the edges: bb://<owner, base58><path>.
-pub fn encode_uri(owner: &Pubkey, path: &str) -> String {
-    format!("bb://{}{path}", encode_id(owner))
-}
-
-/// Parses a bb:// address into (owner, path).
-pub fn decode_uri(uri: &str) -> Result<(Pubkey, String), String> {
-    let rest = uri.strip_prefix("bb://").ok_or("an address starts with bb://")?;
-    let (owner, path) = rest.split_at(rest.find('/').ok_or("an address needs a path after the owner")?);
-    let owner = decode_id(owner).ok_or("an address's owner isn't an ID (32 bytes of base58)")?;
-    check_path(path)?;
-    Ok((owner, path.into()))
+/// A path to match records at or under: a path, or "/" for all of them.
+pub fn check_prefix(prefix: &str) -> Result<(), String> {
+    if prefix == "/" { Ok(()) } else { check_path(prefix) }
 }
 
 /// Whether `path` is `prefix` or below it, by whole segments ("/a/b" is under "/a", not under "/a/b2").
+/// Everything is under "/".
 pub fn path_within(path: &str, prefix: &str) -> bool {
-    path.strip_prefix(prefix).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    prefix == "/" || path.strip_prefix(prefix).is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
 }
 
 pub fn verify_sig(pk: &Pubkey, msg: &[u8], sig: &[u8; 64]) -> Result<(), String> {
@@ -354,34 +323,46 @@ pub fn verify_sig(pk: &Pubkey, msg: &[u8], sig: &[u8; 64]) -> Result<(), String>
     pk.verify_strict(msg, &Signature::from_bytes(sig)).map_err(|_| "signature doesn't match".into())
 }
 
+/// The path each node type belongs at.
+fn node_type_path(kind: &str) -> Option<&'static str> {
+    Some(match kind {
+        "node" => NODE_INFO_PATH,
+        "owner" => OWNER_PATH,
+        "grant" => GRANTS_PATH,
+        "federate" => FEDERATE_PATH,
+        _ => return None,
+    })
+}
+
 impl Record {
     fn unsigned_map(&self) -> Map {
         let mut m = self.extra.clone();
         m.insert("author", CBOR::to_byte_string(self.author));
-        m.insert("owner", CBOR::to_byte_string(self.owner));
         m.insert("path", self.path.as_str());
         m.insert("version", self.version);
         m.insert("type", self.kind.as_str());
         m.insert("data", self.data.clone());
-        if let Some(a) = &self.authorization {
-            let mut am = Map::new();
-            am.insert("path", a.path.as_str());
-            am.insert("signature", CBOR::to_byte_string(a.signature));
-            m.insert("authorization", am);
+        if let Some(e) = self.edits {
+            m.insert("edits", CBOR::to_byte_string(e));
         }
         m
     }
 
-    /// A server record's URL.
-    pub fn server_url(&self) -> Option<String> {
-        let m = self.data.as_map().filter(|_| self.kind == "server")?;
+    /// A node record's URL.
+    pub fn node_url(&self) -> Option<String> {
+        let m = self.data.as_map().filter(|_| self.kind == "node")?;
         field(m, "url", text).ok()
     }
 
-    /// An owner record's user: who claimed the server.
+    /// An owner record's user.
     pub fn owner_user(&self) -> Option<Pubkey> {
         let m = self.data.as_map().filter(|_| self.kind == "owner")?;
         field(m, "user", bytes).ok()
+    }
+
+    /// Whether it's one of a node's own records, which are never federated.
+    pub fn is_node_record(&self) -> bool {
+        path_within(&self.path, NODE_PATH)
     }
 
     /// The bytes the author signs.
@@ -399,13 +380,14 @@ impl Record {
         self.to_cbor().to_cbor_data()
     }
 
-    /// Parses a record's structure. Doesn't check its contents or signatures: see `check`.
+    /// What identifies it: SHA-256 of its bytes, signature included.
+    pub fn hash(&self) -> Hash {
+        Sha256::digest(self.to_bytes()).into()
+    }
+
+    /// Parses a record's structure. Doesn't check its contents or signature: see `check`.
     pub fn from_cbor(v: &CBOR) -> Result<Self, String> {
         let m = as_map(v, "a record")?;
-        let authorization = opt_field(m, "authorization", |v| {
-            let a = v.as_map()?;
-            Some(Authorization { path: field(a, "path", text).ok()?, signature: field(a, "signature", bytes).ok()? })
-        })?;
         let mut extra = Map::new();
         for (k, v) in m.iter() {
             if !k.as_text().is_some_and(|k| RECORD_FIELDS.contains(&k)) {
@@ -414,12 +396,11 @@ impl Record {
         }
         Ok(Record {
             author: field(m, "author", bytes)?,
-            owner: field(m, "owner", bytes)?,
             path: field(m, "path", text)?,
             version: field(m, "version", |v| u64::try_from(v.clone()).ok())?,
             kind: field(m, "type", text)?,
             data: field(m, "data", |v| Some(v.clone()))?,
-            authorization,
+            edits: opt_field(m, "edits", bytes)?,
             signature: field(m, "signature", bytes)?,
             extra,
         })
@@ -429,59 +410,36 @@ impl Record {
         Self::from_cbor(&CBOR::try_from_data(b).map_err(|e| format!("CBOR: {e}"))?)
     }
 
-    /// Checks everything that doesn't depend on other records: the path, that `data` fits `type`,
-    /// the authorization, and the author's signature.
+    /// Checks everything that doesn't depend on other records: the path, that `data` fits `type`, and
+    /// the author's signature. Who may write what is up to each node (see "nodes" above).
     pub fn check(&self) -> Result<(), String> {
         check_path(&self.path)?;
+        match node_type_path(&self.kind) {
+            Some(p) if self.path != p => return Err(format!("a {} record belongs at {p}", self.kind)),
+            None if self.kind != "tombstone" && self.is_node_record() => {
+                return Err(format!("{NODE_PATH} is for the node's own records, not {:?}", self.kind));
+            }
+            _ => {}
+        }
         match self.kind.as_str() {
             "tombstone" if !self.data.is_null() => return Err("a tombstone's data must be null".into()),
+            "tombstone" if self.edits.is_none() => return Err("a tombstone needs to say what it deletes (edits)".into()),
             "tombstone" => {}
             "post" => match self.data.as_text() {
                 Some(t) if !t.is_empty() && t.trim() == t => {}
                 _ => return Err("a post's data must be non-empty, trimmed text".into()),
             },
             "grant" => {
-                if self.author != self.owner {
-                    return Err("only the owner can grant access to their space".into());
-                }
-                let g = GrantData::from_cbor(&self.data)?;
-                check_path(&g.path).map_err(|e| format!("grant: {e}"))?;
-                verify_sig(&self.owner, &grant_signed_bytes(&g.grantee, &self.owner, &g.path), &g.signature)
-                    .map_err(|e| format!("grant: {e}"))?;
+                GrantData::from_cbor(&self.data).map_err(|e| format!("grant: {e}"))?;
             }
-            "server" | "owner" if self.author != self.owner => {
-                return Err(format!("only a server can write its {} record", self.kind));
-            }
-            "server" => {
-                if self.path != "/server" {
-                    return Err("a server record belongs at /server".into());
-                }
-                check_url(&field(as_map(&self.data, "a server record's data")?, "url", text)?)?;
-            }
+            "node" => check_url(&field(as_map(&self.data, "a node record's data")?, "url", text)?)?,
             "owner" => {
-                if self.path != "/owner" {
-                    return Err("an owner record belongs at /owner".into());
-                }
                 field(as_map(&self.data, "an owner record's data")?, "user", bytes::<32>)?;
             }
             "federate" => {
-                federate_peer(&self.path).ok_or("a federate record belongs at /federate/<server ID>")?;
                 FederateData::from_cbor(&self.data)?;
             }
             _ => return Err(format!("unknown record type {:?}", self.kind)),
-        }
-        match (&self.authorization, self.author == self.owner) {
-            (None, true) => {}
-            (Some(_), true) => return Err("owners don't need an authorization in their own space".into()),
-            (None, false) => return Err("writing in someone else's space needs their authorization".into()),
-            (Some(a), false) => {
-                check_path(&a.path).map_err(|e| format!("authorization: {e}"))?;
-                if !path_within(&self.path, &a.path) {
-                    return Err(format!("the authorization only covers {}", a.path));
-                }
-                verify_sig(&self.owner, &grant_signed_bytes(&self.author, &self.owner, &a.path), &a.signature)
-                    .map_err(|e| format!("authorization: {e}"))?;
-            }
         }
         verify_sig(&self.author, &self.signed_bytes(), &self.signature)
     }
@@ -490,6 +448,22 @@ impl Record {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    fn signed(key: &SigningKey, path: &str, kind: &str, data: CBOR, edits: Option<Hash>) -> Record {
+        let mut r = Record {
+            author: key.verifying_key().to_bytes(),
+            path: path.into(),
+            version: 1,
+            kind: kind.into(),
+            data,
+            edits,
+            signature: [0; 64],
+            extra: Map::new(),
+        };
+        r.signature = key.sign(&r.signed_bytes()).to_bytes();
+        r
+    }
 
     #[test]
     fn paths() {
@@ -497,81 +471,76 @@ mod tests {
         for bad in ["", "/", "a", "/a/", "/a//b", "/a/../b", "/a/\n"] {
             assert!(check_path(bad).is_err(), "{bad:?}");
         }
-        assert!(path_within("/a/b", "/a") && path_within("/a", "/a") && !path_within("/ab", "/a"));
+        assert!(check_prefix("/").is_ok());
+        assert!(path_within("/a/b", "/a") && path_within("/a", "/a") && !path_within("/ab", "/a") && path_within("/a", "/"));
     }
 
     #[test]
-    fn record_signing_and_grants() {
-        use ed25519_dalek::{Signer, SigningKey};
-        let owner = SigningKey::from_bytes(&[1; 32]);
-        let author = SigningKey::from_bytes(&[2; 32]);
-        let (o, a) = (owner.verifying_key().to_bytes(), author.verifying_key().to_bytes());
-        let grant_sig = owner.sign(&grant_signed_bytes(&a, &o, "/shared")).to_bytes();
-        let mut r = Record {
-            author: a,
-            owner: o,
-            path: "/shared/x".into(),
-            version: 1,
-            kind: "post".into(),
-            data: "hi".into(),
-            authorization: Some(Authorization { path: "/shared".into(), signature: grant_sig }),
-            signature: [0; 64],
-            extra: Map::new(),
-        };
-        r.signature = author.sign(&r.signed_bytes()).to_bytes();
+    fn records() {
+        let key = SigningKey::from_bytes(&[1; 32]);
+        let r = signed(&key, "/posts/dogs", "post", "hi".into(), None);
         let back = Record::from_bytes(&r.to_bytes()).unwrap();
         assert_eq!(back, r);
+        assert_eq!(back.hash(), r.hash());
         back.check().unwrap();
 
         // Unknown fields survive a round trip, and the signature covers them.
         let mut x = r.clone();
         x.extra.insert("future", 1);
-        x.signature = author.sign(&x.signed_bytes()).to_bytes();
+        x.signature = key.sign(&x.signed_bytes()).to_bytes();
         let back = Record::from_bytes(&x.to_bytes()).unwrap();
         assert_eq!(back, x);
         back.check().unwrap();
+        assert_ne!(x.hash(), r.hash());
 
-        let mut g = Record {
-            author: o,
-            owner: o,
-            path: "/grants/1".into(),
-            version: 1,
-            kind: "grant".into(),
-            data: GrantData { grantee: a, path: "/shared".into(), signature: grant_sig }.to_cbor(),
-            authorization: None,
-            signature: [0; 64],
-            extra: Map::new(),
-        };
-        g.signature = owner.sign(&g.signed_bytes()).to_bytes();
-        g.check().unwrap();
+        let edit = signed(&key, "/posts/cats", "post", "hello".into(), Some(r.hash()));
+        assert_eq!(Record::from_bytes(&edit.to_bytes()).unwrap(), edit);
+        edit.check().unwrap();
+        signed(&key, "/posts/dogs", "tombstone", CBOR::null(), Some(r.hash())).check().unwrap();
+        assert!(signed(&key, "/posts/dogs", "tombstone", CBOR::null(), None).check().is_err());
 
-        let mut outside = r.clone();
-        outside.path = "/sharedx".into();
-        outside.signature = author.sign(&outside.signed_bytes()).to_bytes();
-        assert!(outside.check().is_err());
+        let mut bad = r.clone();
+        bad.data = "changed".into();
+        assert!(bad.check().is_err());
+    }
+
+    #[test]
+    fn node_records() {
+        let key = SigningKey::from_bytes(&[1; 32]);
+        let g = GrantData { path: "/posts".into(), grantees: Grantees::Users(vec![[2; 32]]) };
+        assert_eq!(GrantData::from_cbor(&g.to_cbor()).unwrap(), g);
+        assert!(g.covers(&[2; 32], "/posts/dogs") && !g.covers(&[3; 32], "/posts") && !g.covers(&[2; 32], "/postsx"));
+        let anyone = GrantData { path: "/".into(), grantees: Grantees::Anyone };
+        assert_eq!(GrantData::from_cbor(&anyone.to_cbor()).unwrap(), anyone);
+        assert!(anyone.covers(&[3; 32], "/x"));
+        signed(&key, GRANTS_PATH, "grant", g.to_cbor(), None).check().unwrap();
+        assert!(signed(&key, "/grants", "grant", g.to_cbor(), None).check().is_err());
+        assert!(signed(&key, "/node/x", "post", "hi".into(), None).check().is_err());
+
+        let mut owner = Map::new();
+        owner.insert("user", CBOR::to_byte_string([2u8; 32]));
+        let o = signed(&key, OWNER_PATH, "owner", owner.into(), None);
+        o.check().unwrap();
+        assert_eq!(o.owner_user(), Some([2; 32]));
+        assert!(o.is_node_record());
     }
 
     #[test]
     fn federate_filters() {
-        let (a, b) = ([1; 32], [2; 32]);
-        let all = FederateData { url: "http://x".into(), types: None, paths: None };
+        let all = FederateData { peer: [1; 32], url: "http://x".into(), types: None, paths: None };
         assert_eq!(FederateData::from_cbor(&all.to_cbor()).unwrap(), all);
-        assert!(all.wants(&a, "/anything", "post"));
+        assert!(all.wants("/anything", "post"));
         let some = FederateData {
+            peer: [1; 32],
             url: "http://x".into(),
             types: Some(vec!["post".into()]),
-            paths: Some(vec![PathFilter { owner: None, path: "/pub".into() }, PathFilter { owner: Some(b), path: "/".into() }]),
+            paths: Some(vec!["/pub".into(), "/b".into()]),
         };
         assert_eq!(FederateData::from_cbor(&some.to_cbor()).unwrap(), some);
-        assert!(some.wants(&a, "/pub/x", "post") && some.wants(&b, "/x", "post"));
-        assert!(some.wants(&a, "/pub/x", "tombstone"), "deletes follow");
-        assert!(!some.wants(&a, "/pubx", "post") && !some.wants(&a, "/pub/x", "grant"));
-        assert!(FederateData::from_cbor(&FederateData { url: "ftp://x".into(), ..all }.to_cbor()).is_err());
-        assert_eq!(federate_peer(&format!("/federate/{}", encode_id(&a))), Some(a));
-        assert_eq!(federate_peer("/federate/x/y"), None);
-        for f in ["bb://*/", "bb://*/pub", &format!("bb://{}/x/y", encode_id(&b))] {
-            assert_eq!(PathFilter::parse(f).unwrap().to_string(), f);
-        }
-        assert!(PathFilter::parse("bb://nope/x").is_err() && PathFilter::parse("bb://*").is_err());
+        assert!(some.wants("/pub/x", "post") && some.wants("/b", "post"));
+        assert!(some.wants("/pub/x", "tombstone"), "deletes follow");
+        assert!(!some.wants("/pubx", "post") && !some.wants("/pub/x", "grant"));
+        assert!(FederateData::from_cbor(&FederateData { url: "ftp://x".into(), ..all.clone() }.to_cbor()).is_err());
+        assert!(FederateData::from_cbor(&FederateData { paths: Some(vec!["nope".into()]), ..all }.to_cbor()).is_err());
     }
 }

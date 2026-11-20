@@ -1,27 +1,28 @@
 // Records, IDs and paths come from core/src/lib.rs, compiled to wasm (see wasm/src/lib.rs); main.tsx
 // loads it before anything here runs.
 import {
-  type Authorization,
   type Draft,
   type Rec,
   b58,
   checkPath,
+  checkPrefix,
   claimSignedBytes,
+  decodeEntries,
   decodeId,
   decodeRecord,
   decodeRecords,
   encodeRecord,
-  grantSignedBytes,
   pathWithin,
   phrase,
   signedBytes,
   twoWords,
+  unb58,
 } from "../../wasm/pkg/fedcrdt_wasm.js";
 
-export { type Authorization, type Rec, b58, pathWithin };
+export { type Rec, b58, pathWithin };
 
-/** `server`: the key is a server's (its phrase is "server_word"). */
-export type User = { pubkey: string; phrase: string; server: boolean };
+/** `node`: the key is a node's (its phrase is "node_word"). */
+export type User = { pubkey: string; phrase: string; node: boolean };
 
 async function api<T>(path: string, body?: unknown, method = body === undefined ? "GET" : "POST"): Promise<T> {
   const res = await fetch(
@@ -45,18 +46,34 @@ export const getUser = (pubkey: string) => api<User>(`/api/users/${pubkey}`);
 /** Whether `s` is an ID: 32 bytes of base58. */
 export const isPubkey = (s: string) => decodeId(s) !== undefined;
 
-/** IDs of keys known to be servers', from their /server records and federate records naming them. */
-const servers = new Set<string>();
-export const isServer = (pubkey: string) => servers.has(pubkey);
-export async function loadServers() {
-  for (const s of await api<string[]>("/api/servers")) servers.add(s);
+/** Whether `s` is a record hash: 32 bytes of base58. */
+export const isHash = (s: string) => unb58(s)?.length === 32;
+
+/** IDs of keys known to be nodes': this one, and the peers it federates with. */
+const nodes = new Set<string>();
+export const isNode = (pubkey: string) => nodes.has(pubkey);
+
+/** The node this page talks to, and who owns it. */
+export type NodeInfo = { pubkey: string; phrase: string; owners: string[] };
+let thisNode: NodeInfo | null = null;
+export const getNode = (url = "") => api<NodeInfo>(`${url}/api/node`);
+
+/** Loads this node's info and the nodes it knows of. */
+export async function loadNode() {
+  const [n, list] = await Promise.all([getNode(), api<string[]>("/api/nodes")]);
+  thisNode = n;
+  for (const s of list) nodes.add(s);
+  return n;
 }
 
-/** An ID's "🦬two_words" nickname, or "server_word" for a known server's. */
+/** Whether we own this node (as of the last `loadNode`). */
+export const amOwner = () => !!keys && !!thisNode?.owners.includes(keys.pubkey);
+
+/** An ID's "🦬two_words" nickname, or "node_word" for a known node's. */
 export function userPhrase(pubkey: string) {
   const pk = decodeId(pubkey);
   if (!pk) throw new Error("not an ID");
-  return phrase(pk, servers.has(pubkey));
+  return phrase(pk, nodes.has(pubkey));
 }
 
 // ---- bytes ----
@@ -73,7 +90,7 @@ const random = (n: number) => crypto.getRandomValues(new Uint8Array(n));
 // Everything hangs off one secret: the passkey's PRF output for a fixed salt. Only that passkey
 // can produce it. From it we derive (HKDF) an Ed25519 keypair, whose public key is the user's ID.
 // There is no sign-in: having the keys loaded is all; the
-// server has no sessions and never sees the secret or the private keys.
+// node has no sessions and never sees the secret or the private keys.
 
 const PRF_SALT = enc.encode("bisonbase keys v1");
 const REMEMBER_KEY = "bisonbase-keys";
@@ -296,77 +313,106 @@ export function forgetKeys() {
 
 // ---- records ----
 //
-// Everything users write is a record: a dCBOR map signed by its author, identified by (owner, path),
-// where the newest version wins. The server stores and returns records exactly as signed; the wasm
-// core decodes and checks them here in the browser, so nothing depends on trusting the server.
+// Everything users write is a record: a dCBOR map signed by its author, identified by its hash. Paths
+// are only categories: any number of records share one. An edit or delete is a new record naming the
+// version it replaces (`edits`); a record and its edits form a chain, linked to by its first record's
+// hash. The node stores and returns records exactly as signed; the wasm core decodes and checks them
+// here in the browser, so nothing depends on trusting the node.
 
-/** A record as shown: its decoded IDs, its bb:// address, and whether it checks out. */
+/** A record as shown: its decoded IDs, its chain, and whether it checks out. */
 export type Post = {
   rec: Rec;
+  /** This version's hash (base58). */
+  hash: string;
+  /** Its chain's first record's hash (base58): the link that stays the same across edits. */
+  root: string;
   author: User;
-  owner: User;
-  /** bb://<owner><path> */
-  uri: string;
-  /** Whether its signature (and authorization, if any) verified, in this browser. */
+  /** Who wrote the chain's first version, if known: who may edit it, besides the node's owners. */
+  by: User | null;
+  /** How many versions its chain has. */
+  versions: number;
+  /** Whether its signature verified, in this browser. */
   verified: boolean;
   /** The text, if it's a plain post. */
   text: string | null;
   /** For grant records: who may write, and where. */
-  grant?: { grantee: User; path: string };
-  /** For federate records: which server gets pushed what. `types` and `paths` are null for all. */
+  grant?: { path: string; grantees: User[] | "anyone" };
+  /** For federate records: which node gets pushed what. `types` and `paths` are null for all. */
   federate?: { peer: User; url: string; types: string[] | null; paths: string[] | null };
-  /** For a server record: its URL. */
-  serverUrl?: string;
-  /** For a server's owner record: who claimed it. */
-  claimedBy?: User;
+  /** For a node record: its URL. */
+  nodeUrl?: string;
+  /** For an owner record: who. */
+  ownerUser?: User;
 };
 
 const bytesEqual = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((x, i) => x === b[i]);
 
-/** Trims and NFC-normalizes a path someone typed, then checks it (see check_path in core/src/lib.rs). Throws if it's bad. */
-export function normalizePath(input: string) {
+/** Compares bytes like the node does (memcmp, then length). */
+const bytesCmp = (a: Uint8Array, b: Uint8Array) => {
+  for (let i = 0; i < Math.min(a.length, b.length); i++) if (a[i] !== b[i]) return a[i] - b[i];
+  return a.length - b.length;
+};
+
+/** Trims and NFC-normalizes a path someone typed, then checks it (see check_path in core/src/lib.rs).
+ * Throws if it's bad. `prefix`: "/" is fine too. */
+export function normalizePath(input: string, prefix = false) {
   const path = input.trim().normalize("NFC");
-  checkPath(path);
+  if (prefix) checkPrefix(path);
+  else checkPath(path);
   return path;
 }
 
 const toUser = (pk: Uint8Array): User => {
   const pubkey = b58(pk);
-  return { pubkey, phrase: userPhrase(pubkey), server: servers.has(pubkey) };
+  return { pubkey, phrase: userPhrase(pubkey), node: nodes.has(pubkey) };
 };
 
-export function viewPost(rec: Rec): Post {
+export function viewPost(rec: Rec, chain?: { root: Uint8Array; by?: Uint8Array; versions: number }): Post {
   const f = rec.federate;
+  const g = rec.grant;
   return {
-    grant: rec.grant && { grantee: toUser(rec.grant.grantee), path: rec.grant.path },
+    grant: g && { path: g.path, grantees: g.grantees === "anyone" ? "anyone" : g.grantees.map(toUser) },
     federate: f && { peer: toUser(f.peer), url: f.url, types: f.types ?? null, paths: f.paths ?? null },
-    serverUrl: rec.serverUrl,
-    claimedBy: rec.claimedBy && toUser(rec.claimedBy),
+    nodeUrl: rec.nodeUrl,
+    ownerUser: rec.ownerUser && toUser(rec.ownerUser),
     rec,
+    hash: b58(rec.hash),
+    root: b58(chain?.root ?? rec.hash),
     author: toUser(rec.author),
-    owner: toUser(rec.owner),
-    uri: `bb://${b58(rec.owner)}${rec.path}`,
+    by: chain ? (chain.by ? toUser(chain.by) : null) : toUser(rec.author),
+    versions: chain?.versions ?? 1,
     verified: rec.verified,
     text: rec.text ?? null,
   };
 }
 
-/** Live records, newest first; optionally only `owner`'s space, `author`'s, those `user` owns or
- * wrote, of one `type`, or at or under `prefix`. */
-export async function getPosts(q: { owner?: string; author?: string; user?: string; type?: string; prefix?: string } = {}) {
+/** The current version of each live record, newest first; optionally only those first written by
+ * `author`, of one `type`, or at or under `prefix`. */
+export async function getPosts(q: { author?: string; type?: string; prefix?: string } = {}) {
   const params = new URLSearchParams(Object.entries(q).filter((e): e is [string, string] => !!e[1]));
   const res = await fetch(`/api/records?${params}`);
   if (!res.ok) throw new Error((await res.text()) || res.statusText);
-  const list = decodeRecords(new Uint8Array(await res.arrayBuffer()));
-  // Learn which keys are servers' first, so they get server phrases.
-  for (const r of list) {
-    if (r.serverUrl !== undefined && r.path === "/server") servers.add(b58(r.owner));
-    if (r.federate) servers.add(b58(r.federate.peer));
-  }
-  return list.map(viewPost);
+  return decodeEntries(new Uint8Array(await res.arrayBuffer())).map((e) => viewPost(e.rec, e));
 }
 
-/** Signs `d` (as us) and stores it. */
+/** A record's whole chain: every version, oldest first; the current one; and the tombstone, if it was deleted. */
+export type Chain = { versions: Post[]; current: Post | null; deleted: Post | null };
+
+/** The chain that the record with this hash (base58) is in. */
+export async function getChain(hash: string): Promise<Chain> {
+  const res = await fetch(`/api/records/${hash}`);
+  if (!res.ok) throw new Error((await res.text()) || res.statusText);
+  const recs = decodeRecords(new Uint8Array(await res.arrayBuffer()));
+  // The first record: the one whose `edits` isn't here.
+  const root = recs.find((r) => !r.edits || !recs.some((o) => bytesEqual(o.hash, r.edits!))) ?? recs[0];
+  const chain = { root: root.hash, by: root.edits ? undefined : root.author, versions: recs.length };
+  const versions = recs.map((r) => viewPost(r, chain));
+  const newest = (a: Post, b: Post) => a.rec.version - b.rec.version || bytesCmp(a.rec.hash, b.rec.hash);
+  const live = versions.filter((p) => p.rec.type !== "tombstone").sort(newest);
+  return { versions, current: live.at(-1) ?? null, deleted: versions.find((p) => p.rec.type === "tombstone") ?? null };
+}
+
+/** Signs `d` (as us) and stores it. Returns its hash (base58). */
 async function putRec(d: Draft) {
   const signature = await sign(signedBytes(d));
   const res = await fetch("/api/records", {
@@ -375,88 +421,82 @@ async function putRec(d: Draft) {
     body: encodeRecord(d, signature) as Uint8Array<ArrayBuffer>,
   });
   if (!res.ok) throw new Error((await res.text()) || res.statusText);
+  return ((await res.json()) as { hash: string }).hash;
 }
 
 /** A version newer than both the clock and `prev`, so quick successive edits still go through. */
 const nextVersion = (prev = 0) => Math.max(Date.now(), prev + 1);
 
-// ---- grants: letting someone else write in your space ----
+// ---- grants: who may write where ----
 //
-// The owner signs {author: grantee, owner, path} and keeps it in their space as a "grant" record
-// (by default under /grants). The grantee finds it there and copies its signature into their
-// records' `authorization`.
+// Owners may write anywhere. They let others write at or under a path with grant records, at /node/grants.
 
-/** A grant given to us: where we may write. */
-export type Grant = { owner: User; ownerPk: Uint8Array; path: string; signature: Uint8Array; uri: string };
-
-/** Lets `grantee` (base58 ID) write at or under `path` in our space, saving the grant as a record. Returns its address. */
-export async function makeGrant(grantee: string, path: string) {
-  if (!keys) throw new Error("Derive keys first.");
-  const g = decodeId(grantee.trim());
-  if (!g) throw new Error("That isn't an ID (32 bytes of base58).");
-  path = normalizePath(path);
-  const signature = await sign(grantSignedBytes(g, keys.pk, path));
-  const at = `/grants/${b58(random(8))}`;
-  await putRec({ author: keys.pk, owner: keys.pk, path: at, version: nextVersion(), type: "grant", data: { grantee: g, path, signature } });
-  return `bb://${keys.pubkey}${at}`;
+/** Where we may write, from the grants that name us (or anyone). */
+export async function myGrants(): Promise<string[]> {
+  if (!keys) return [];
+  const me = keys.pubkey;
+  return (await getPosts({ type: "grant", prefix: "/node/grants" }))
+    .filter((p) => p.verified && p.grant && (p.grant.grantees === "anyone" || p.grant.grantees.some((u) => u.pubkey === me)))
+    .map((p) => p.grant!.path);
 }
 
-/** Grants others have given us, from their grant records (verified here). */
-export async function myGrants(): Promise<Grant[]> {
-  if (!keys) return [];
-  const pk = keys.pk;
-  return (await getPosts({ type: "grant" }))
-    .filter((p) => p.verified && p.grant?.grantee.pubkey === keys?.pubkey && !bytesEqual(p.rec.owner, pk))
-    .map((p) => ({ owner: p.owner, ownerPk: p.rec.owner, path: p.rec.grant!.path, signature: p.rec.grant!.signature, uri: p.uri }));
+/** Parses IDs (base58) separated by spaces, commas or new lines, or "anyone". */
+function parseGrantees(s: string): Uint8Array[] | "anyone" {
+  if (s.trim().toLowerCase() === "anyone") return "anyone";
+  const ids = s.split(/[\s,]+/).filter(Boolean);
+  if (!ids.length) throw new Error("Say who: IDs, or \"anyone\".");
+  return ids.map((id) => {
+    const pk = decodeId(id);
+    if (!pk) throw new Error(`${id} isn't an ID (32 bytes of base58).`);
+    return pk;
+  });
+}
+
+/** Lets `grantees` (IDs, or "anyone") write at or under `path` ("/" for everywhere). Owners only. Returns the grant's hash. */
+export async function makeGrant(grantees: string, path: string) {
+  if (!keys) throw new Error("Sign in first.");
+  const data = { path: normalizePath(path, true), grantees: parseGrantees(grantees) };
+  return putRec({ author: keys.pk, path: "/node/grants", version: nextVersion(), type: "grant", data });
+}
+
+/** Makes `user` (an ID) an owner of this node. Owners only. */
+export async function addOwner(user: string) {
+  if (!keys) throw new Error("Sign in first.");
+  const u = decodeId(user.trim());
+  if (!u) throw new Error("That isn't an ID (32 bytes of base58).");
+  return putRec({ author: keys.pk, path: "/node/owner", version: nextVersion(), type: "owner", data: { user: u } });
 }
 
 // ---- writing posts ----
 
-/** Who owns the space a write goes to, and the authorization needed if it isn't us. */
-function placement(existing?: Post, grant?: Grant): Pick<Draft, "owner" | "authorization"> {
-  const owner = existing?.rec.owner ?? grant?.ownerPk ?? keys!.pk;
-  if (bytesEqual(owner, keys!.pk)) return { owner };
-  // Writing to an existing record of ours in someone's space reuses the authorization it carries.
-  const authorization: Authorization | undefined =
-    grant && bytesEqual(grant.ownerPk, owner)
-      ? { path: grant.path, signature: grant.signature }
-      : existing && bytesEqual(existing.rec.author, keys!.pk)
-        ? existing.rec.authorization
-        : undefined;
-  if (!authorization) throw new Error("Writing in someone else's space needs a grant from them.");
-  return { owner, authorization };
-}
-
-/** Whether we can delete this record (and edit it, if it's a post): it's in our space, or we wrote it under a grant. */
+/** Whether we may edit or delete this record: we wrote it, or we own this node. */
 export const canEdit = (p: Post) =>
-  !!keys && (bytesEqual(p.rec.owner, keys.pk) || (bytesEqual(p.rec.author, keys.pk) && !!p.rec.authorization));
+  !!keys && p.rec.type !== "node" && (amOwner() || (p.by?.pubkey === keys.pubkey && !pathWithin(p.rec.path, "/node")));
 
-/** Creates a post at `path` (in our space, or the grant's owner's), or replaces `existing`. Always signed. */
-export async function putPost(text: string, opts: { path?: string; grant?: Grant }, existing?: Post) {
-  if (!keys) throw new Error("Derive keys first.");
-  const path = existing?.rec.path ?? normalizePath(opts.path ?? "");
-  const where = placement(existing, opts.grant);
-  if (where.authorization && !pathWithin(path, where.authorization.path)) {
-    throw new Error(`The grant only covers ${where.authorization.path}.`);
-  }
-  await putRec({ author: keys.pk, ...where, path, version: nextVersion(existing?.rec.version), type: "post", data: text.trim() });
+/** Creates a post at `path`, or edits `existing` (possibly moving it to `path`). Returns its hash. */
+export async function putPost(text: string, path: string, existing?: Post) {
+  if (!keys) throw new Error("Sign in first.");
+  return putRec({
+    author: keys.pk,
+    path: normalizePath(path),
+    version: nextVersion(existing?.rec.version),
+    type: "post",
+    edits: existing?.rec.hash,
+    data: text.trim(),
+  });
 }
 
-/** Deletes a post, leaving a signed tombstone at its path. */
+/** Deletes a record, with a signed tombstone naming its current version. */
 export async function deletePost(p: Post) {
-  if (!keys) throw new Error("Derive keys first.");
-  await putRec({ author: keys.pk, ...placement(p), path: p.rec.path, version: nextVersion(p.rec.version), type: "tombstone", data: null });
+  if (!keys) throw new Error("Sign in first.");
+  await putRec({ author: keys.pk, path: p.rec.path, version: nextVersion(p.rec.version), type: "tombstone", edits: p.rec.hash, data: null });
 }
-
-/** A random path for a new post. */
-export const newPostPath = () => `/posts/${b58(random(8))}`;
 
 /** A post with a made-up signature, to show what a bad one looks like. */
 export function forgedPost(): Post {
   const pk = decodeId("4zvwRjXUKGfvwnParsHAS3HuSVzV5cA4McphgmoCtajS")!;
   const draft: Draft = {
     author: pk,
-    owner: pk,
     path: "/demo/forged",
     version: Date.now(),
     type: "post",
@@ -465,55 +505,45 @@ export function forgedPost(): Post {
   return viewPost(decodeRecord(encodeRecord(draft, new Uint8Array(64))));
 }
 
-// ---- this server, and federation ----
+// ---- this node, and federation ----
 //
-// Each server has its own key and space. Its owner claims it once with a one-time link (printed by the
-// server), and is then granted /federate in its space, where each "federate" record names a peer
-// server to push records to. See core/src/lib.rs.
+// Each node has its own key. Its owner claims it once with a one-time link (printed by the node); owners
+// may then add other owners, grants, and "federate" records naming peer nodes to push records to. All
+// of those live under /node and are never federated. See core/src/lib.rs.
 
-export type ServerInfo = { pubkey: string; phrase: string; owner: string | null };
-export const getServer = (url = "") => api<ServerInfo>(`${url}/api/server`);
-
-/** Claims this server as its owner (us), with the token from its claim link. Returns the server's ID. */
-export async function claimServer(token: string) {
+/** Claims this node as its first owner (us), with the token from its claim link. Returns the node's ID. */
+export async function claimNode(token: string) {
   if (!keys) throw new Error("Sign in first.");
-  const server = await getServer();
-  const t = decodeId(token);
-  if (!t) throw new Error("This claim link is broken: its token isn't 32 bytes of base58.");
-  const signature = await sign(claimSignedBytes(decodeId(server.pubkey)!, t));
+  const node = await getNode();
+  const t = unb58(token);
+  if (!t) throw new Error("This claim link is broken: its token isn't base58.");
+  const signature = await sign(claimSignedBytes(decodeId(node.pubkey)!, t));
   await api("/api/claim", { token, user: keys.pubkey, signature: b58(signature) });
-  servers.add(server.pubkey);
-  return server.pubkey;
+  await loadNode();
+  return node.pubkey;
 }
 
-/** Has `server` (our own server's ID) push records to the server at `url`: those of the given types
- * (comma- or space-separated; none for all) at the given paths (bb://<ID or *>/<path>, one per line;
- * none for all). We need its /federate grant, i.e. to be its owner. Returns the record's address. */
-export async function putFederate(server: string, url: string, types: string, paths: string) {
+/** Has this node push records to the node at `url`: those of the given types (comma- or space-separated;
+ * none for all) at or under the given paths (one per line; none for all). Owners only. Returns the record's hash. */
+export async function putFederate(url: string, types: string, paths: string) {
   if (!keys) throw new Error("Sign in first.");
   url = url.trim().replace(/\/+$/, "");
-  if (!/^https?:\/\/\S+$/.test(url)) throw new Error("Enter the other server's http:// or https:// URL.");
-  const peer = await getServer(url).then(
+  if (!/^https?:\/\/\S+$/.test(url)) throw new Error("Enter the other node's http:// or https:// URL.");
+  const peer = await getNode(url).then(
     (s) => s.pubkey,
     (e) => {
-      throw new Error(`Couldn't reach a server at ${url}: ${e.message}`);
+      throw new Error(`Couldn't reach a node at ${url}: ${e.message}`);
     },
   );
-  if (peer === server) throw new Error("That's this server.");
-  const grant = (await myGrants()).find((g) => g.owner.pubkey === server && pathWithin("/federate", g.path));
-  if (!grant) throw new Error("Only this server's owner can federate it.");
+  if (peer === thisNode?.pubkey) throw new Error("That's this node.");
   const t = types.split(/[\s,]+/).filter(Boolean);
-  const p = paths.split("\n").map((s) => s.trim()).filter(Boolean);
-  const path = `/federate/${peer}`;
-  servers.add(peer);
-  await putRec({
+  const p = paths.split("\n").map((s) => s.trim()).filter(Boolean).map((s) => normalizePath(s, true));
+  nodes.add(peer);
+  return putRec({
     author: keys.pk,
-    owner: grant.ownerPk,
-    authorization: { path: grant.path, signature: grant.signature },
-    path,
+    path: "/node/federate",
     version: nextVersion(),
     type: "federate",
-    data: { url, ...(t.length && { types: t }), ...(p.length && { paths: p }) },
+    data: { peer: decodeId(peer)!, url, ...(t.length && { types: t }), ...(p.length && { paths: p }) },
   });
-  return `bb://${server}${path}`;
 }

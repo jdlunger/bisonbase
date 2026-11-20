@@ -2,8 +2,9 @@
 //! Built into wasm/pkg by `npm run wasm`.
 
 use fedcrdt_core::{
-    Authorization, CBOR, FederateData, GrantData, Map, PathFilter, Record, check_path, claim_signed_bytes,
-    decode_id, encode_b58, federate_peer, grant_signed_bytes, path_within, phrase, server_phrase, two_words,
+    CBOR, FederateData, GrantData, Grantees, Map, Record, check_path, check_prefix, claim_signed_bytes, decode_b58, decode_id,
+    encode_b58,
+    node_phrase, path_within, phrase, two_words,
 };
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
@@ -11,47 +12,49 @@ use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen(typescript_custom_section)]
 const TYPES: &str = r#"
-export type Authorization = { path: string; signature: Uint8Array };
+/** A grant's data: who may write at or under `path` ("/" for everywhere). */
+export type GrantData = { path: string; grantees: "anyone" | Uint8Array[] };
+
+/** A federate record's data. Missing `types` or `paths` means all. */
+export type FederateData = { peer: Uint8Array; url: string; types?: string[]; paths?: string[] };
 
 /** A record, decoded and checked. Field by field, see core/src/lib.rs. */
 export type Rec = {
+  /** SHA-256 of its bytes: what identifies it. */
+  hash: Uint8Array;
   author: Uint8Array;
-  owner: Uint8Array;
   path: string;
   version: number;
   type: string;
-  authorization?: Authorization;
+  edits?: Uint8Array;
   signature: Uint8Array;
-  /** Whether it checks out: its path, data, authorization and signature. */
+  /** Whether it checks out: its path, data and signature. */
   verified: boolean;
   /** Why it doesn't, if it doesn't. */
   problem?: string;
   /** A post's text. */
   text?: string;
-  /** A grant record's data. */
-  grant?: { grantee: Uint8Array; path: string; signature: Uint8Array };
-  /** A federate record's peer and data; `paths` written bb://<ID or *><path>. Missing `types` or `paths` means all. */
-  federate?: { peer: Uint8Array; url: string; types?: string[]; paths?: string[] };
-  /** A server record's URL. */
-  serverUrl?: string;
-  /** An owner record's user: who claimed the server. */
-  claimedBy?: Uint8Array;
+  grant?: GrantData;
+  federate?: FederateData;
+  /** A node record's URL. */
+  nodeUrl?: string;
+  /** An owner record's user. */
+  ownerUser?: Uint8Array;
 };
 
-/** A record to sign and write. `data` is the text of a "post", null for a "tombstone", or a grant's or
- * federate record's data (federate `paths` written bb://<ID or *><path>). */
+/** A chain's current version, as GET /api/records lists them: `root` is the chain's first record's
+ * hash, `by` who wrote that (if the node has it), `versions` how many there are. */
+export type Entry = { rec: Rec; root: Uint8Array; by?: Uint8Array; versions: number };
+
+/** A record to sign and write. `data` is the text of a "post", null for a "tombstone", or a grant's,
+ * federate record's or owner record's data. */
 export type Draft = {
   author: Uint8Array;
-  owner: Uint8Array;
   path: string;
   version: number;
   type: string;
-  authorization?: Authorization;
-  data:
-    | string
-    | null
-    | { grantee: Uint8Array; path: string; signature: Uint8Array }
-    | { url: string; types?: string[]; paths?: string[] };
+  edits?: Uint8Array;
+  data: string | null | GrantData | FederateData | { user: Uint8Array };
 };
 "#;
 
@@ -75,23 +78,17 @@ fn to_js(v: &impl Serialize) -> Result<JsValue> {
 
 // ---- reading ----
 
-#[derive(Serialize, Deserialize)]
-struct AuthorizationJs {
-    path: String,
-    signature: ByteBuf,
-}
-
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RecJs {
+    hash: ByteBuf,
     author: ByteBuf,
-    owner: ByteBuf,
     path: String,
     version: u64,
     #[serde(rename = "type")]
     kind: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    authorization: Option<AuthorizationJs>,
+    edits: Option<ByteBuf>,
     signature: ByteBuf,
     verified: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -103,19 +100,25 @@ struct RecJs {
     #[serde(skip_serializing_if = "Option::is_none")]
     federate: Option<FederateJs>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    server_url: Option<String>,
+    node_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    claimed_by: Option<ByteBuf>,
+    owner_user: Option<ByteBuf>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum GranteesJs {
+    Anyone(String),
+    Users(Vec<ByteBuf>),
 }
 
 #[derive(Serialize, Deserialize)]
 struct GrantJs {
-    grantee: ByteBuf,
     path: String,
-    signature: ByteBuf,
+    grantees: GranteesJs,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct FederateJs {
     peer: ByteBuf,
     url: String,
@@ -128,38 +131,67 @@ struct FederateJs {
 fn rec_js(r: &Record) -> RecJs {
     let problem = r.check().err();
     let grant = (r.kind == "grant").then(|| GrantData::from_cbor(&r.data).ok()).flatten();
-    let federate = (r.kind == "federate")
-        .then(|| Some((federate_peer(&r.path)?, FederateData::from_cbor(&r.data).ok()?)))
-        .flatten();
+    let federate = (r.kind == "federate").then(|| FederateData::from_cbor(&r.data).ok()).flatten();
     RecJs {
+        hash: buf(&r.hash()),
         author: buf(&r.author),
-        owner: buf(&r.owner),
         path: r.path.clone(),
         version: r.version,
         kind: r.kind.clone(),
-        authorization: r.authorization.as_ref().map(|a| AuthorizationJs { path: a.path.clone(), signature: buf(&a.signature) }),
+        edits: r.edits.map(|e| buf(&e)),
         signature: buf(&r.signature),
         verified: problem.is_none(),
         problem,
         text: (r.kind == "post").then(|| r.data.as_text().map(Into::into)).flatten(),
-        grant: grant.map(|g| GrantJs { grantee: buf(&g.grantee), path: g.path, signature: buf(&g.signature) }),
-        federate: federate.map(|(peer, f)| FederateJs {
-            peer: buf(&peer),
-            url: f.url,
-            types: f.types,
-            paths: f.paths.map(|p| p.iter().map(PathFilter::to_string).collect()),
+        grant: grant.map(|g| GrantJs {
+            path: g.path,
+            grantees: match g.grantees {
+                Grantees::Anyone => GranteesJs::Anyone("anyone".into()),
+                Grantees::Users(u) => GranteesJs::Users(u.iter().map(|u| buf(u)).collect()),
+            },
         }),
-        server_url: r.server_url(),
-        claimed_by: r.owner_user().map(|u| buf(&u)),
+        federate: federate.map(|f| FederateJs { peer: buf(&f.peer), url: f.url, types: f.types, paths: f.paths }),
+        node_url: r.node_url(),
+        owner_user: r.owner_user().map(|u| buf(&u)),
     }
 }
 
-/// Decodes and checks a CBOR array of records, as the server's GET /api/records returns. Leaves out
-/// any that aren't records at all.
+#[derive(Serialize)]
+struct EntryJs {
+    rec: RecJs,
+    root: ByteBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    by: Option<ByteBuf>,
+    versions: u64,
+}
+
+fn entry_js(v: &CBOR) -> Option<EntryJs> {
+    let m = v.as_map()?;
+    let rec = Record::from_cbor(&m.get::<_, CBOR>("record")?).ok()?;
+    let bytes = |k: &str| m.get::<_, CBOR>(k).and_then(|v| v.as_byte_string().map(buf));
+    Some(EntryJs {
+        rec: rec_js(&rec),
+        root: bytes("root")?,
+        by: bytes("by"),
+        versions: m.get::<_, CBOR>("versions").and_then(|v| u64::try_from(v).ok())?,
+    })
+}
+
+fn array(bytes: &[u8]) -> Result<Vec<CBOR>> {
+    CBOR::try_from_data(bytes).map_err(err)?.into_array().ok_or_else(|| err("expected an array"))
+}
+
+/// Decodes and checks the entries GET /api/records returns. Leaves out any that aren't entries at all.
+#[wasm_bindgen(js_name = decodeEntries, unchecked_return_type = "Entry[]")]
+pub fn decode_entries(bytes: &[u8]) -> Result<JsValue> {
+    to_js(&array(bytes)?.iter().filter_map(entry_js).collect::<Vec<_>>())
+}
+
+/// Decodes and checks a CBOR array of records, as GET /api/records/<hash> returns. Leaves out any
+/// that aren't records at all.
 #[wasm_bindgen(js_name = decodeRecords, unchecked_return_type = "Rec[]")]
 pub fn decode_records(bytes: &[u8]) -> Result<JsValue> {
-    let items = CBOR::try_from_data(bytes).map_err(err)?.into_array().ok_or_else(|| err("expected an array of records"))?;
-    to_js(&items.iter().filter_map(|v| Record::from_cbor(v).ok()).map(|r| rec_js(&r)).collect::<Vec<_>>())
+    to_js(&array(bytes)?.iter().filter_map(|v| Record::from_cbor(v).ok()).map(|r| rec_js(&r)).collect::<Vec<_>>())
 }
 
 /// Decodes and checks one record.
@@ -173,12 +205,11 @@ pub fn decode_record(bytes: &[u8]) -> Result<JsValue> {
 #[derive(Deserialize)]
 struct DraftJs {
     author: ByteBuf,
-    owner: ByteBuf,
     path: String,
     version: u64,
     #[serde(rename = "type")]
     kind: String,
-    authorization: Option<AuthorizationJs>,
+    edits: Option<ByteBuf>,
     data: Option<DataJs>,
 }
 
@@ -187,7 +218,8 @@ struct DraftJs {
 enum DataJs {
     Text(String),
     Grant(GrantJs),
-    Federate { url: String, types: Option<Vec<String>>, paths: Option<Vec<String>> },
+    Federate(FederateJs),
+    Owner { user: ByteBuf },
 }
 
 fn record(draft: JsValue, signature: [u8; 64]) -> Result<Record> {
@@ -196,30 +228,30 @@ fn record(draft: JsValue, signature: [u8; 64]) -> Result<Record> {
         None => CBOR::null(),
         Some(DataJs::Text(t)) => t.into(),
         Some(DataJs::Grant(g)) => GrantData {
-            grantee: fixed(&g.grantee, "grantee")?,
             path: g.path,
-            signature: fixed(&g.signature, "signature")?,
+            grantees: match g.grantees {
+                GranteesJs::Anyone(s) if s == "anyone" => Grantees::Anyone,
+                GranteesJs::Anyone(s) => return Err(err(format!("grantees must be \"anyone\" or a list of IDs, not {s:?}"))),
+                GranteesJs::Users(u) => Grantees::Users(u.iter().map(|u| fixed(u, "grantee")).collect::<Result<_>>()?),
+            },
         }
         .to_cbor(),
-        Some(DataJs::Federate { url, types, paths }) => FederateData {
-            url,
-            types,
-            paths: paths.map(|p| p.iter().map(|s| PathFilter::parse(s)).collect::<std::result::Result<_, _>>()).transpose().map_err(err)?,
+        Some(DataJs::Federate(f)) => {
+            FederateData { peer: fixed(&f.peer, "peer")?, url: f.url, types: f.types, paths: f.paths }.to_cbor()
         }
-        .to_cbor(),
-    };
-    let authorization = match d.authorization {
-        Some(a) => Some(Authorization { path: a.path, signature: fixed(&a.signature, "authorization signature")? }),
-        None => None,
+        Some(DataJs::Owner { user }) => {
+            let mut m = Map::new();
+            m.insert("user", CBOR::to_byte_string(fixed::<32>(&user, "user")?));
+            m.into()
+        }
     };
     Ok(Record {
         author: fixed(&d.author, "author")?,
-        owner: fixed(&d.owner, "owner")?,
         path: d.path,
         version: d.version,
         kind: d.kind,
         data,
-        authorization,
+        edits: d.edits.map(|e| fixed(&e, "edits")).transpose()?,
         signature,
         extra: Map::new(),
     })
@@ -231,22 +263,16 @@ pub fn signed_bytes(#[wasm_bindgen(unchecked_param_type = "Draft")] draft: JsVal
     Ok(record(draft, [0; 64])?.signed_bytes())
 }
 
-/// `draft` with its author's `signature`, as CBOR to send to the server.
+/// `draft` with its author's `signature`, as CBOR to send to the node.
 #[wasm_bindgen(js_name = encodeRecord)]
 pub fn encode_record(#[wasm_bindgen(unchecked_param_type = "Draft")] draft: JsValue, signature: &[u8]) -> Result<Vec<u8>> {
     Ok(record(draft, fixed(signature, "signature")?)?.to_bytes())
 }
 
-/// The bytes an owner signs to let `author` write at or under `path` in their space.
-#[wasm_bindgen(js_name = grantSignedBytes)]
-pub fn grant_signed_bytes_js(author: &[u8], owner: &[u8], path: &str) -> Result<Vec<u8>> {
-    Ok(grant_signed_bytes(&fixed(author, "author")?, &fixed(owner, "owner")?, path))
-}
-
-/// The bytes a user signs to claim `server`, with the token from its claim link.
+/// The bytes a user signs to claim `node`, with the token from its claim link.
 #[wasm_bindgen(js_name = claimSignedBytes)]
-pub fn claim_signed_bytes_js(server: &[u8], token: &[u8]) -> Result<Vec<u8>> {
-    Ok(claim_signed_bytes(&fixed(server, "server")?, token))
+pub fn claim_signed_bytes_js(node: &[u8], token: &[u8]) -> Result<Vec<u8>> {
+    Ok(claim_signed_bytes(&fixed(node, "node")?, token))
 }
 
 // ---- IDs and paths ----
@@ -257,17 +283,23 @@ pub fn b58(bytes: &[u8]) -> String {
     encode_b58(bytes)
 }
 
+/// Bytes from base58; undefined if it isn't.
+#[wasm_bindgen]
+pub fn unb58(s: &str) -> Option<Vec<u8>> {
+    decode_b58(s)
+}
+
 /// The public key for a base58 ID; undefined unless it's exactly 32 bytes.
 #[wasm_bindgen(js_name = decodeId)]
 pub fn decode_id_js(id: &str) -> Option<Vec<u8>> {
     decode_id(id).map(|pk| pk.to_vec())
 }
 
-/// An ID's "🦬two_words" nickname, or "server_word" for a server's.
+/// An ID's "🦬two_words" nickname, or "node_word" for a node's.
 #[wasm_bindgen(js_name = phrase)]
-pub fn phrase_js(pk: &[u8], server: bool) -> Result<String> {
+pub fn phrase_js(pk: &[u8], node: bool) -> Result<String> {
     let pk = fixed(pk, "an ID")?;
-    Ok(if server { server_phrase(&pk) } else { phrase(&pk) })
+    Ok(if node { node_phrase(&pk) } else { phrase(&pk) })
 }
 
 /// "two_words" from SHA-256 of `bytes`, as a passkey's name is derived from its user handle.
@@ -280,6 +312,12 @@ pub fn two_words_js(bytes: &[u8]) -> String {
 #[wasm_bindgen(js_name = checkPath)]
 pub fn check_path_js(path: &str) -> Result<()> {
     check_path(path).map_err(err)
+}
+
+/// Throws unless `prefix` is a valid path, or "/" for everything.
+#[wasm_bindgen(js_name = checkPrefix)]
+pub fn check_prefix_js(prefix: &str) -> Result<()> {
+    check_prefix(prefix).map_err(err)
 }
 
 /// Whether `path` is `prefix` or below it, by whole segments.

@@ -1,144 +1,125 @@
-import { useCallback, useEffect, useState } from "react";
-import { type Post, type User, forgedPost, getPosts, isPubkey, normalizePath, userPhrase } from "./api.ts";
-import { OwnerInfo } from "./Identity.tsx";
-import { NewHere, PostTree, Subtree } from "./NoteList.tsx";
-import { Link, idPath, recordPath } from "./router.tsx";
-import { type Run, link, hl } from "./ui.ts";
+import { type Chain, type NodeInfo, type Post, type User, forgedPost, getChain, getPosts, isHash, isPubkey, normalizePath } from "./api.ts";
+import { Identity, NodeAdmin } from "./Identity.tsx";
+import { NewHere, PathLinks, PostItem, Subtree } from "./NoteList.tsx";
+import { Link } from "./router.tsx";
+import { type Run, link, useLoad } from "./ui.ts";
 
-type Loaded = {
-  posts: Post[];
-  /** At a space's root only: valid grants the owner gave or received, and what they wrote in others' spaces. */
-  grants?: Post[];
-  elsewhere?: Post[];
-};
+type PageProps = { me: User | null; busy: boolean; run: Run; tick: number };
 
-/** Everything at or under a place. No `owner`: every space ("/"). `owner` at "/": their page, with who they are
- * on top. Deeper: the record at `path`, if any, and everything under it. Reloads when `tick` changes. */
-export default function Browse({
-  owner,
-  path: rawPath,
-  me,
-  busy,
-  run,
-  tick,
-}: {
-  owner?: string;
-  path: string;
-  me: User | null;
-  busy: boolean;
-  run: Run;
-  tick: number;
-}) {
+const ErrorBox = ({ children }: { children: React.ReactNode }) => (
+  <p className="mt-4 rounded-md bg-red-50 p-3 text-sm text-red-700 ring-1 ring-red-200">{children}</p>
+);
+
+/** Every record at or under `path` ("/" for all of them). */
+export function PathPage({ path: rawPath, me, busy, run, tick }: { path: string } & PageProps) {
   let path = "/";
   let pathError = "";
   try {
-    if (rawPath !== "/") path = normalizePath(rawPath);
+    path = normalizePath(rawPath, true);
   } catch (e) {
     pathError = (e as Error).message;
   }
   const root = path === "/";
-  const valid = (owner === undefined || isPubkey(owner)) && !pathError;
-  const [phrase, setPhrase] = useState<string | null>(null);
-  const [data, setData] = useState<Loaded | null>(null);
-  const [error, setError] = useState("");
-
-  const load = useCallback(async (): Promise<Loaded> => {
-    if (owner === undefined) {
-      const [posts, forged] = await Promise.all([getPosts(), forgedPost()]);
-      return { posts: [...posts, forged] };
-    }
-    if (!root) return { posts: await getPosts({ owner, prefix: path }) };
-    const [posts, g, written] = await Promise.all([getPosts({ owner }), getPosts({ type: "grant" }), getPosts({ author: owner })]);
-    return {
-      posts,
-      grants: g.filter((p) => p.verified && p.grant && (p.owner.pubkey === owner || p.grant.grantee.pubkey === owner)),
-      elsewhere: written.filter((p) => p.owner.pubkey !== owner),
-    };
-  }, [owner, path, root]);
-
-  // A new place: start over.
-  useEffect(() => {
-    setPhrase(null);
-    setData(null);
-    if (valid && owner) setPhrase(userPhrase(owner));
-  }, [owner, path, valid]);
-
-  useEffect(() => {
-    if (!valid) return;
-    let live = true;
-    setError("");
-    load().then(
-      (d) => live && setData(d),
-      (e) => live && setError(`Couldn't load records: ${e.message}`),
-    );
-    return () => {
-      live = false;
-    };
-  }, [load, valid, tick]);
-
+  const { data, error } = useLoad(
+    pathError ? null : async () => (root ? [...(await getPosts()), forgedPost()] : getPosts({ prefix: path })),
+    [path, pathError],
+    tick,
+  );
+  if (pathError) return <ErrorBox>{pathError}</ErrorBox>;
   const items = { me, busy, run };
-  if (!valid) {
-    return (
-      <p className="mt-6 rounded-md bg-red-50 p-3 text-sm text-red-700 ring-1 ring-red-200">
-        {pathError || (
-          <>
-            <code className="break-all">{owner}</code> isn't a valid ID (32 bytes of base58).
-          </>
-        )}
-      </p>
-    );
-  }
-
-  const segs = root ? [] : path.slice(1).split("/");
-  const records =
-    data === null ? (
-      !error && <p className="mt-3 text-gray-500">Loading…</p>
-    ) : data.posts.length === 0 ? (
-      <p className="mt-3 text-gray-500">Nothing here yet.</p>
-    ) : owner === undefined ? (
-      <PostTree posts={data.posts} first={me?.pubkey} {...items} />
-    ) : (
-      <Subtree owner={owner} path={path} posts={data.posts} {...items} />
-    );
   return (
     <>
-      {owner && root && (
-        <OwnerInfo pubkey={owner} phrase={phrase} grants={data?.grants ?? null} me={me?.pubkey ?? null} busy={busy} run={run} />
+      {!root && (
+        <h1 className="text-xl">
+          <PathLinks path={path} />
+          <NewHere path={path} />
+        </h1>
       )}
-      {owner && (
-        <h2 className={`font-mono break-all ${root ? "mt-10 text-xl font-semibold" : "mt-2 text-xl"}`}>
-          bb://
-          {root ? (
-            <span className={hl(phrase ?? "…")} title={owner}>{phrase ?? "…"}</span>
-          ) : (
-            <Link href={idPath(owner)} className={link} title={owner}>
-              <span className={hl(phrase ?? "…")}>{phrase ?? "…"}</span>
-            </Link>
-          )}
-          {root && "/"}
-          {segs.map((seg, i) => (
-            <span key={i}>
-              /
-              {i === segs.length - 1 ? (
-                <span className="font-semibold">{seg}</span>
-              ) : (
-                <Link href={recordPath(owner, "/" + segs.slice(0, i + 1).join("/"))} className={link}>
-                  {seg}
-                </Link>
-              )}
-            </span>
-          ))}
-          <NewHere owner={owner} dir={root ? "" : path} />
-        </h2>
+      {error && <ErrorBox>Couldn't load records: {error}</ErrorBox>}
+      {data === null ? (
+        !error && <p className="mt-3 text-gray-500">Loading…</p>
+      ) : data.length === 0 ? (
+        <p className="mt-3 text-gray-500">Nothing here yet.</p>
+      ) : (
+        <Subtree path={path} posts={data} {...items} />
       )}
-      {error && <p className="mt-4 rounded-md bg-red-50 p-3 text-sm text-red-700 ring-1 ring-red-200">{error}</p>}
-      {records}
-      {data?.elsewhere && data.elsewhere.length > 0 && (
-        <>
-          <h2 className="mt-10 text-xl font-semibold">In others' spaces</h2>
-          <p className="mt-1 text-sm text-gray-500">What {phrase ? <span className={hl(phrase)}>{phrase}</span> : "they"} wrote elsewhere, with grants.</p>
-          <PostTree posts={data.elsewhere} {...items} />
-        </>
+    </>
+  );
+}
+
+/** One record, by any of its versions' hashes: its current version, then every version. */
+export function RecordPage({ hash, me, busy, run, tick }: { hash: string } & PageProps) {
+  const valid = isHash(hash);
+  const { data, error } = useLoad<Chain>(valid ? () => getChain(hash) : null, [hash], tick);
+  if (!valid) return <ErrorBox><code className="break-all">{hash}</code> isn't a record hash (32 bytes of base58).</ErrorBox>;
+  if (error) return <ErrorBox>Couldn't load this record: {error}</ErrorBox>;
+  if (!data) return <p className="text-gray-500">Loading…</p>;
+  const items = { me, busy, run };
+  const shown = data.current ?? data.versions[0];
+  return (
+    <>
+      <h1 className="text-xl">
+        <PathLinks path={shown.rec.path} />
+      </h1>
+      {data.deleted ? (
+        <p className="mt-4 rounded-md bg-gray-50 p-3 text-sm text-gray-600 ring-1 ring-gray-200">
+          Deleted by{" "}
+          <Link href={`/u/${data.deleted.author.pubkey}`} className={link}>
+            {data.deleted.author.phrase}
+          </Link>
+          . Its versions are below.
+        </p>
+      ) : (
+        data.current && (
+          <div className="mt-4 rounded-lg ring-1 ring-gray-200">
+            <PostItem post={data.current} hidePath {...items} />
+          </div>
+        )
+      )}
+      <h2 className="mt-10 text-xl font-semibold">History</h2>
+      <p className="mt-1 text-sm text-gray-500">Every version, oldest first. Each names the one it edits; the newest wins.</p>
+      <ol className="mt-3 divide-y divide-gray-200 rounded-lg ring-1 ring-gray-200">
+        {data.versions.map((p) => (
+          <li key={p.hash} className={p.hash === hash ? "bg-indigo-50/50" : ""}>
+            <PostItem post={p} history {...items} />
+          </li>
+        ))}
+      </ol>
+    </>
+  );
+}
+
+type UserData = { grants: Post[]; written: Post[] };
+
+/** A user's page: who they are, their grants, and what they wrote. For this node's key, also the node's owners, grants and peers. */
+export function UserPage({ pubkey, node, me, busy, run, tick }: { pubkey: string; node: NodeInfo | null } & PageProps) {
+  const valid = isPubkey(pubkey);
+  const { data, error } = useLoad<UserData>(
+    valid
+      ? async () => {
+          const [grants, written] = await Promise.all([getPosts({ type: "grant", prefix: "/node/grants" }), getPosts({ author: pubkey })]);
+          const named = grants.filter((g) => g.verified && g.grant?.grantees !== "anyone" && g.grant?.grantees.some((u) => u.pubkey === pubkey));
+          return { grants: named, written };
+        }
+      : null,
+    [pubkey],
+    tick,
+  );
+  if (!valid) return <ErrorBox><code className="break-all">{pubkey}</code> isn't a valid ID (32 bytes of base58).</ErrorBox>;
+  const items = { me, busy, run };
+  const isThisNode = node?.pubkey === pubkey;
+  return (
+    <>
+      <Identity pubkey={pubkey} node={node} me={me} grants={data?.grants ?? null} busy={busy} run={run} />
+      {isThisNode && <NodeAdmin me={me} busy={busy} run={run} tick={tick} />}
+      <h2 className="mt-10 text-xl font-semibold">Written</h2>
+      {error && <ErrorBox>Couldn't load records: {error}</ErrorBox>}
+      {data === null ? (
+        !error && <p className="mt-3 text-gray-500">Loading…</p>
+      ) : data.written.length === 0 ? (
+        <p className="mt-3 text-gray-500">Nothing yet.</p>
+      ) : (
+        <Subtree path="/" posts={data.written} {...items} />
       )}
     </>
   );
