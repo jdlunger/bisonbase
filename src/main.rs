@@ -22,8 +22,8 @@ use std::{
 };
 
 /// Bump to wipe the database when the schema changes incompatibly.
-/// 6: records identified by hash, nodes.
-const SCHEMA_VERSION: i64 = 6;
+/// 6: records identified by hash, nodes. 7: chains table, seq as rowid.
+const SCHEMA_VERSION: i64 = 7;
 
 /// How far ahead of the node's clock a write's version may be.
 const MAX_CLOCK_SKEW_MS: u64 = 10 * 60 * 1000;
@@ -64,60 +64,8 @@ async fn main() {
     let origin = std::env::var("ORIGIN").unwrap_or("http://localhost:5173".into());
 
     let db = Connection::open(&db_path).unwrap();
-    let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-    if version < SCHEMA_VERSION {
-        db.execute_batch(&format!(
-            "DROP VIEW IF EXISTS heads; DROP TABLE IF EXISTS records; DROP TABLE IF EXISTS notes; DROP TABLE IF EXISTS sessions;
-             DROP TABLE IF EXISTS users; DROP TABLE IF EXISTS server; DROP TABLE IF EXISTS node; DROP TABLE IF EXISTS claim_tokens;
-             DROP TABLE IF EXISTS peer_cursors;
-             PRAGMA user_version = {SCHEMA_VERSION};"
-        ))
-        .unwrap();
-    }
-    db.execute_batch(
-        "-- Store raw bytes (keys, signatures, hashes), never their base58/base64 or phrases: those are only
-        -- for input and output, at the API's edges.
-        CREATE TABLE IF NOT EXISTS users (
-            pubkey BLOB PRIMARY KEY, -- 32-byte Ed25519 public key: the user's ID
-            created_at INTEGER NOT NULL DEFAULT (unixepoch())
-        );
-        -- Every record, exactly as signed, by hash. Records never change: edits and deletes (tombstones)
-        -- are new records. author, path, version, type and edits are copies of the record's fields, for
-        -- querying.
-        CREATE TABLE IF NOT EXISTS records (
-            hash BLOB PRIMARY KEY, -- SHA-256 of `record`
-            author BLOB NOT NULL,
-            path TEXT NOT NULL,
-            version INTEGER NOT NULL,
-            type TEXT NOT NULL,
-            edits BLOB,            -- hash of the version it edits or deletes
-            root BLOB NOT NULL,    -- its chain's first record: follows `edits` back as far as this node has
-            record BLOB NOT NULL,  -- the record's deterministic CBOR, signature included
-            seq INTEGER NOT NULL,  -- local order of arrival: what peers are pushed by
-            received_from BLOB     -- the node that pushed it here, if one did; it isn't pushed back there
-        );
-        CREATE INDEX IF NOT EXISTS records_by_root ON records (root);
-        CREATE INDEX IF NOT EXISTS records_by_path ON records (path);
-        CREATE INDEX IF NOT EXISTS records_by_seq ON records (seq);
-        -- Each live chain's current version: its newest (by version, then hash), unless any version is a tombstone.
-        CREATE VIEW IF NOT EXISTS heads AS
-            SELECT r.* FROM records r
-            WHERE NOT EXISTS (SELECT 1 FROM records n WHERE n.root = r.root
-                                AND (n.version > r.version OR (n.version = r.version AND n.hash > r.hash)))
-              AND NOT EXISTS (SELECT 1 FROM records t WHERE t.root = r.root AND t.type = 'tombstone');
-        -- This node's own key pair: exactly one row.
-        CREATE TABLE IF NOT EXISTS node (
-            pubkey BLOB PRIMARY KEY,
-            secret BLOB NOT NULL -- 32-byte Ed25519 seed
-        );
-        -- How far each peer record (by hash) has been pushed: every record with seq <= this one.
-        -- An edited peer record starts over.
-        CREATE TABLE IF NOT EXISTS peer_cursors (
-            peer BLOB PRIMARY KEY,
-            seq INTEGER NOT NULL
-        );",
-    )
-    .unwrap();
+    db.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;").unwrap();
+    create_schema(&db);
 
     let key = node_key(&db);
     let pk = key.verifying_key().to_bytes();
@@ -152,6 +100,76 @@ fn random<const N: usize>() -> [u8; N] {
 }
 
 /// This node's key, made on first run.
+/// Creates the tables if they're missing, wiping them first if they're from an older schema.
+fn create_schema(db: &Connection) {
+    let version: i64 = db.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+    if version < SCHEMA_VERSION {
+        db.execute_batch(&format!(
+            "DROP VIEW IF EXISTS heads; DROP TABLE IF EXISTS chains; DROP TABLE IF EXISTS records; DROP TABLE IF EXISTS notes; DROP TABLE IF EXISTS sessions;
+             DROP TABLE IF EXISTS users; DROP TABLE IF EXISTS server; DROP TABLE IF EXISTS node; DROP TABLE IF EXISTS claim_tokens;
+             DROP TABLE IF EXISTS peer_cursors;
+             PRAGMA user_version = {SCHEMA_VERSION};"
+        ))
+        .unwrap();
+    }
+    db.execute_batch(
+        "-- Store raw bytes (keys, signatures, hashes), never their base58/base64 or phrases: those are only
+        -- for input and output, at the API's edges.
+        CREATE TABLE IF NOT EXISTS users (
+            pubkey BLOB PRIMARY KEY, -- 32-byte Ed25519 public key: the user's ID
+            created_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );
+        -- Every record, exactly as signed, by hash. Records never change: edits and deletes (tombstones)
+        -- are new records. author, path, version, type and edits are copies of the record's fields, for
+        -- querying.
+        CREATE TABLE IF NOT EXISTS records (
+            seq INTEGER PRIMARY KEY, -- local order of arrival (the rowid): what peers are pushed by
+            hash BLOB NOT NULL UNIQUE, -- SHA-256 of `record`
+            author BLOB NOT NULL,
+            path TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            type TEXT NOT NULL,
+            edits BLOB,            -- hash of the version it edits or deletes
+            root BLOB NOT NULL,    -- its chain's first record: follows `edits` back as far as this node has
+            record BLOB NOT NULL,  -- the record's deterministic CBOR, signature included
+            received_from BLOB     -- the node that pushed it here, if one did; it isn't pushed back there
+        );
+        CREATE INDEX IF NOT EXISTS records_by_root ON records (root, version, hash);
+        -- One row per chain (by root), kept up to date by `store`: its current version (newest by
+        -- version, then hash) and a summary. path, type and version are the head's, for querying.
+        CREATE TABLE IF NOT EXISTS chains (
+            root BLOB PRIMARY KEY,
+            head BLOB NOT NULL,     -- hash of the current version
+            author BLOB,            -- who wrote the root record; NULL until it arrives here
+            path TEXT NOT NULL,
+            type TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            versions INTEGER NOT NULL, -- how many versions this node has
+            deleted INTEGER NOT NULL   -- 1 if any version is a tombstone
+        );
+        CREATE INDEX IF NOT EXISTS chains_by_type ON chains (type) WHERE NOT deleted;
+        CREATE INDEX IF NOT EXISTS chains_by_path ON chains (path) WHERE NOT deleted;
+        CREATE INDEX IF NOT EXISTS chains_by_author ON chains (author) WHERE NOT deleted;
+        -- Each live chain's current version. `author` is the head's; `by` the root's.
+        CREATE VIEW IF NOT EXISTS heads AS
+            SELECT c.root, c.head AS hash, c.author AS by, c.path, c.type, c.version, c.versions, r.author, r.record
+            FROM chains c JOIN records r ON r.hash = c.head
+            WHERE NOT c.deleted;
+        -- This node's own key pair: exactly one row.
+        CREATE TABLE IF NOT EXISTS node (
+            pubkey BLOB PRIMARY KEY,
+            secret BLOB NOT NULL -- 32-byte Ed25519 seed
+        );
+        -- How far each peer record (by hash) has been pushed: every record with seq <= this one.
+        -- An edited peer record starts over.
+        CREATE TABLE IF NOT EXISTS peer_cursors (
+            peer BLOB PRIMARY KEY,
+            seq INTEGER NOT NULL
+        );",
+    )
+    .unwrap();
+}
+
 fn node_key(db: &Connection) -> SigningKey {
     let secret: Option<[u8; 32]> = db.query_row("SELECT secret FROM node", [], |r| r.get(0)).optional().unwrap();
     secret.map(|s| SigningKey::from_bytes(&s)).unwrap_or_else(|| {
@@ -221,17 +239,29 @@ fn store(db: &Connection, rec: &Record, from: Option<Pubkey>) -> Result<bool, St
         Some(prev) => db.query_row("SELECT root FROM records WHERE hash = ?1", [prev], |r| r.get(0)).optional().unwrap().unwrap_or(prev),
         None => hash,
     };
-    db.execute("INSERT OR IGNORE INTO users (pubkey) VALUES (?1)", [rec.author]).unwrap();
-    db.execute(
-        "INSERT INTO records (hash, author, path, version, type, edits, root, record, seq, received_from)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, (SELECT coalesce(max(seq), 0) + 1 FROM records), ?9)",
+    let tx = db.unchecked_transaction().unwrap();
+    tx.execute("INSERT OR IGNORE INTO users (pubkey) VALUES (?1)", [rec.author]).unwrap();
+    tx.execute(
+        "INSERT INTO records (hash, author, path, version, type, edits, root, record, received_from)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         (hash, rec.author, &rec.path, rec.version as i64, &rec.kind, rec.edits, root, rec.to_bytes(), from),
     )
     .unwrap();
     // Edits of this record that arrived before it were filed under it as their root.
     if root != hash {
-        db.execute("UPDATE records SET root = ?1 WHERE root = ?2", (root, hash)).unwrap();
+        tx.execute("UPDATE records SET root = ?1 WHERE root = ?2", (root, hash)).unwrap();
+        tx.execute("DELETE FROM chains WHERE root = ?1", [hash]).unwrap();
     }
+    tx.execute(
+        "INSERT OR REPLACE INTO chains (root, head, author, path, type, version, versions, deleted)
+         SELECT ?1, h.hash, (SELECT author FROM records WHERE hash = ?1), h.path, h.type, h.version,
+                (SELECT count(*) FROM records WHERE root = ?1),
+                EXISTS (SELECT 1 FROM records WHERE root = ?1 AND type = 'tombstone')
+         FROM records h WHERE h.root = ?1 ORDER BY h.version DESC, h.hash DESC LIMIT 1",
+        [root],
+    )
+    .unwrap();
+    tx.commit().unwrap();
     Ok(true)
 }
 
@@ -327,7 +357,7 @@ impl App {
             .optional()
             .unwrap()
             .ok_or("this node doesn't have the record it edits")?;
-        if db.query_row("SELECT 1 FROM records WHERE root = ?1 AND type = 'tombstone'", [root], |_| Ok(())).optional().unwrap().is_some() {
+        if db.query_row("SELECT deleted FROM chains WHERE root = ?1", [root], |r| r.get(0)).optional().unwrap() == Some(true) {
             return Err("that record was deleted".into());
         }
         if prev.kind == "node" {
@@ -421,18 +451,29 @@ async fn list_records(State(app): S, Query(q): Query<RecordsQuery>) -> Response 
         return err(StatusCode::BAD_REQUEST, format!("bad prefix: {e}"));
     }
     let db = app.db.lock().unwrap();
-    let mut stmt = db
-        .prepare(
-            "SELECT h.record, h.root, o.author, (SELECT count(*) FROM records v WHERE v.root = h.root)
-             FROM heads h LEFT JOIN records o ON o.hash = h.root
-             WHERE (?1 IS NULL OR o.author = ?1)
-               AND (?2 IS NULL OR h.path = ?2 OR substr(h.path, 1, length(?2) + 1) = ?2 || '/')
-               AND (?3 IS NULL OR h.type = ?3)
-             ORDER BY h.version DESC",
-        )
-        .unwrap();
+    // Only the filters given, so the planner can pick an index for them (`?1 IS NULL OR …` defeats that).
+    let mut sql = String::from("SELECT record, root, by, versions FROM heads WHERE 1");
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![];
+    let mut bind = |v: Box<dyn rusqlite::ToSql>| {
+        params.push(v);
+        format!("?{}", params.len())
+    };
+    if let Some(a) = author {
+        sql += &format!(" AND by = {}", bind(Box::new(a)));
+    }
+    if let Some(p) = prefix {
+        // The path itself or anything under it: one range ('0' sorts right after '/'), narrowed to
+        // leave out siblings like `{p}-x` that sort between `{p}` and `{p}/`.
+        let p = bind(Box::new(p));
+        sql += &format!(" AND path >= {p} AND path < {p} || '0' AND (path = {p} OR path >= {p} || '/')");
+    }
+    if let Some(k) = q.kind {
+        sql += &format!(" AND type = {}", bind(Box::new(k)));
+    }
+    sql += " ORDER BY version DESC";
+    let mut stmt = db.prepare(&sql).unwrap();
     let entries: Vec<CBOR> = stmt
-        .query_map((author, prefix, q.kind), |r| {
+        .query_map(rusqlite::params_from_iter(params), |r| {
             let mut m = Map::new();
             m.insert("record", CBOR::try_from_data(r.get::<_, Vec<u8>>(0)?).expect("stored records are dCBOR"));
             m.insert("root", CBOR::to_byte_string(r.get::<_, Hash>(1)?));
@@ -658,5 +699,275 @@ async fn push_to(app: &App, peer_hash: Hash, peer: &PeerData) -> Result<(), reqw
             .unwrap()
             .execute("INSERT OR REPLACE INTO peer_cursors (peer, seq) VALUES (?1, ?2)", (peer_hash, last))
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fedcrdt_core::{GRANT_PATH, Grantees};
+
+    /// A fresh node on an in-memory database, started as `main` does: it has a node record, and an
+    /// owner record naming an unclaimed claim.
+    fn node() -> App {
+        let db = Connection::open_in_memory().unwrap();
+        create_schema(&db);
+        let key = node_key(&db);
+        let pk = key.verifying_key().to_bytes();
+        let app = App { db: Mutex::new(db), key, pk, push: Default::default(), http: reqwest::Client::new() };
+        app.init("http://node.test", "http://web.test");
+        app
+    }
+
+    fn key(n: u8) -> SigningKey {
+        SigningKey::from_bytes(&[n; 32])
+    }
+
+    fn id(k: &SigningKey) -> Pubkey {
+        k.verifying_key().to_bytes()
+    }
+
+    fn sign(key: &SigningKey, path: &str, kind: &str, data: CBOR, edits: Option<&Record>, version: u64) -> Record {
+        let mut r = Record {
+            author: id(key),
+            path: path.into(),
+            version,
+            kind: kind.into(),
+            data,
+            edits: edits.map(Record::hash),
+            signature: [0; 64],
+            extra: Map::new(),
+        };
+        r.signature = key.sign(&r.signed_bytes()).to_bytes();
+        r
+    }
+
+    fn post(key: &SigningKey, path: &str, text: &str, edits: Option<&Record>, version: u64) -> Record {
+        sign(key, path, "post", text.into(), edits, version)
+    }
+
+    fn tombstone(key: &SigningKey, of: &Record, version: u64) -> Record {
+        sign(key, &of.path, "tombstone", CBOR::null(), Some(of), version)
+    }
+
+    /// Writes `r` as `put_record` does: authorized, then stored.
+    fn put(app: &App, r: &Record) -> Result<(), String> {
+        let db = app.db.lock().unwrap();
+        app.authorize(&db, r)?;
+        assert!(store(&db, r, None)?, "already stored");
+        Ok(())
+    }
+
+    /// Stores `r` as `receive` does for a record a peer pushed: unauthorized.
+    fn pushed(app: &App, r: &Record) {
+        assert!(store(&app.db.lock().unwrap(), r, Some([7; 32])).unwrap(), "already stored");
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct Chain {
+        head: Hash,
+        author: Option<Pubkey>,
+        versions: i64,
+        deleted: bool,
+    }
+
+    fn chain_of(app: &App, root: &Record) -> Option<Chain> {
+        app.db
+            .lock()
+            .unwrap()
+            .query_row("SELECT head, author, versions, deleted FROM chains WHERE root = ?1", [root.hash()], |r| {
+                Ok(Chain { head: r.get(0)?, author: r.get(1)?, versions: r.get(2)?, deleted: r.get(3)? })
+            })
+            .optional()
+            .unwrap()
+    }
+
+    /// Roots of the live chains of type `kind`.
+    fn live(app: &App, kind: &str) -> Vec<Hash> {
+        heads_of(&app.db.lock().unwrap(), kind).into_iter().map(|(root, _)| root).collect()
+    }
+
+    /// A node with an owner, alice, who lets anyone write under /post. Returns it, alice and bob.
+    fn setup() -> (App, SigningKey, SigningKey) {
+        let app = node();
+        let (alice, bob) = (key(1), key(2));
+        app.write(&app.db.lock().unwrap(), OWNER_PATH, "owner", Who::User(id(&alice)).to_cbor(), None);
+        let grant = GrantData { path: "/post".into(), grantees: Grantees::Anyone };
+        put(&app, &sign(&alice, GRANT_PATH, "grant", grant.to_cbor(), None, 1)).unwrap();
+        (app, alice, bob)
+    }
+
+    #[test]
+    fn edits_move_the_head() {
+        let (app, _, bob) = setup();
+        let v1 = post(&bob, "/post/a", "one", None, 1);
+        put(&app, &v1).unwrap();
+        assert_eq!(chain_of(&app, &v1), Some(Chain { head: v1.hash(), author: Some(id(&bob)), versions: 1, deleted: false }));
+
+        let v2 = post(&bob, "/post/a", "two", Some(&v1), 2);
+        put(&app, &v2).unwrap();
+        assert_eq!(chain_of(&app, &v1), Some(Chain { head: v2.hash(), author: Some(id(&bob)), versions: 2, deleted: false }));
+
+        // A concurrent edit at the same version: the higher hash wins, whichever arrives last.
+        let v2b = post(&bob, "/post/a", "two, again", Some(&v1), 2);
+        put(&app, &v2b).unwrap();
+        let head = chain_of(&app, &v1).unwrap().head;
+        assert_eq!(head, v2.hash().max(v2b.hash()));
+        assert_eq!(live(&app, "post"), vec![v1.hash()]);
+
+        // An older edit doesn't take over.
+        put(&app, &post(&bob, "/post/a", "stale", Some(&v1), 1)).unwrap();
+        assert_eq!(chain_of(&app, &v1).unwrap().head, head);
+        assert_eq!(chain_of(&app, &v1).unwrap().versions, 4);
+    }
+
+    fn permutations(n: usize) -> Vec<Vec<usize>> {
+        if n == 0 {
+            return vec![vec![]];
+        }
+        permutations(n - 1)
+            .into_iter()
+            .flat_map(|p| (0..n).map(move |i| [&p[..i], &[n - 1], &p[i..]].concat()))
+            .collect()
+    }
+
+    #[test]
+    fn out_of_order_arrival_converges() {
+        let bob = key(2);
+        let mut chain = vec![post(&bob, "/post/a", "v1", None, 1)];
+        for v in 2..=4 {
+            let r = post(&bob, "/post/a", &format!("v{v}"), chain.last(), v);
+            chain.push(r);
+        }
+        let (first, last) = (&chain[0], &chain[3]);
+        let orders = permutations(chain.len());
+        assert_eq!(orders.len(), 24);
+        for order in orders {
+            let app = node();
+            for &i in &order {
+                pushed(&app, &chain[i]);
+            }
+            let want = Chain { head: last.hash(), author: Some(id(&bob)), versions: 4, deleted: false };
+            assert_eq!(chain_of(&app, first), Some(want), "order {order:?}");
+            assert_eq!(live(&app, "post"), vec![first.hash()], "order {order:?}: one chain, no leftovers");
+            let db = app.db.lock().unwrap();
+            let roots: i64 = db.query_row("SELECT count(*) FROM records WHERE root = ?1", [first.hash()], |r| r.get(0)).unwrap();
+            assert_eq!(roots, 4, "order {order:?}");
+            let posts: i64 = db.query_row("SELECT count(*) FROM chains WHERE type = 'post'", [], |r| r.get(0)).unwrap();
+            assert_eq!(posts, 1, "order {order:?}");
+        }
+    }
+
+    #[test]
+    fn missing_root_leaves_author_unknown() {
+        let bob = key(2);
+        let v1 = post(&bob, "/post/a", "v1", None, 1);
+        let v2 = post(&bob, "/post/a", "v2", Some(&v1), 2);
+        let app = node();
+        pushed(&app, &v2);
+        // Filed under v1 (its root as far as this node knows), with no author until v1 arrives.
+        assert_eq!(chain_of(&app, &v1), Some(Chain { head: v2.hash(), author: None, versions: 1, deleted: false }));
+        pushed(&app, &v1);
+        assert_eq!(chain_of(&app, &v1), Some(Chain { head: v2.hash(), author: Some(id(&bob)), versions: 2, deleted: false }));
+    }
+
+    #[test]
+    fn tombstones_delete_the_chain() {
+        let (app, _, bob) = setup();
+        let v1 = post(&bob, "/post/a", "one", None, 1);
+        put(&app, &v1).unwrap();
+        let t = tombstone(&bob, &v1, 2);
+        put(&app, &t).unwrap();
+        assert!(chain_of(&app, &v1).unwrap().deleted);
+        assert!(live(&app, "post").is_empty());
+
+        let err = put(&app, &post(&bob, "/post/a", "back", Some(&v1), 3)).unwrap_err();
+        assert!(err.contains("deleted"), "{err}");
+        assert!(put(&app, &tombstone(&bob, &t, 3)).unwrap_err().contains("deleted"));
+
+        // Even an edit newer than the tombstone, pushed by a peer, doesn't bring it back.
+        pushed(&app, &post(&bob, "/post/a", "late", Some(&v1), 5));
+        assert!(chain_of(&app, &v1).unwrap().deleted);
+        assert!(live(&app, "post").is_empty());
+    }
+
+    #[test]
+    fn tombstone_before_its_record() {
+        let bob = key(2);
+        let v1 = post(&bob, "/post/a", "one", None, 1);
+        let t = tombstone(&bob, &v1, 2);
+        let app = node();
+        pushed(&app, &t);
+        pushed(&app, &v1);
+        assert_eq!(chain_of(&app, &v1), Some(Chain { head: t.hash(), author: Some(id(&bob)), versions: 2, deleted: true }));
+        assert!(live(&app, "post").is_empty());
+    }
+
+    #[test]
+    fn who_may_write() {
+        let (app, alice, bob) = setup();
+        let carol = key(3);
+
+        let err = put(&app, &post(&bob, "/notes/x", "hi", None, 1)).unwrap_err();
+        assert!(err.contains("needs a grant"), "{err}");
+        let grant = GrantData { path: "/notes".into(), grantees: Grantees::Anyone };
+        let err = put(&app, &sign(&bob, GRANT_PATH, "grant", grant.to_cbor(), None, 1)).unwrap_err();
+        assert!(err.contains("owners"), "{err}");
+
+        let v1 = post(&bob, "/post/a", "bob's", None, 1);
+        put(&app, &v1).unwrap();
+        let err = put(&app, &post(&carol, "/post/a", "carol's now", Some(&v1), 2)).unwrap_err();
+        assert!(err.contains("only its author"), "{err}");
+        let err = put(&app, &post(&bob, "/notes/a", "moved", Some(&v1), 2)).unwrap_err();
+        assert!(err.contains("needs a grant"), "{err}");
+        put(&app, &post(&alice, "/post/a", "edited by an owner", Some(&v1), 2)).unwrap();
+        assert_eq!(chain_of(&app, &v1).unwrap().author, Some(id(&bob)), "the chain is still bob's");
+
+        // The node's owner records: the one naming the first-owner claim, and alice's.
+        let owners: Vec<(Hash, Record)> = heads_of(&app.db.lock().unwrap(), "owner");
+        assert_eq!(owners.len(), 2);
+        let (claim_owner, alice_owner) = match owners[0].1.owner() {
+            Some(Who::Claim(_)) => (&owners[0].1, &owners[1].1),
+            _ => (&owners[1].1, &owners[0].1),
+        };
+        put(&app, &tombstone(&alice, claim_owner, now_ms())).unwrap();
+        let err = put(&app, &tombstone(&alice, alice_owner, now_ms())).unwrap_err();
+        assert!(err.contains("at least one owner"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn list_filters() {
+        let (app, alice, bob) = setup();
+        for path in ["/post", "/post/a", "/post/a/b", "/post-x", "/postx", "/posts/c", "/other"] {
+            put(&app, &post(&alice, path, path, None, 1)).unwrap();
+        }
+        put(&app, &post(&bob, "/post/bob", "bob's", None, 2)).unwrap();
+        let deleted = post(&alice, "/post/gone", "gone", None, 1);
+        put(&app, &deleted).unwrap();
+        put(&app, &tombstone(&alice, &deleted, 2)).unwrap();
+        let app = Arc::new(app);
+
+        let list = async |author: Option<&SigningKey>, kind: Option<&str>, prefix: Option<&str>| -> Vec<String> {
+            let q = RecordsQuery { author: author.map(|k| encode_id(&id(k))), kind: kind.map(Into::into), prefix: prefix.map(Into::into) };
+            let res = list_records(State(app.clone()), Query(q)).await;
+            assert_eq!(res.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            let mut paths: Vec<String> = CBOR::try_from_data(&body)
+                .unwrap()
+                .into_array()
+                .unwrap()
+                .iter()
+                .map(|e| Record::from_cbor(&e.as_map().unwrap().get::<_, CBOR>("record").unwrap()).unwrap().path)
+                .collect();
+            paths.sort();
+            paths
+        };
+
+        assert_eq!(list(None, Some("post"), Some("/post")).await, ["/post", "/post/a", "/post/a/b", "/post/bob"]);
+        assert_eq!(list(None, None, Some("/post/a")).await, ["/post/a", "/post/a/b"]);
+        assert_eq!(list(Some(&bob), None, None).await, ["/post/bob"]);
+        assert_eq!(list(Some(&bob), Some("post"), Some("/posts")).await, Vec::<String>::new());
+        assert_eq!(list(None, Some("post"), Some("/")).await.len(), 8, "everything but the deleted one");
+        assert_eq!(list(None, Some("grant"), None).await, [GRANT_PATH]);
     }
 }
