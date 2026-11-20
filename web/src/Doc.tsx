@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as Y from "yjs";
+import { Awareness, applyAwarenessUpdate, encodeAwarenessUpdate, removeAwarenessStates } from "y-protocols/awareness";
 import { yCollab, yUndoManagerKeymap } from "y-codemirror.next";
 import { Compartment, EditorState } from "@codemirror/state";
 import { EditorView, drawSelection, keymap, placeholder } from "@codemirror/view";
@@ -17,14 +18,17 @@ import {
   b58,
   docHasOpenClaims,
   getChain,
-  getDocUpdates,
   inviteToDoc,
   isHash,
+  joinLive,
   loadClaims,
   mayEditDoc,
   putDocUpdate,
   removeDocEditor,
   renameDoc,
+  streamRecords,
+  streamedRecord,
+  userPhrase,
 } from "./api.ts";
 import { ClaimLink } from "./Identity.tsx";
 import { PartyLink, PathLinks, UserLink } from "./NoteList.tsx";
@@ -32,27 +36,47 @@ import { Link, recordPath } from "./router.tsx";
 import { type Run, input, link, secondary, useLoad } from "./ui.ts";
 
 // A shared doc: its "doc" record (title, editors) and its text, a Yjs CRDT built from "doc_update"
-// records (see the end of api.ts). We poll the node for new updates, apply those by the doc's author
-// and editors, and write our own edits as updates: batched, so typing doesn't sign a record per key.
+// records (see the end of api.ts). We stream the doc's records from the node, apply the updates by its
+// author and editors, and write our own edits as updates: batched, so typing doesn't sign a record per
+// key. Editors also join the doc's live room, to see each other's cursors (Yjs awareness), which
+// nothing stores.
 
 /** The origin we tag updates from the node with, so they aren't sent back. */
 const REMOTE = Symbol("remote");
 /** Send our edits once typing pauses this long, */
-const FLUSH_IDLE_MS = 400;
+const FLUSH_IDLE_MS = 250;
 /** or at the latest this long after the first unsent one. */
-const FLUSH_MAX_MS = 2000;
+const FLUSH_MAX_MS = 1500;
 const RETRY_MS = 3000;
-const POLL_MS = 1000;
-const POLL_HIDDEN_MS = 5000;
+const RECONNECT_MS = 2000;
+
+/** Live room frames from the node (see `live` in src/main.rs): kind, connection (u32), sender's ID, payload. */
+const LIVE_UPDATE = 0;
+const LIVE_JOINED = 1;
+const LIVE_LEFT = 2;
 
 type Mode = "write" | "split" | "preview";
 
 /** How our edits stand: all sent, waiting to send, sending, or failing to send (why). */
 type SaveState = { unsent: boolean; sending: boolean; error: string };
 
+/** How someone shows in the live room: their phrase, and a color from their ID. */
+type Presence = { pubkey: string; name: string; color: string; colorLight: string };
+
+function presence(pubkey: string): Presence {
+  let h = 0;
+  for (const c of pubkey) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+  const hue = h % 360;
+  return { pubkey, name: userPhrase(pubkey), color: `hsl(${hue} 70% 42%)`, colorLight: `hsl(${hue} 70% 42% / 0.18)` };
+}
+
+/** The doc's awareness (cursors), and what the live room has proved about it: who's behind each
+ * connection, and which connection each remote awareness client came from. */
+type Live = { awareness: Awareness; users: Map<number, string>; clients: Map<number, number> };
+
 /** The doc's text and how it syncs with the node: set up for one doc (its hash), torn down on leaving. */
 function useDocSync(hash: string, onDocChange: (doc: Post | null, deleted: boolean) => void) {
-  const [ytext, setYtext] = useState<Y.Text | null>(null);
+  const [sync, setSync] = useState<{ ytext: Y.Text; live: Live } | null>(null);
   const [ready, setReady] = useState(false);
   const [save, setSave] = useState<SaveState>({ unsent: false, sending: false, error: "" });
   const [syncError, setSyncError] = useState("");
@@ -67,13 +91,26 @@ function useDocSync(hash: string, onDocChange: (doc: Post | null, deleted: boole
     if (!isHash(hash)) return;
     const ydoc = new Y.Doc();
     const text = ydoc.getText("md");
+    const live: Live = { awareness: new Awareness(ydoc), users: new Map(), clients: new Map() };
+    // Name remote cursors by who the live room says sent them, not by what they say. Registered
+    // before the editor's own listener, so it sees the names already fixed.
+    live.awareness.on("change", ({ added, updated }: { added: number[]; updated: number[] }, origin: unknown) => {
+      const user = typeof origin === "number" ? live.users.get(origin) : undefined;
+      if (!user) return;
+      for (const id of [...added, ...updated]) {
+        live.clients.set(id, origin as number);
+        const state = live.awareness.states.get(id);
+        if (state) state.user = presence(user);
+      }
+    });
     let stopped = false;
-    let seq = 0;
-    let head = "";
-    let pollTimer: ReturnType<typeof setTimeout> | undefined;
     let flushTimer: ReturnType<typeof setTimeout> | undefined;
     /** Updates from the node not applied yet, because we don't know their authors as editors (yet). */
     let pending: Rec[] = [];
+    /** Whether the doc record may have changed since we last loaded it; whether new updates came. */
+    let docDirty = true;
+    let fresh = false;
+    let caughtUp = false;
     /** Our edits not sent yet, and when the first of them was made. */
     const outbox: Uint8Array[] = [];
     let firstUnsent = 0;
@@ -106,35 +143,43 @@ function useDocSync(hash: string, onDocChange: (doc: Post | null, deleted: boole
       setIgnored(pending.length);
     };
 
-    const poll = async () => {
-      try {
-        const r = await getDocUpdates(hash, seq);
-        if (stopped) return;
-        if (!r) {
-          // Deleted (or never a doc here): show why, and stop.
-          await loadDoc();
-          return;
+    /** Catches up with what the stream brought: the doc record if it changed, then the updates. One at a time. */
+    let queue = Promise.resolve();
+    const process = () =>
+      (queue = queue.then(async () => {
+        try {
+          if (docDirty) {
+            docDirty = false;
+            await loadDoc();
+          }
+          // Someone we don't know may have claimed an invite since we loaded who claimed what.
+          const doc = docRef.current;
+          if (fresh && doc && docHasOpenClaims(doc) && pending.some((u) => !mayEditDoc(doc, b58(u.author)))) {
+            await loadClaims();
+            await loadDoc();
+          }
+          fresh = false;
+          apply();
+        } catch (e) {
+          setSyncError((e as Error).message);
         }
-        seq = r.seq;
-        pending.push(...r.updates);
-        if (r.head !== head) {
-          head = r.head;
-          await loadDoc();
-        }
-        // Someone we don't know may have claimed an invite since we loaded who claimed what.
-        const doc = docRef.current;
-        if (r.updates.length && doc && docHasOpenClaims(doc) && pending.some((u) => !mayEditDoc(doc, b58(u.author)))) {
-          await loadClaims();
-          await loadDoc();
-        }
-        apply();
-        setReady(true);
-        setSyncError("");
-      } catch (e) {
-        setSyncError((e as Error).message);
-      }
-      if (!stopped) pollTimer = setTimeout(poll, document.hidden ? POLL_HIDDEN_MS : POLL_MS);
-    };
+      }));
+
+    const es = streamRecords({ doc: hash });
+    es.addEventListener("record", (e) => {
+      const rec = streamedRecord((e as MessageEvent<string>).data);
+      if (rec.type === "doc_update") {
+        pending.push(rec);
+        fresh = true;
+      } else docDirty = true; // a new version of the doc, or its deletion
+      if (caughtUp) process();
+    });
+    es.addEventListener("ready", () => {
+      caughtUp = true;
+      process().then(() => !stopped && setReady(true));
+    });
+    es.onopen = () => setSyncError("");
+    es.onerror = () => setSyncError("lost the connection to the node; reconnecting…");
 
     const schedule = (ms?: number) => {
       clearTimeout(flushTimer);
@@ -174,26 +219,115 @@ function useDocSync(hash: string, onDocChange: (doc: Post | null, deleted: boole
     };
     window.addEventListener("beforeunload", beforeUnload);
 
-    setYtext(text);
-    poll();
+    setSync({ ytext: text, live });
 
     return () => {
       stopped = true;
-      clearTimeout(pollTimer);
+      es.close();
       clearTimeout(flushTimer);
       window.removeEventListener("beforeunload", beforeUnload);
       // Leaving within the app: send what's left, best effort.
       if (outbox.length && docRef.current) putDocUpdate(docRef.current, Y.mergeUpdates(outbox)).catch(() => {});
+      live.awareness.destroy();
       ydoc.destroy();
-      setYtext(null);
+      setSync(null);
     };
   }, [hash]);
 
-  return { ytext, ready, save, syncError, ignored, reload: () => reloadRef.current() };
+  return { sync, ready, save, syncError, ignored, reload: () => reloadRef.current() };
 }
 
-/** A CodeMirror markdown editor bound to `ytext`; read-only unless `editable`. */
-function Editor({ ytext, editable }: { ytext: Y.Text; editable: boolean }) {
+/** While `me` may edit the doc: its live room, passing our awareness (cursor) to the other editors there,
+ * and theirs to us. Reconnects if the connection drops. */
+function useLiveRoom(hash: string, live: Live | null, me: User | null, editable: boolean) {
+  useEffect(() => {
+    if (!live || !me || !editable) return;
+    const { awareness, users, clients } = live;
+    awareness.setLocalStateField("user", presence(me.pubkey));
+    let stopped = false;
+    let ws: WebSocket | null = null;
+    let retry: ReturnType<typeof setTimeout> | undefined;
+
+    const sendMine = () => {
+      if (ws?.readyState === WebSocket.OPEN) ws.send(encodeAwarenessUpdate(awareness, [awareness.clientID]) as Uint8Array<ArrayBuffer>);
+    };
+    const onLocal = ({ added, updated, removed }: Record<string, number[]>, origin: unknown) => {
+      if (origin === "local" && [...added, ...updated, ...removed].includes(awareness.clientID)) sendMine();
+    };
+    awareness.on("update", onLocal);
+
+    /** Forgets the cursors that came through connection `conn` (all of them, if undefined). */
+    const forget = (conn?: number) => {
+      const ids = [...clients].filter(([, c]) => conn === undefined || c === conn).map(([id]) => id);
+      ids.forEach((id) => clients.delete(id));
+      removeAwarenessStates(awareness, ids, "left");
+    };
+
+    const connect = async () => {
+      try {
+        const live = await joinLive(hash);
+        if (stopped) return live.ws.close();
+        ws = live.ws;
+        ws.onopen = () => {
+          ws!.send(live.hello);
+          sendMine();
+        };
+        ws.onmessage = (e) => {
+          const b = new Uint8Array(e.data as ArrayBuffer);
+          if (b.length < 37) return;
+          const conn = new DataView(b.buffer).getUint32(1);
+          users.set(conn, b58(b.subarray(5, 37)));
+          if (b[0] === LIVE_UPDATE) applyAwarenessUpdate(awareness, b.subarray(37), conn);
+          else if (b[0] === LIVE_JOINED) sendMine();
+          else if (b[0] === LIVE_LEFT) {
+            forget(conn);
+            users.delete(conn);
+          }
+        };
+        ws.onclose = (e) => {
+          forget();
+          if (e.code === 4003) console.warn(`Not joining this doc's live room: ${e.reason}`);
+          else if (!stopped) retry = setTimeout(connect, RECONNECT_MS);
+        };
+      } catch (e) {
+        console.warn("Couldn't join this doc's live room:", e);
+      }
+    };
+    connect();
+
+    return () => {
+      stopped = true;
+      clearTimeout(retry);
+      awareness.off("update", onLocal);
+      ws?.close();
+      forget();
+      awareness.setLocalState(null);
+    };
+  }, [hash, live, me?.pubkey, editable]);
+}
+
+/** Who else is in the live room right now. */
+function useHere(live: Live | null) {
+  const [here, setHere] = useState<Presence[]>([]);
+  useEffect(() => {
+    if (!live) return;
+    const update = () => {
+      const seen = new Map<string, Presence>();
+      for (const [id, s] of live.awareness.getStates()) {
+        const p = s.user as Presence | undefined;
+        if (id !== live.awareness.clientID && live.clients.has(id) && p) seen.set(p.pubkey, p);
+      }
+      setHere([...seen.values()]);
+    };
+    update();
+    live.awareness.on("change", update);
+    return () => live.awareness.off("change", update);
+  }, [live]);
+  return here;
+}
+
+/** A CodeMirror markdown editor bound to `ytext`, showing the cursors in `awareness`; read-only unless `editable`. */
+function Editor({ ytext, awareness, editable }: { ytext: Y.Text; awareness: Awareness; editable: boolean }) {
   const el = useRef<HTMLDivElement>(null);
   const view = useRef<EditorView | null>(null);
   const editability = useMemo(() => new Compartment(), []);
@@ -211,7 +345,7 @@ function Editor({ ytext, editable }: { ytext: Y.Text; editable: boolean }) {
           markdown(),
           EditorView.lineWrapping,
           placeholder("Write in markdown…"),
-          yCollab(ytext, null),
+          yCollab(ytext, awareness),
           editability.of(editableExt(editable)),
           EditorView.theme({
             "&": { fontSize: "14px", height: "100%" },
@@ -223,7 +357,7 @@ function Editor({ ytext, editable }: { ytext: Y.Text; editable: boolean }) {
       }),
     });
     return () => view.current?.destroy();
-  }, [ytext]);
+  }, [ytext, awareness]);
 
   useEffect(() => {
     view.current?.dispatch({ effects: editability.reconfigure(editableExt(editable)) });
@@ -249,8 +383,21 @@ function Preview({ ytext }: { ytext: Y.Text }) {
   );
 }
 
-function Status({ save, syncError, ignored, editable }: { save: SaveState; syncError: string; ignored: number; editable: boolean }) {
+function Status(props: { save: SaveState; syncError: string; ignored: number; editable: boolean; here: Presence[] }) {
+  const { save, syncError, ignored, editable, here } = props;
   const parts: React.ReactNode[] = [];
+  if (here.length) {
+    parts.push(
+      <span>
+        Here now:{" "}
+        {here.map((p, i) => (
+          <span key={p.pubkey} style={{ color: p.color }} className="font-medium">
+            {i > 0 && ", "}● {p.name}
+          </span>
+        ))}
+      </span>,
+    );
+  }
   if (save.error) parts.push(<span className="text-red-700">{save.error} (retrying)</span>);
   else if (save.sending) parts.push("Saving…");
   else if (save.unsent) parts.push("Unsaved changes");
@@ -356,13 +503,17 @@ export function DocPage({ hash, me, busy, run, tick }: { hash: string; me: User 
   const [doc, setDoc] = useState<{ post: Post | null; deleted: boolean } | null>(null);
   const [mode, setMode] = useState<Mode>("split");
   useEffect(() => setDoc(null), [hash]);
-  const { ytext, ready, save, syncError, ignored, reload } = useDocSync(hash, (post, deleted) => setDoc({ post, deleted }));
+  const { sync, ready, save, syncError, ignored, reload } = useDocSync(hash, (post, deleted) => setDoc({ post, deleted }));
+  const post = doc?.post && !doc.deleted ? doc.post : null;
+  const editable = !!me && !!post && mayEditDoc(post, me.pubkey);
+  useLiveRoom(hash, sync?.live ?? null, me, editable);
+  const here = useHere(sync?.live ?? null);
   // After our own actions (renaming, editors), see the new version now rather than on the next poll.
   const { error } = useLoad(valid && tick ? reload : null, [hash], tick);
 
   if (!valid) return <p className="text-red-700"><code className="break-all">{hash}</code> isn't a doc hash (32 bytes of base58).</p>;
   if (!doc) return <p className="text-gray-500">{syncError ? `Couldn't load this doc: ${syncError}` : "Loading…"}</p>;
-  if (doc.deleted || !doc.post) {
+  if (!post) {
     return (
       <p className="rounded-md bg-gray-50 p-3 text-sm text-gray-600 ring-1 ring-gray-200">
         {doc.deleted ? "This doc was deleted." : "That isn't a doc."}{" "}
@@ -373,8 +524,6 @@ export function DocPage({ hash, me, busy, run, tick }: { hash: string; me: User 
       </p>
     );
   }
-  const post = doc.post;
-  const editable = !!me && mayEditDoc(post, me.pubkey);
   const manage = !!me && (post.by?.pubkey === me.pubkey || amOwner());
   const tab = (m: Mode, label: string) => (
     <button
@@ -401,7 +550,7 @@ export function DocPage({ hash, me, busy, run, tick }: { hash: string; me: User 
       {error && <p className="text-sm text-red-700">{error}</p>}
 
       <div className="flex items-center justify-between gap-2">
-        <Status save={save} syncError={syncError} ignored={ignored} editable={editable} />
+        <Status save={save} syncError={syncError} ignored={ignored} editable={editable} here={here} />
         <div className="flex overflow-hidden rounded-md text-xs font-medium ring-1 ring-gray-300">
           {tab("write", "Write")}
           {tab("split", "Split")}
@@ -409,12 +558,12 @@ export function DocPage({ hash, me, busy, run, tick }: { hash: string; me: User 
         </div>
       </div>
 
-      {!ytext || !ready ? (
+      {!sync || !ready ? (
         <p className="text-gray-500">Loading its text…</p>
       ) : (
         <div className={`grid gap-4 ${mode === "split" ? "md:grid-cols-2" : ""}`}>
-          {mode !== "preview" && <Editor ytext={ytext} editable={editable} />}
-          {mode !== "write" && <Preview ytext={ytext} />}
+          {mode !== "preview" && <Editor ytext={sync.ytext} awareness={sync.live.awareness} editable={editable} />}
+          {mode !== "write" && <Preview ytext={sync.ytext} />}
         </div>
       )}
 

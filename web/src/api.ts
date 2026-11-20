@@ -13,6 +13,7 @@ import {
   decodeRecord,
   decodeRecords,
   encodeRecord,
+  liveSignedBytes,
   pathWithin,
   phrase,
   readSignedBytes,
@@ -778,14 +779,24 @@ export const mayEditDoc = (doc: Post, pubkey: string) =>
 /** Whether some editor of `doc` is named by a claim we don't know to be claimed (as of `loadClaims`). */
 export const docHasOpenClaims = (doc: Post) => !!doc.doc?.editors.some((e) => e.claim && !e.user);
 
-/** `doc`'s updates that arrived at this node after `after` (0 for all), in order; where to continue
- * from; and the hash of the doc's current version (base58). null if the doc's gone. */
-export async function getDocUpdates(root: string, after: number) {
-  const res = await fetch(`/api/docs/${root}/updates?after=${after}`);
-  if (res.status === 404) return null;
-  if (!res.ok) throw new Error((await res.text()) || res.statusText);
-  const updates = decodeRecords(new Uint8Array(await res.arrayBuffer()));
-  return { updates, seq: Number(res.headers.get("x-seq")), head: res.headers.get("x-doc-head")! };
+/** Records as they're stored on this node (see `stream` in src/main.rs): a doc's, with `doc` (its hash,
+ * base58), or those at or under `prefix`. Each "record" event's data is a record (base64); after what's
+ * already there comes a "ready" event. EventSource reconnects by itself, picking up where it left off. */
+export const streamRecords = (q: { doc?: string; prefix?: string }) =>
+  new EventSource(`/api/stream?${new URLSearchParams(Object.entries(q).filter((e): e is [string, string] => !!e[1]))}`);
+
+/** A "record" event's record, decoded and checked. */
+export const streamedRecord = (data: string) => decodeRecord(unb64(data));
+
+/** A WebSocket to `doc`'s live room on this node (see `live` in src/main.rs), and the signed hello that
+ * has to be its first message: we may only join as one of its editors. */
+export async function joinLive(doc: string) {
+  if (!keys || !thisNode) throw new Error("Sign in first.");
+  const expires = Date.now() + READ_TOKEN_MS;
+  const signature = await sign(liveSignedBytes(decodeId(thisNode.pubkey)!, unb58(doc)!, BigInt(expires)));
+  const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/docs/${doc}/live`);
+  ws.binaryType = "arraybuffer";
+  return { ws, hello: JSON.stringify({ user: keys.pubkey, expires, signature: b58(signature) }) };
 }
 
 /** Writes a Yjs update to `doc`'s text, as us. */

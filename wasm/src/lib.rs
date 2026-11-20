@@ -2,7 +2,7 @@
 //! Built into wasm/pkg by `npm run wasm`.
 
 use fedcrdt_core::{
-    CBOR, ClaimData, DocData, DocUpdateData, GrantData, Grantees, Map, PeerData, Record, Who, check_path, check_prefix, claim_signed_bytes, decode_b58,
+    CBOR, ClaimData, DocData, DocUpdateData, GrantData, Grantees, Map, PeerData, Record, Who, check_path, check_prefix, claim_signed_bytes, decode_b58, live_signed_bytes,
     decode_id, encode_b58, node_phrase, path_within, phrase, read_signed_bytes, two_words,
 };
 use serde::{Deserialize, Serialize};
@@ -354,6 +354,12 @@ pub fn claim_signed_bytes_js(node: &[u8], token: &[u8]) -> Result<Vec<u8>> {
 #[wasm_bindgen(js_name = readSignedBytes)]
 pub fn read_signed_bytes_js(node: &[u8], expires: u64) -> Result<Vec<u8>> {
     Ok(read_signed_bytes(&fixed(node, "node")?, expires))
+}
+
+/// The bytes an editor signs to join the live room of `doc` on `node` until `expires` (ms since the epoch).
+#[wasm_bindgen(js_name = liveSignedBytes)]
+pub fn live_signed_bytes_js(node: &[u8], doc: &[u8], expires: u64) -> Result<Vec<u8>> {
+    Ok(live_signed_bytes(&fixed(node, "node")?, &fixed(doc, "doc")?, expires))
 }
 
 // ---- IDs and paths ----

@@ -1,26 +1,39 @@
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Path, Query, State},
+    extract::{
+        Path, Query, State,
+        ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
+    },
     http::{HeaderMap, StatusCode, Uri, header},
-    response::{IntoResponse, Redirect, Response},
+    response::{
+        IntoResponse, Redirect, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::{get, post},
 };
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use ed25519_dalek::{Signer, SigningKey};
 use fedcrdt_core::{
-    CBOR, CLAIM_PATH, ClaimData, DocUpdateData, GrantData, Hash, MAX_READ_TOKEN_MS, Map, NODE_INFO_PATH, NODE_PATH, OWNER_PATH, PeerData, Pubkey,
+    CBOR, CLAIM_PATH, ClaimData, DocData, DocUpdateData, GrantData, Hash, MAX_READ_TOKEN_MS, Map, NODE_INFO_PATH, NODE_PATH, OWNER_PATH, PeerData, Pubkey,
     Record, Who, check_prefix, claim_signed_bytes, decode_b58, decode_id, encode_b58, encode_id, node_phrase, path_within, phrase,
-    read_signed_bytes, verify_sig,
+    live_signed_bytes, read_signed_bytes, verify_sig,
 };
 use rusqlite::{Connection, OptionalExtension};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
-    sync::{Arc, Mutex},
+    collections::{HashMap, HashSet},
+    convert::Infallible,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU32, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use tokio::sync::{broadcast, mpsc};
+use tokio_stream::wrappers::ReceiverStream;
 
 /// Bump to wipe the database when the schema changes incompatibly.
 /// 6: records identified by hash, nodes. 7: chains table, seq as rowid. 8: private records. 9: records.doc.
@@ -32,6 +45,9 @@ const MAX_CLOCK_SKEW_MS: u64 = 10 * 60 * 1000;
 /// Records per push to a peer.
 const PUSH_BATCH: i64 = 100;
 
+/// The largest message a live room passes on.
+const MAX_LIVE_MSG: usize = 64 * 1024;
+
 struct App {
     db: Mutex<Connection>,
     /// This node's own key; its public half is `pk`.
@@ -40,6 +56,39 @@ struct App {
     /// Wakes the push task when a record is stored.
     push: tokio::sync::Notify,
     http: reqwest::Client,
+    /// Every record as it's stored here, for streams (see `stream`).
+    stored: broadcast::Sender<Stored>,
+    /// Each doc's live room, while anyone's in it (see `live`).
+    rooms: Mutex<HashMap<Hash, broadcast::Sender<LiveMsg>>>,
+    /// Numbers connections to live rooms.
+    next_conn: AtomicU32,
+}
+
+impl App {
+    fn new(db: Connection, key: SigningKey) -> App {
+        let pk = key.verifying_key().to_bytes();
+        App {
+            db: Mutex::new(db),
+            key,
+            pk,
+            push: Default::default(),
+            http: reqwest::Client::new(),
+            stored: broadcast::channel(1024).0,
+            rooms: Default::default(),
+            next_conn: AtomicU32::new(0),
+        }
+    }
+}
+
+/// A record just stored here, as streams need it.
+#[derive(Clone)]
+struct Stored {
+    seq: i64,
+    root: Hash,
+    doc: Option<Hash>,
+    path: String,
+    private: bool,
+    bytes: Arc<Vec<u8>>,
 }
 
 type S = State<Arc<App>>;
@@ -69,8 +118,7 @@ async fn main() {
     create_schema(&db);
 
     let key = node_key(&db);
-    let pk = key.verifying_key().to_bytes();
-    let app = Arc::new(App { db: Mutex::new(db), key, pk, push: Default::default(), http: reqwest::Client::new() });
+    let app = Arc::new(App::new(db, key));
     app.init(&public_url, &origin);
     tokio::spawn(push_loop(app.clone()));
 
@@ -79,7 +127,8 @@ async fn main() {
         .route("/api/users/{pubkey}", get(user))
         .route("/api/records", get(list_records).post(put_record))
         .route("/api/records/{hash}", get(chain))
-        .route("/api/docs/{hash}/updates", get(doc_updates))
+        .route("/api/stream", get(stream))
+        .route("/api/docs/{hash}/live", get(live))
         .route("/api/node", get(node_info))
         .route("/api/nodes", get(nodes))
         .route("/api/claim", post(claim))
@@ -216,6 +265,20 @@ fn claimed_by(db: &Connection, root: &Hash) -> Option<Pubkey> {
     claim_head(db, root)?.1.user
 }
 
+/// The live doc whose chain starts with `root`: who started it, its current version, and that version's data.
+fn doc_head(db: &Connection, root: &Hash) -> Result<(Pubkey, Record, DocData), String> {
+    let (by, head): (Option<Pubkey>, Vec<u8>) = db
+        .query_row("SELECT by, record FROM heads WHERE root = ?1 AND type = 'doc'", [root], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()
+        .unwrap()
+        .ok_or("this node has no live doc with that hash")?;
+    let head = parse_record(head);
+    match (by, head.doc()) {
+        (Some(by), Some(doc)) => Ok((by, head, doc)),
+        _ => Err("this node doesn't have that doc's first version".into()),
+    }
+}
+
 /// This node's owners, from its owner records: users named directly, or who claimed a claim named.
 fn owners(db: &Connection) -> Vec<Pubkey> {
     heads_of(db, "owner").iter().filter_map(|(_, r)| r.owner()?.resolve(|c| claimed_by(db, c))).collect()
@@ -272,6 +335,19 @@ fn store(db: &Connection, rec: &Record, from: Option<Pubkey>) -> Result<bool, St
 }
 
 impl App {
+    /// Stores `rec` (see `store`). If it's new here, passes it to streams and wakes the push task.
+    fn store(&self, db: &Connection, rec: &Record, from: Option<Pubkey>) -> Result<bool, String> {
+        let new = store(db, rec, from)?;
+        if new {
+            let (seq, root) =
+                db.query_row("SELECT seq, root FROM records WHERE hash = ?1", [rec.hash()], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+            let doc = rec.doc_update().map(|u| u.doc);
+            let _ = self.stored.send(Stored { seq, root, doc, path: rec.path.clone(), private: rec.private, bytes: Arc::new(rec.to_bytes()) });
+            self.push.notify_one();
+        }
+        Ok(new)
+    }
+
     /// A record by this node, signed by it. `edits`: the version it replaces.
     fn sign(&self, db: &Connection, path: &str, kind: &str, data: CBOR, edits: Option<Hash>) -> Record {
         let prev: Option<i64> = edits.and_then(|h| db.query_row("SELECT version FROM records WHERE hash = ?1", [h], |r| r.get(0)).optional().unwrap());
@@ -293,8 +369,7 @@ impl App {
     /// Writes a record as this node. Returns its hash.
     fn write(&self, db: &Connection, path: &str, kind: &str, data: CBOR, edits: Option<Hash>) -> Hash {
         let r = self.sign(db, path, kind, data, edits);
-        store(db, &r, None).unwrap();
-        self.push.notify_one();
+        self.store(db, &r, None).unwrap();
         r.hash()
     }
 
@@ -403,15 +478,7 @@ impl App {
     /// Whether `rec`, an update to the doc `u.doc`, may be written here: the doc is live, the update is
     /// at its current path, and its author is the doc's author, one of its editors, or an owner.
     fn authorize_doc_update(&self, db: &Connection, rec: &Record, u: &DocUpdateData, owner: bool) -> Result<(), String> {
-        let (by, head): (Option<Pubkey>, Vec<u8>) = db
-            .query_row("SELECT by, record FROM heads WHERE root = ?1 AND type = 'doc'", [u.doc], |r| Ok((r.get(0)?, r.get(1)?)))
-            .optional()
-            .unwrap()
-            .ok_or("this node has no live doc with that hash")?;
-        let head = parse_record(head);
-        let (Some(by), Some(doc)) = (by, head.doc()) else {
-            return Err("this node doesn't have that doc's first version".into());
-        };
+        let (by, head, doc) = doc_head(db, &u.doc)?;
         if rec.path != head.path {
             return Err(format!("this doc's updates go at its path, {}", head.path));
         }
@@ -498,6 +565,13 @@ struct RecordsQuery {
     prefix: Option<String>,
 }
 
+/// SQL for "and `path` is at or under the prefix bound as `p`": one range ('0' sorts right after '/'),
+/// narrowed to leave out siblings like `{p}-x` that sort between `{p}` and `{p}/`. As a range, it can
+/// use an index.
+fn under(p: &str) -> String {
+    format!(" AND path >= {p} AND path < {p} || '0' AND (path = {p} OR path >= {p} || '/')")
+}
+
 /// The current version of every live chain matching the query (but doc updates, unless `type` asks for
 /// them), newest first, as a CBOR array of
 /// {record, root: its chain's hash, by: who wrote the chain's first record (if this node has it),
@@ -530,10 +604,7 @@ async fn list_records(State(app): S, headers: HeaderMap, Query(q): Query<Records
         sql += &format!(" AND by = {}", bind(Box::new(a)));
     }
     if let Some(p) = prefix {
-        // The path itself or anything under it: one range ('0' sorts right after '/'), narrowed to
-        // leave out siblings like `{p}-x` that sort between `{p}` and `{p}/`.
-        let p = bind(Box::new(p));
-        sql += &format!(" AND path >= {p} AND path < {p} || '0' AND (path = {p} OR path >= {p} || '/')");
+        sql += &under(&bind(Box::new(p)));
     }
     match q.kind {
         Some(k) => sql += &format!(" AND type = {}", bind(Box::new(k))),
@@ -593,9 +664,8 @@ async fn put_record(State(app): S, body: Bytes) -> Response {
     if let Err(e) = app.authorize(&db, &rec) {
         return err(StatusCode::FORBIDDEN, e);
     }
-    match store(&db, &rec, None) {
+    match app.store(&db, &rec, None) {
         Ok(true) => {
-            app.push.notify_one();
             Json(json!({ "hash": encode_b58(&rec.hash()) })).into_response()
         }
         Ok(false) => err(StatusCode::CONFLICT, "this record is already here"),
@@ -603,37 +673,211 @@ async fn put_record(State(app): S, body: Bytes) -> Response {
     }
 }
 
+// ---- streams: records as they arrive ----
+
 #[derive(Deserialize)]
-struct UpdatesQuery {
-    /// Only updates that arrived after this one: the X-Seq of an earlier answer.
+struct StreamQuery {
+    /// Only a doc's records: its versions and its updates (the doc chain's first record's hash, base58).
+    doc: Option<String>,
+    /// Only records at or under this path.
+    prefix: Option<String>,
+    /// Start after this record (an event ID from an earlier stream), instead of at the beginning. A
+    /// reconnecting EventSource's Last-Event-ID takes its place.
     after: Option<i64>,
 }
 
-/// The updates to the live doc whose chain starts with the record with this hash (base58), in the order
-/// they arrived here, as a CBOR array of records. X-Seq: where to continue from (`after`); X-Doc-Head:
-/// the doc's current version's hash (base58), so readers see when its title or editors change. Includes
-/// updates by anyone: readers check who wrote them (see `DocData::may_edit`).
-async fn doc_updates(State(app): S, Path(hash): Path<String>, Query(q): Query<UpdatesQuery>) -> Response {
-    let Some(root) = decode_b58(&hash).and_then(|h| Hash::try_from(h).ok()) else {
+/// Which records a stream passes on. Never private ones: the stream has no read token.
+#[derive(Clone)]
+struct StreamFilter {
+    doc: Option<Hash>,
+    prefix: Option<String>,
+}
+
+impl StreamFilter {
+    fn matches(&self, s: &Stored) -> bool {
+        !s.private && self.doc.is_none_or(|d| s.doc == Some(d) || s.root == d) && self.prefix.as_ref().is_none_or(|p| path_within(&s.path, p))
+    }
+}
+
+/// The records matching `f` that arrived here after `after`, in order: (seq, record).
+fn stored_after(db: &Connection, f: &StreamFilter, after: i64) -> Vec<(i64, Vec<u8>)> {
+    let mut sql = String::from("SELECT seq, record FROM records WHERE seq > ?1 AND NOT private");
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(after)];
+    if let Some(d) = f.doc {
+        params.push(Box::new(d));
+        sql += &format!(" AND (doc = ?{0} OR root = ?{0})", params.len());
+    }
+    if let Some(p) = &f.prefix {
+        params.push(Box::new(p.clone()));
+        sql += &under(&format!("?{}", params.len()));
+    }
+    sql += " ORDER BY seq";
+    let mut stmt = db.prepare(&sql).unwrap();
+    stmt.query_map(rusqlite::params_from_iter(params), |r| Ok((r.get(0)?, r.get(1)?))).unwrap().flatten().collect()
+}
+
+/// Server-sent events: every record matching the query that's here (after `after`), then a "ready"
+/// event (its data: the last record's seq), then each new one as it's stored. Each "record" event's data is the record (base64 CBOR), and
+/// its ID is where to continue from. A stream that falls too far behind is ended; EventSource reconnects
+/// and picks up where it left off.
+async fn stream(State(app): S, headers: HeaderMap, Query(q): Query<StreamQuery>) -> Response {
+    let doc = match q.doc.as_deref().map(|d| decode_b58(d).and_then(|h| Hash::try_from(h).ok())) {
+        Some(None) => return err(StatusCode::BAD_REQUEST, "doc isn't 32 bytes of base58"),
+        d => d.flatten(),
+    };
+    let prefix = q.prefix.filter(|p| p != "/");
+    if let Some(Err(e)) = prefix.as_deref().map(check_prefix) {
+        return err(StatusCode::BAD_REQUEST, format!("bad prefix: {e}"));
+    }
+    let f = StreamFilter { doc, prefix };
+    let after = headers.get("last-event-id").and_then(|v| v.to_str().ok()?.parse().ok()).or(q.after).unwrap_or(0);
+    // Subscribing with the database locked: anything stored before is in the backlog, anything after
+    // comes through `live`. Some may be in both; seq tells.
+    let (backlog, mut live) = {
+        let db = app.db.lock().unwrap();
+        (stored_after(&db, &f, after), app.stored.subscribe())
+    };
+    let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(64);
+    let record = |seq: i64, bytes: &[u8]| Ok(Event::default().event("record").id(seq.to_string()).data(BASE64.encode(bytes)));
+    tokio::spawn(async move {
+        let mut last = after;
+        for (seq, bytes) in backlog {
+            if tx.send(record(seq, &bytes)).await.is_err() {
+                return;
+            }
+            last = seq;
+        }
+        // With data: browsers drop events without any.
+        if tx.send(Ok(Event::default().event("ready").id(last.to_string()).data(last.to_string()))).await.is_err() {
+            return;
+        }
+        loop {
+            tokio::select! {
+                _ = tx.closed() => return,
+                s = live.recv() => match s {
+                    Ok(s) if s.seq > last && f.matches(&s) => {
+                        last = s.seq;
+                        if tx.send(record(s.seq, &s.bytes)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => return,
+                },
+            }
+        }
+    });
+    Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::default()).into_response()
+}
+
+// ---- live rooms: presence in a doc ----
+//
+// A WebSocket per editor, per doc. The first message is a hello, signed by one of the doc's editors (see
+// `live_signed_bytes` in core/src/lib.rs): JSON {user, expires, signature}, base58 but for the expiry.
+// Then each binary message (a Yjs awareness update: cursors, selections) goes to everyone else in the
+// room, as is. Nothing is stored or checked but its size.
+//
+// To the client, each message is a frame: a kind (LIVE_*), the sender's connection number (u32, big
+// endian), the sender's ID (32 bytes), then for LIVE_UPDATE what they sent. The ID is the one their
+// hello proved, so clients can name cursors by it rather than by what the update claims.
+
+const LIVE_UPDATE: u8 = 0;
+/// Someone joined: send them where you are.
+const LIVE_JOINED: u8 = 1;
+/// Someone left: forget their cursors.
+const LIVE_LEFT: u8 = 2;
+
+#[derive(Clone)]
+struct LiveMsg {
+    from: u32,
+    frame: Arc<Vec<u8>>,
+}
+
+#[derive(Deserialize)]
+struct Hello {
+    user: String,
+    expires: u64,
+    signature: String,
+}
+
+impl App {
+    /// Who a live room's hello is from, if it's valid and they may edit the doc.
+    fn live_hello(&self, doc: &Hash, text: &str) -> Result<Pubkey, String> {
+        let h: Hello = serde_json::from_str(text).map_err(|_| "expected a hello: {user, expires, signature}")?;
+        let user = decode_id(&h.user).ok_or("the hello's user isn't an ID")?;
+        let sig: [u8; 64] = decode_b58(&h.signature).and_then(|s| s.try_into().ok()).ok_or("the hello's signature isn't 64 bytes of base58")?;
+        let now = now_ms();
+        if h.expires < now || h.expires > now + MAX_READ_TOKEN_MS {
+            return Err("the hello expired, or expires too far ahead; check your clock".into());
+        }
+        verify_sig(&user, &live_signed_bytes(&self.pk, doc, h.expires), &sig)?;
+        let db = self.db.lock().unwrap();
+        let (by, _, data) = doc_head(&db, doc)?;
+        if !owners(&db).contains(&user) && !data.may_edit(&by, &user, |c| claimed_by(&db, c)) {
+            return Err("only the doc's author and editors can join".into());
+        }
+        Ok(user)
+    }
+}
+
+/// Joins the live room of the doc whose chain starts with the record with this hash (base58).
+async fn live(State(app): S, Path(hash): Path<String>, ws: WebSocketUpgrade) -> Response {
+    let Some(doc) = decode_b58(&hash).and_then(|h| Hash::try_from(h).ok()) else {
         return err(StatusCode::BAD_REQUEST, "hash isn't 32 bytes of base58");
     };
-    let db = app.db.lock().unwrap();
-    let Some(head): Option<Hash> =
-        db.query_row("SELECT hash FROM heads WHERE root = ?1 AND type = 'doc'", [root], |r| r.get(0)).optional().unwrap()
-    else {
-        return err(StatusCode::NOT_FOUND, "no live doc with that hash here");
+    ws.max_message_size(MAX_LIVE_MSG).on_upgrade(move |socket| live_conn(app, doc, socket))
+}
+
+async fn live_conn(app: Arc<App>, doc: Hash, mut ws: WebSocket) {
+    let hello = match ws.recv().await {
+        Some(Ok(Message::Text(t))) => app.live_hello(&doc, &t),
+        _ => return,
     };
-    let after = q.after.unwrap_or(0);
-    let mut stmt = db.prepare("SELECT seq, record FROM records WHERE doc = ?1 AND seq > ?2 AND type = 'doc_update' ORDER BY seq").unwrap();
-    let rows: Vec<(i64, Vec<u8>)> = stmt.query_map((root, after), |r| Ok((r.get(0)?, r.get(1)?))).unwrap().flatten().collect();
-    let seq = rows.last().map_or(after, |r| r.0);
-    let records: Vec<Vec<u8>> = rows.into_iter().map(|r| r.1).collect();
-    let headers = [
-        (header::CONTENT_TYPE, "application/cbor".to_string()),
-        (header::HeaderName::from_static("x-seq"), seq.to_string()),
-        (header::HeaderName::from_static("x-doc-head"), encode_b58(&head)),
-    ];
-    (headers, cbor_array(&records)).into_response()
+    let user = match hello {
+        Ok(u) => u,
+        Err(e) => {
+            let _ = ws.send(Message::Close(Some(CloseFrame { code: 4003, reason: e.into() }))).await;
+            return;
+        }
+    };
+    let conn = app.next_conn.fetch_add(1, Ordering::Relaxed);
+    let frame = |kind: u8, payload: &[u8]| LiveMsg { from: conn, frame: Arc::new([&[kind][..], &conn.to_be_bytes(), &user, payload].concat()) };
+    // Subscribing with the rooms locked, so an emptied room can't be dropped between.
+    let (tx, mut rx) = {
+        let mut rooms = app.rooms.lock().unwrap();
+        let tx = rooms.entry(doc).or_insert_with(|| broadcast::channel(256).0).clone();
+        let rx = tx.subscribe();
+        (tx, rx)
+    };
+    let _ = tx.send(frame(LIVE_JOINED, &[]));
+    loop {
+        tokio::select! {
+            m = ws.recv() => match m {
+                Some(Ok(Message::Binary(b))) => {
+                    let _ = tx.send(frame(LIVE_UPDATE, &b));
+                }
+                Some(Ok(_)) => {}
+                _ => break,
+            },
+            m = rx.recv() => match m {
+                Ok(m) if m.from != conn => {
+                    if ws.send(Message::Binary(m.frame.to_vec().into())).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(_) => {}
+                // Missed some: they're only cursors, and each client resends its own now and then.
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+        }
+    }
+    let _ = tx.send(frame(LIVE_LEFT, &[]));
+    drop(rx);
+    let mut rooms = app.rooms.lock().unwrap();
+    if tx.receiver_count() == 0 {
+        rooms.remove(&doc);
+    }
 }
 
 // ---- this node, and claiming it ----
@@ -732,7 +976,7 @@ async fn receive(State(app): S, headers: HeaderMap, body: Bytes) -> Response {
             if r.kind == "claim" {
                 return Err("claims aren't federated".into());
             }
-            store(&db, &r, from)
+            app.store(&db, &r, from)
         })
         .map(|r| match r {
             Ok(true) => "stored".into(),
@@ -740,9 +984,6 @@ async fn receive(State(app): S, headers: HeaderMap, body: Bytes) -> Response {
             Err(e) => format!("bad record: {e}").into(),
         })
         .collect();
-    if results.iter().any(|r| r == "stored") {
-        app.push.notify_one();
-    }
     Json(results).into_response()
 }
 
@@ -834,8 +1075,7 @@ mod tests {
         let db = Connection::open_in_memory().unwrap();
         create_schema(&db);
         let key = node_key(&db);
-        let pk = key.verifying_key().to_bytes();
-        let app = App { db: Mutex::new(db), key, pk, push: Default::default(), http: reqwest::Client::new() };
+        let app = App::new(db, key);
         app.init("http://node.test", "http://web.test");
         app
     }
@@ -1186,13 +1426,20 @@ mod tests {
         sign(key, path, "doc_update", DocUpdateData { doc: doc.hash(), update: update.to_vec() }.to_cbor(), None, 1)
     }
 
-    /// The updates `doc_updates` answers with (their bytes), and its X-Seq.
-    async fn updates(app: &Arc<App>, doc: &Record, after: i64) -> (Vec<Vec<u8>>, i64) {
-        let res = doc_updates(State(app.clone()), Path(encode_b58(&doc.hash())), Query(UpdatesQuery { after: Some(after) })).await;
-        assert_eq!(res.status(), StatusCode::OK);
-        let seq = res.headers()["x-seq"].to_str().unwrap().parse().unwrap();
-        let items = CBOR::try_from_data(body(res).await).unwrap().into_array().unwrap();
-        (items.iter().map(|v| Record::from_cbor(v).unwrap().doc_update().unwrap().update).collect(), seq)
+    /// What a stream of `doc` starts with after `after`: its records' types (and for updates, what they
+    /// say), and the last one's seq.
+    fn streamed(app: &App, doc: &Record, after: i64) -> (Vec<String>, i64) {
+        let f = StreamFilter { doc: Some(doc.hash()), prefix: None };
+        let rows = stored_after(&app.db.lock().unwrap(), &f, after);
+        let last = rows.last().map_or(after, |r| r.0);
+        let said = rows
+            .iter()
+            .map(|(_, b)| {
+                let r = parse_record(b.clone());
+                r.doc_update().map_or(r.kind.clone(), |u| String::from_utf8(u.update).unwrap())
+            })
+            .collect();
+        (said, last)
     }
 
     #[tokio::test]
@@ -1236,9 +1483,9 @@ mod tests {
         let err = put(&app, &tombstone(&bob, &carols, 2)).unwrap_err();
         assert!(err.contains("never edited or deleted"), "{err}");
 
-        let (all, seq) = updates(&app, &doc, 0).await;
-        assert_eq!(all, [b"bob".to_vec(), b"alice".to_vec(), b"carol".to_vec()]);
-        assert_eq!(updates(&app, &doc, seq).await, (vec![], seq));
+        let (all, seq) = streamed(&app, &doc, 0);
+        assert_eq!(all, ["doc", "bob", "alice", "doc", "carol"], "the doc's versions and updates, as they arrived");
+        assert_eq!(streamed(&app, &doc, seq), (vec![], seq));
         let list = list_records(State(app.clone()), HeaderMap::new(), Query(RecordsQuery { author: None, kind: None, prefix: Some("/doc".into()) })).await;
         let kinds: Vec<String> = CBOR::try_from_data(body(list).await)
             .unwrap()
@@ -1261,7 +1508,44 @@ mod tests {
         put(&app, &tombstone(&bob, &v2, 3)).unwrap();
         let err = put(&app, &doc_update(&bob, &doc, "/doc", b"late")).unwrap_err();
         assert!(err.contains("no live doc"), "{err}");
-        let res = doc_updates(State(app.clone()), Path(encode_b58(&doc.hash())), Query(UpdatesQuery { after: None })).await;
-        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(streamed(&app, &doc, seq).0, ["tombstone"], "streams see it go");
+    }
+
+    #[tokio::test]
+    async fn streams_and_live_rooms() {
+        use fedcrdt_core::DocData;
+        let (app, alice, bob) = setup();
+        let carol = key(3);
+        let grant = GrantData { path: "/doc".into(), grantees: Grantees::Anyone };
+        put(&app, &sign(&alice, GRANT_PATH, "grant", grant.to_cbor(), None, 1)).unwrap();
+        let doc = sign(&bob, "/doc", "doc", DocData { title: "".into(), editors: vec![Who::User(id(&carol))] }.to_cbor(), None, 1);
+        put(&app, &doc).unwrap();
+
+        // What a stream of the doc, and one of /post, would pass on as records are stored.
+        let mut rx = app.stored.subscribe();
+        let (of_doc, of_posts) = (StreamFilter { doc: Some(doc.hash()), prefix: None }, StreamFilter { doc: None, prefix: Some("/post".into()) });
+        let db = app.db.lock().unwrap();
+        for r in [doc_update(&carol, &doc, "/doc", b"hi"), post(&bob, "/post/a", "a", None, 1), private_post(&alice, "/post/b", "secret", None, 1)] {
+            assert!(app.store(&db, &r, None).unwrap());
+        }
+        drop(db);
+        let got: Vec<(bool, bool)> = (0..3).map(|_| rx.try_recv().unwrap()).map(|s| (of_doc.matches(&s), of_posts.matches(&s))).collect();
+        assert_eq!(got, [(true, false), (false, true), (false, false)], "private records are never streamed");
+
+        // Joining the doc's live room: a fresh hello signed by an editor (or an owner), for this doc on this node.
+        let hello = |k: &SigningKey, doc: &Hash, expires: u64| {
+            let sig = k.sign(&live_signed_bytes(&app.pk, doc, expires)).to_bytes();
+            json!({ "user": encode_id(&id(k)), "expires": expires, "signature": encode_b58(&sig) }).to_string()
+        };
+        let soon = now_ms() + 60_000;
+        assert_eq!(app.live_hello(&doc.hash(), &hello(&carol, &doc.hash(), soon)), Ok(id(&carol)));
+        assert_eq!(app.live_hello(&doc.hash(), &hello(&bob, &doc.hash(), soon)), Ok(id(&bob)));
+        assert_eq!(app.live_hello(&doc.hash(), &hello(&alice, &doc.hash(), soon)), Ok(id(&alice)));
+        let err = app.live_hello(&doc.hash(), &hello(&key(4), &doc.hash(), soon)).unwrap_err();
+        assert!(err.contains("author and editors"), "{err}");
+        let err = app.live_hello(&doc.hash(), &hello(&carol, &[0; 32], soon)).unwrap_err();
+        assert!(err.contains("doesn't match"), "signed for another doc: {err}");
+        let err = app.live_hello(&doc.hash(), &hello(&carol, &doc.hash(), now_ms() - 1)).unwrap_err();
+        assert!(err.contains("expired"), "{err}");
     }
 }

@@ -203,6 +203,23 @@ pub fn read_signed_bytes(node: &Pubkey, expires: u64) -> Vec<u8> {
     [READ_CONTEXT, &CBOR::from(m).to_cbor_data()].concat()
 }
 
+// ---- live presence in a doc ----
+//
+// Editors of a doc can join its live room on a node, to see each other's cursors. Nothing said there is
+// stored. To join, an editor signs `live_signed_bytes`: good for that doc, on that node, until it expires.
+
+pub const LIVE_CONTEXT: &[u8] = b"bisonbase-live-v1\n";
+
+/// The bytes a user signs to join the live room of `doc` (its chain's first record's hash) on `node`,
+/// until `expires` (ms since the epoch; at most MAX_READ_TOKEN_MS ahead).
+pub fn live_signed_bytes(node: &Pubkey, doc: &Hash, expires: u64) -> Vec<u8> {
+    let mut m = Map::new();
+    m.insert("node", CBOR::to_byte_string(node));
+    m.insert("doc", CBOR::to_byte_string(doc));
+    m.insert("expires", expires);
+    [LIVE_CONTEXT, &CBOR::from(m).to_cbor_data()].concat()
+}
+
 /// A user, as owner and grant records name them: {user: their ID}, or {claim: the hash of a claim
 /// chain's first record}, for whoever claims it.
 #[derive(Clone, Debug, PartialEq)]
