@@ -7,8 +7,8 @@ use axum::{
     routing::{get, post},
 };
 use ed25519_dalek::{Signer, SigningKey};
-use fedcrdt::{
-    Cbor, FederateData, GrantData, Pubkey, Record, cbor_decode, cbor_head, check_path, claim_signed_bytes, decode_id,
+use fedcrdt_core::{
+    CBOR, FederateData, GrantData, Map, Pubkey, Record, check_path, claim_signed_bytes, decode_id,
     encode_id, federate_peer, grant_signed_bytes, path_within, phrase, server_phrase, verify_sig,
 };
 use rusqlite::{Connection, OptionalExtension};
@@ -16,7 +16,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::HashSet,
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -201,7 +201,7 @@ fn store(db: &Connection, rec: &Record, from: Option<Pubkey>) -> Result<bool, St
 
 impl App {
     /// A record in this server's own space, signed by it, newer than what's there.
-    fn sign(&self, db: &Connection, path: &str, kind: &str, data: Cbor) -> Record {
+    fn sign(&self, db: &Connection, path: &str, kind: &str, data: CBOR) -> Record {
         let prev = stored_record(db, &self.pk, path).map_or(0, |r| r.version);
         let mut r = Record {
             author: self.pk,
@@ -212,13 +212,14 @@ impl App {
             data,
             authorization: None,
             signature: [0; 64],
+            extra: Map::new(),
         };
         r.signature = self.key.sign(&r.signed_bytes()).to_bytes();
         r
     }
 
     /// Writes a record in this server's space.
-    fn write(&self, db: &Connection, path: &str, kind: &str, data: Cbor) {
+    fn write(&self, db: &Connection, path: &str, kind: &str, data: CBOR) {
         let r = self.sign(db, path, kind, data);
         store(db, &r, None).unwrap();
         self.push.notify_one();
@@ -227,7 +228,9 @@ impl App {
     /// Keeps the /server record's URL current and, while there's no owner, prints a fresh claim link.
     fn init(&self, public_url: &str, origin: &str) {
         let db = self.db.lock().unwrap();
-        let data = Cbor::Map(BTreeMap::from([("url".into(), Cbor::Text(public_url.into()))]));
+        let mut m = Map::new();
+        m.insert("url", public_url);
+        let data = CBOR::from(m);
         if stored_record(&db, &self.pk, "/server").is_none_or(|r| r.data != data) {
             self.write(&db, "/server", "server", data);
         }
@@ -241,12 +244,7 @@ impl App {
 
     /// Who claimed this server, from its /owner record.
     fn owner(&self, db: &Connection) -> Option<Pubkey> {
-        let r = stored_record(db, &self.pk, "/owner").filter(|r| r.kind == "owner")?;
-        let Cbor::Map(m) = r.data else { return None };
-        match m.get("user") {
-            Some(Cbor::Bytes(b)) => b.as_slice().try_into().ok(),
-            _ => None,
-        }
+        stored_record(db, &self.pk, "/owner")?.owner_user()
     }
 }
 
@@ -291,7 +289,7 @@ async fn user(State(app): S, Path(pubkey): Path<String>) -> Response {
     }
 }
 
-// ---- records (see src/lib.rs): signed CBOR in, signed CBOR out ----
+// ---- records (see core/src/lib.rs): signed CBOR in, signed CBOR out ----
 
 #[derive(Deserialize)]
 struct RecordsQuery {
@@ -330,10 +328,7 @@ async fn list_records(State(app): S, Query(q): Query<RecordsQuery>) -> Response 
         )
         .unwrap();
     let records: Vec<Vec<u8>> = stmt.query_map((owner, author, prefix, user, q.kind), |r| r.get(0)).unwrap().flatten().collect();
-    // Each stored record is already deterministic CBOR, so the array can be assembled directly.
-    let mut body = cbor_head(4, records.len() as u64);
-    records.iter().for_each(|r| body.extend(r));
-    ([(header::CONTENT_TYPE, "application/cbor")], body).into_response()
+    ([(header::CONTENT_TYPE, "application/cbor")], cbor_array(&records)).into_response()
 }
 
 /// Stores a record (CBOR body) if it's valid and newer than what's at its (owner, path).
@@ -399,12 +394,20 @@ async fn claim(State(app): S, Json(c): Json<Claim>) -> Response {
     if db.execute("DELETE FROM claim_tokens WHERE hash = ?1", [Sha256::digest(&token).as_slice()]).unwrap() == 0 {
         return err(StatusCode::FORBIDDEN, "This claim link was already used, or isn't for this server.");
     }
-    app.write(&db, "/owner", "owner", Cbor::Map(BTreeMap::from([("user".into(), Cbor::Bytes(user.to_vec()))])));
+    let mut m = Map::new();
+    m.insert("user", CBOR::to_byte_string(user));
+    app.write(&db, "/owner", "owner", m.into());
     let grant = GrantData { grantee: user, path: "/federate".into(), signature: app.key.sign(&grant_signed_bytes(&user, &app.pk, "/federate")).to_bytes() };
     let at = format!("/grants/{}", bs58::encode(random::<8>()).into_string());
     app.write(&db, &at, "grant", grant.to_cbor());
     println!("claimed by {} ({})", encode_id(&user), phrase(&user));
     Json(json!({ "server": encode_id(&app.pk) })).into_response()
+}
+
+/// A CBOR array of stored records (each already dCBOR).
+fn cbor_array(records: &[Vec<u8>]) -> Vec<u8> {
+    let items: Vec<CBOR> = records.iter().map(|r| CBOR::try_from_data(r).expect("stored records are dCBOR")).collect();
+    CBOR::from(items).to_cbor_data()
 }
 
 // ---- federation: pushing records to peers, and receiving them ----
@@ -413,13 +416,13 @@ async fn claim(State(app): S, Json(c): Json<Claim>) -> Response {
 /// X-From. Answers, per record, "stored", "have" (this one or a newer one), or why it was refused.
 async fn receive(State(app): S, headers: HeaderMap, body: Bytes) -> Response {
     let from = headers.get("x-from").and_then(|v| v.to_str().ok()).and_then(decode_id);
-    let Ok(Cbor::Array(items)) = cbor_decode(&body) else {
+    let Some(items) = CBOR::try_from_data(&body).ok().and_then(CBOR::into_array) else {
         return err(StatusCode::BAD_REQUEST, "expected a CBOR array of records");
     };
     let db = app.db.lock().unwrap();
     let results: Vec<Value> = items
         .into_iter()
-        .map(|v| match Record::from_cbor(v).and_then(|r| store(&db, &r, from)) {
+        .map(|v| match Record::from_cbor(&v).and_then(|r| store(&db, &r, from)) {
             Ok(true) => "stored".into(),
             Ok(false) => "have".into(),
             Err(e) => format!("bad record: {e}").into(),
@@ -497,8 +500,7 @@ async fn push_to(app: &App, peer: Pubkey, version: u64, fed: &FederateData) -> R
             (batch, last)
         };
         if !batch.is_empty() {
-            let mut body = cbor_head(4, batch.len() as u64);
-            batch.iter().for_each(|r| body.extend(r));
+            let body = cbor_array(&batch);
             app.http
                 .post(format!("{}/receive", fed.url.trim_end_matches('/')))
                 .header(header::CONTENT_TYPE, "application/cbor")

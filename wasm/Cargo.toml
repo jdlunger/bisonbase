@@ -1,0 +1,15 @@
+# fedcrdt-core for the web client: `npm run wasm` builds it into wasm/pkg.
+[package]
+name = "fedcrdt-wasm"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+fedcrdt-core = { path = "../core" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde-wasm-bindgen = "0.6.5"
+serde_bytes = "0.11.19"
+wasm-bindgen = "0.2.130"

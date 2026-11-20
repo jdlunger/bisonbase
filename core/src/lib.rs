@@ -1,20 +1,25 @@
-//! Record format, IDs and checks, used by the server.
+//! Record format, IDs and checks, shared by the server (src/main.rs) and the web client (via wasm/).
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, sync::LazyLock};
+use std::sync::LazyLock;
 
 // ---- user IDs ----
 //
 // A user's ID is their raw 32-byte Ed25519 public key, and that's what gets stored. base58 (Bitcoin
 // alphabet: letters and digits only, so a double-click selects it all) and the word phrase are only
-// for showing, typing and passing it around. Keep in sync with web/src/api.ts.
+// for showing, typing and passing it around.
 
 pub type Pubkey = [u8; 32];
 
 /// The ID as shown to people and used in URLs and the API.
 pub fn encode_id(pk: &Pubkey) -> String {
-    bs58::encode(pk).into_string()
+    encode_b58(pk)
+}
+
+/// Any bytes in base58, e.g. random path segments.
+pub fn encode_b58(b: &[u8]) -> String {
+    bs58::encode(b).into_string()
 }
 
 /// Parses a base58 ID; None unless it's exactly 32 bytes.
@@ -23,7 +28,7 @@ pub fn decode_id(s: &str) -> Option<Pubkey> {
 }
 
 static WORDS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
-    include_str!("../google-10000-english-usa-no-swears.txt")
+    include_str!("../../google-10000-english-usa-no-swears.txt")
         .lines()
         .map(str::trim)
         .filter(|w| !w.is_empty())
@@ -31,20 +36,25 @@ static WORDS: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
 });
 
 static EMOJI: LazyLock<Vec<&'static str>> = LazyLock::new(|| {
-    include_str!("../emoji.txt").lines().map(str::trim).filter(|e| !e.is_empty()).collect()
+    include_str!("../../emoji.txt").lines().map(str::trim).filter(|e| !e.is_empty()).collect()
 });
 
-/// The u32 at byte `i` of SHA-256(`pk`), mod `n`.
-fn pick(pk: &Pubkey, i: usize, n: usize) -> usize {
-    let h = Sha256::digest(pk);
+/// The u32 at byte `i` of SHA-256(`b`), mod `n`.
+fn pick(b: &[u8], i: usize, n: usize) -> usize {
+    let h = Sha256::digest(b);
     u32::from_be_bytes(h[i..i + 4].try_into().unwrap()) as usize % n
+}
+
+/// "two_words" from SHA-256 of `b`: its first two u32s pick the words. Also names passkeys, from their
+/// user handle.
+pub fn two_words(b: &[u8]) -> String {
+    [0, 4].map(|i| WORDS[pick(b, i, WORDS.len())]).join("_")
 }
 
 /// A readable "🦬two_words" nickname for an ID, from SHA-256 of its raw bytes: two u32s pick the words, the
 /// third the emoji. Not unique enough to identify anyone.
 pub fn phrase(pk: &Pubkey) -> String {
-    let words = [0, 4].map(|i| WORDS[pick(pk, i, WORDS.len())]).join("_");
-    format!("{}{words}", EMOJI[pick(pk, 8, EMOJI.len())])
+    format!("{}{}", EMOJI[pick(pk, 8, EMOJI.len())], two_words(pk))
 }
 
 /// A server's nickname instead: "server_" and the phrase's first word.
@@ -52,168 +62,33 @@ pub fn server_phrase(pk: &Pubkey) -> String {
     format!("server_{}", WORDS[pick(pk, 0, WORDS.len())])
 }
 
-// ---- deterministic CBOR (RFC 8949 §4.2.1 core deterministic encoding) ----
+// ---- CBOR ----
 //
-// Records are passed around and stored as CBOR in its one deterministic form, so the bytes a
-// signature covers can always be rebuilt from the decoded value. Only a subset is supported:
-// unsigned and negative integers, byte and text strings, arrays, maps with text keys, booleans and
-// null; no floats, no tags, no indefinite lengths. The decoder rejects any non-deterministic
-// encoding. Keep in sync with web/src/cbor.ts.
+// Records are passed around and stored as dCBOR (deterministic CBOR, see the `dcbor` crate), so the
+// bytes a signature covers can always be rebuilt from the decoded value. Fields and values we don't
+// recognize are ignored, not rejected.
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum Cbor {
-    Uint(u64),
-    /// -1 - n
-    Neg(u64),
-    Bytes(Vec<u8>),
-    Text(String),
-    Array(Vec<Cbor>),
-    Map(BTreeMap<String, Cbor>),
-    Bool(bool),
-    Null,
+pub use dcbor::{CBOR, CBORCase, Map};
+
+fn bytes<const N: usize>(v: &CBOR) -> Option<[u8; N]> {
+    v.as_byte_string()?.try_into().ok()
 }
 
-fn put_head(out: &mut Vec<u8>, major: u8, n: u64) {
-    let m = major << 5;
-    match n {
-        0..=23 => out.push(m | n as u8),
-        24..=0xff => out.extend([m | 24, n as u8]),
-        0x100..=0xffff => {
-            out.push(m | 25);
-            out.extend((n as u16).to_be_bytes())
-        }
-        0x1_0000..=0xffff_ffff => {
-            out.push(m | 26);
-            out.extend((n as u32).to_be_bytes())
-        }
-        _ => {
-            out.push(m | 27);
-            out.extend(n.to_be_bytes())
-        }
-    }
+fn text(v: &CBOR) -> Option<String> {
+    v.as_text().map(Into::into)
 }
 
-/// Deterministic map key order: by encoded bytes, which for text keys is by length, then bytewise.
-fn key_order(a: &str, b: &str) -> std::cmp::Ordering {
-    a.len().cmp(&b.len()).then(a.as_bytes().cmp(b.as_bytes()))
+/// Field `k` of `m`, converted with `f`.
+fn field<T>(m: &Map, k: &str, f: impl FnOnce(&CBOR) -> Option<T>) -> Result<T, String> {
+    m.get::<_, CBOR>(k).as_ref().and_then(f).ok_or_else(|| format!("missing or malformed field {k:?}"))
 }
 
-fn encode_into(v: &Cbor, out: &mut Vec<u8>) {
-    match v {
-        Cbor::Uint(n) => put_head(out, 0, *n),
-        Cbor::Neg(n) => put_head(out, 1, *n),
-        Cbor::Bytes(b) => {
-            put_head(out, 2, b.len() as u64);
-            out.extend(b)
-        }
-        Cbor::Text(s) => {
-            put_head(out, 3, s.len() as u64);
-            out.extend(s.as_bytes())
-        }
-        Cbor::Array(a) => {
-            put_head(out, 4, a.len() as u64);
-            a.iter().for_each(|v| encode_into(v, out))
-        }
-        Cbor::Map(m) => {
-            put_head(out, 5, m.len() as u64);
-            let mut keys: Vec<&String> = m.keys().collect();
-            keys.sort_by(|a, b| key_order(a, b));
-            for k in keys {
-                encode_into(&Cbor::Text(k.clone()), out);
-                encode_into(&m[k], out);
-            }
-        }
-        Cbor::Bool(b) => out.push(if *b { 0xf5 } else { 0xf4 }),
-        Cbor::Null => out.push(0xf6),
-    }
+fn opt_field<T>(m: &Map, k: &str, f: impl FnOnce(&CBOR) -> Option<T>) -> Result<Option<T>, String> {
+    m.get::<_, CBOR>(k).map(|v| f(&v).ok_or_else(|| format!("malformed field {k:?}"))).transpose()
 }
 
-/// Just the head of a CBOR item: its major type and argument (e.g. an array's length).
-pub fn cbor_head(major: u8, n: u64) -> Vec<u8> {
-    let mut out = Vec::new();
-    put_head(&mut out, major, n);
-    out
-}
-
-pub fn cbor_encode(v: &Cbor) -> Vec<u8> {
-    let mut out = Vec::new();
-    encode_into(v, &mut out);
-    out
-}
-
-/// Decodes exactly one value, which must be deterministically encoded and fill all of `bytes`.
-pub fn cbor_decode(bytes: &[u8]) -> Result<Cbor, String> {
-    let mut b = bytes;
-    let v = decode_value(&mut b, 0)?;
-    if !b.is_empty() {
-        return Err("CBOR: trailing bytes".into());
-    }
-    Ok(v)
-}
-
-fn take<'a>(b: &mut &'a [u8], n: u64) -> Result<&'a [u8], String> {
-    if n > b.len() as u64 {
-        return Err("CBOR: truncated".into());
-    }
-    let (head, rest) = b.split_at(n as usize);
-    *b = rest;
-    Ok(head)
-}
-
-/// The argument of a head with additional info `info`, which must be in its shortest form.
-fn take_arg(b: &mut &[u8], info: u8) -> Result<u64, String> {
-    let (n, min) = match info {
-        0..=23 => return Ok(info as u64),
-        24 => (take(b, 1)?[0] as u64, 24),
-        25 => (u16::from_be_bytes(take(b, 2)?.try_into().unwrap()) as u64, 0x100),
-        26 => (u32::from_be_bytes(take(b, 4)?.try_into().unwrap()) as u64, 0x1_0000),
-        27 => (u64::from_be_bytes(take(b, 8)?.try_into().unwrap()), 0x1_0000_0000),
-        _ => return Err("CBOR: indefinite lengths aren't allowed".into()),
-    };
-    if n < min {
-        return Err("CBOR: not in shortest form".into());
-    }
-    Ok(n)
-}
-
-fn decode_value(b: &mut &[u8], depth: usize) -> Result<Cbor, String> {
-    if depth > 32 {
-        return Err("CBOR: nested too deeply".into());
-    }
-    let ib = take(b, 1)?[0];
-    let (major, info) = (ib >> 5, ib & 0x1f);
-    if major == 7 {
-        return match info {
-            20 => Ok(Cbor::Bool(false)),
-            21 => Ok(Cbor::Bool(true)),
-            22 => Ok(Cbor::Null),
-            _ => Err("CBOR: only true, false and null simple values are allowed".into()),
-        };
-    }
-    let n = take_arg(b, info)?;
-    Ok(match major {
-        0 => Cbor::Uint(n),
-        1 => Cbor::Neg(n),
-        2 => Cbor::Bytes(take(b, n)?.to_vec()),
-        3 => Cbor::Text(String::from_utf8(take(b, n)?.to_vec()).map_err(|_| "CBOR: text isn't UTF-8")?),
-        4 => Cbor::Array((0..n).map(|_| decode_value(b, depth + 1)).collect::<Result<_, _>>()?),
-        5 => {
-            let mut m = BTreeMap::new();
-            let mut prev: Option<String> = None;
-            for _ in 0..n {
-                let Cbor::Text(k) = decode_value(b, depth + 1)? else {
-                    return Err("CBOR: map keys must be text".into());
-                };
-                if prev.as_deref().is_some_and(|p| key_order(p, &k).is_ge()) {
-                    return Err("CBOR: map keys out of order, or duplicated".into());
-                }
-                m.insert(k.clone(), decode_value(b, depth + 1)?);
-                prev = Some(k);
-            }
-            Cbor::Map(m)
-        }
-        _ => return Err("CBOR: tags aren't allowed".into()),
-    })
+fn as_map<'a>(v: &'a CBOR, what: &str) -> Result<&'a Map, String> {
+    v.as_map().ok_or_else(|| format!("{what} must be a map"))
 }
 
 // ---- records ----
@@ -234,7 +109,8 @@ fn decode_value(b: &mut &[u8], depth: usize) -> Result<Cbor, String> {
 //   signature      bytes(64)  author's Ed25519 signature over `RECORD_CONTEXT || CBOR(the record
 //                             without this field)`
 //
-// Records are identified by (owner, path). Keep in sync with web/src/api.ts.
+// Any other fields are kept (the signature covers them) but otherwise ignored. Records are
+// identified by (owner, path).
 
 /// Prefixed to the bytes of each kind of signature, so one can never pass for another.
 pub const RECORD_CONTEXT: &[u8] = b"bisonbase-record-v1\n";
@@ -249,10 +125,14 @@ pub struct Record {
     pub path: String,
     pub version: u64,
     pub kind: String,
-    pub data: Cbor,
+    pub data: CBOR,
     pub authorization: Option<Authorization>,
     pub signature: [u8; 64],
+    /// Fields this version doesn't know about.
+    pub extra: Map,
 }
+
+const RECORD_FIELDS: [&str; 8] = ["author", "owner", "path", "version", "type", "data", "authorization", "signature"];
 
 /// The owner's permission for the record's author to write at or under `path`.
 #[derive(Clone, Debug, PartialEq)]
@@ -272,35 +152,27 @@ pub struct GrantData {
 }
 
 impl GrantData {
-    pub fn from_cbor(v: &Cbor) -> Result<Self, String> {
-        let Cbor::Map(m) = v else { return Err("a grant's data must be a map".into()) };
-        let mut m = m.clone();
-        let g = GrantData {
-            grantee: field(&mut m, "grantee", bytes)?,
-            path: field(&mut m, "path", text)?,
-            signature: field(&mut m, "signature", bytes)?,
-        };
-        no_more_fields(m)?;
-        Ok(g)
+    pub fn from_cbor(v: &CBOR) -> Result<Self, String> {
+        let m = as_map(v, "a grant's data")?;
+        Ok(GrantData { grantee: field(m, "grantee", bytes)?, path: field(m, "path", text)?, signature: field(m, "signature", bytes)? })
     }
 
-    pub fn to_cbor(&self) -> Cbor {
-        Cbor::Map(BTreeMap::from([
-            ("grantee".into(), Cbor::Bytes(self.grantee.to_vec())),
-            ("path".into(), Cbor::Text(self.path.clone())),
-            ("signature".into(), Cbor::Bytes(self.signature.to_vec())),
-        ]))
+    pub fn to_cbor(&self) -> CBOR {
+        let mut m = Map::new();
+        m.insert("grantee", CBOR::to_byte_string(self.grantee));
+        m.insert("path", self.path.as_str());
+        m.insert("signature", CBOR::to_byte_string(self.signature));
+        m.into()
     }
 }
 
 /// The bytes an owner signs to let `author` write at or under `path` in their space.
 pub fn grant_signed_bytes(author: &Pubkey, owner: &Pubkey, path: &str) -> Vec<u8> {
-    let m = BTreeMap::from([
-        ("author".into(), Cbor::Bytes(author.to_vec())),
-        ("owner".into(), Cbor::Bytes(owner.to_vec())),
-        ("path".into(), Cbor::Text(path.into())),
-    ]);
-    [GRANT_CONTEXT, &cbor_encode(&Cbor::Map(m))].concat()
+    let mut m = Map::new();
+    m.insert("author", CBOR::to_byte_string(author));
+    m.insert("owner", CBOR::to_byte_string(owner));
+    m.insert("path", path);
+    [GRANT_CONTEXT, &CBOR::from(m).to_cbor_data()].concat()
 }
 
 // ---- servers and federation ----
@@ -317,11 +189,10 @@ pub const CLAIM_CONTEXT: &[u8] = b"bisonbase-claim-v1\n";
 
 /// The bytes a user signs to claim `server`, with the token from its one-time claim link.
 pub fn claim_signed_bytes(server: &Pubkey, token: &[u8]) -> Vec<u8> {
-    let m = BTreeMap::from([
-        ("server".into(), Cbor::Bytes(server.to_vec())),
-        ("token".into(), Cbor::Bytes(token.to_vec())),
-    ]);
-    [CLAIM_CONTEXT, &cbor_encode(&Cbor::Map(m))].concat()
+    let mut m = Map::new();
+    m.insert("server", CBOR::to_byte_string(server));
+    m.insert("token", CBOR::to_byte_string(token));
+    [CLAIM_CONTEXT, &CBOR::from(m).to_cbor_data()].concat()
 }
 
 /// The peer a federate record's path names: /federate/<ID>.
@@ -338,8 +209,27 @@ pub struct PathFilter {
 }
 
 impl PathFilter {
+    /// Parses bb://<ID or *><path>, where a bare "/" means the whole space.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let bad = || format!("{s} isn't bb://<ID or *>/<path>");
+        let rest = s.strip_prefix("bb://").ok_or_else(bad)?;
+        let (owner, path) = rest.split_at(rest.find('/').ok_or_else(bad)?);
+        let owner = if owner == "*" { None } else { Some(decode_id(owner).ok_or_else(bad)?) };
+        if path != "/" {
+            check_path(path)?;
+        }
+        Ok(PathFilter { owner, path: path.into() })
+    }
+
     pub fn matches(&self, owner: &Pubkey, path: &str) -> bool {
         self.owner.is_none_or(|o| &o == owner) && (self.path == "/" || path_within(path, &self.path))
+    }
+}
+
+impl std::fmt::Display for PathFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let owner = self.owner.as_ref().map_or("*".into(), encode_id);
+        write!(f, "bb://{owner}{}", self.path)
     }
 }
 
@@ -361,53 +251,52 @@ fn check_url(url: &str) -> Result<(), String> {
 }
 
 impl FederateData {
-    pub fn from_cbor(v: &Cbor) -> Result<Self, String> {
-        let Cbor::Map(m) = v else { return Err("a federate record's data must be a map".into()) };
-        let mut m = m.clone();
-        let list = |v: Cbor| match v {
-            Cbor::Array(a) => Some(a),
-            _ => None,
-        };
-        let types = opt_field(&mut m, "types", list)?
-            .map(|a| a.into_iter().map(|t| text(t).ok_or("types must be text")).collect::<Result<Vec<_>, _>>())
+    pub fn from_cbor(v: &CBOR) -> Result<Self, String> {
+        let m = as_map(v, "a federate record's data")?;
+        let list = |v: &CBOR| v.as_array().map(<[CBOR]>::to_vec);
+        let types = opt_field(m, "types", list)?
+            .map(|a| a.iter().map(|t| text(t).ok_or("types must be text")).collect::<Result<Vec<_>, _>>())
             .transpose()?;
-        let paths = opt_field(&mut m, "paths", list)?
+        let paths = opt_field(m, "paths", list)?
             .map(|a| {
-                a.into_iter()
+                a.iter()
                     .map(|p| {
-                        let Cbor::Map(mut p) = p else { return Err("paths must be maps".to_string()) };
-                        let f = PathFilter { owner: opt_field(&mut p, "owner", bytes)?, path: field(&mut p, "path", text)? };
-                        no_more_fields(p)?;
+                        let p = as_map(p, "paths")?;
+                        let f = PathFilter { owner: opt_field(p, "owner", bytes)?, path: field(p, "path", text)? };
                         if f.path != "/" {
                             check_path(&f.path)?;
                         }
                         Ok(f)
                     })
-                    .collect::<Result<Vec<_>, _>>()
+                    .collect::<Result<Vec<_>, String>>()
             })
             .transpose()?;
-        let d = FederateData { url: field(&mut m, "url", text)?, types, paths };
-        no_more_fields(m)?;
+        let d = FederateData { url: field(m, "url", text)?, types, paths };
         check_url(&d.url)?;
         Ok(d)
     }
 
-    pub fn to_cbor(&self) -> Cbor {
-        let mut m = BTreeMap::from([("url".into(), Cbor::Text(self.url.clone()))]);
+    pub fn to_cbor(&self) -> CBOR {
+        let mut m = Map::new();
+        m.insert("url", self.url.as_str());
         if let Some(t) = &self.types {
-            m.insert("types".into(), Cbor::Array(t.iter().map(|t| Cbor::Text(t.clone())).collect()));
+            m.insert("types", t.clone());
         }
         if let Some(p) = &self.paths {
-            let p = p.iter().map(|f| {
-                let mut m = BTreeMap::from([("path".into(), Cbor::Text(f.path.clone()))]);
-                if let Some(o) = f.owner {
-                    m.insert("owner".into(), Cbor::Bytes(o.to_vec()));
-                }
-                Cbor::Map(m)
-            });
-            m.insert("paths".into(), Cbor::Array(p.collect()));
+            let p: Vec<CBOR> = p
+                .iter()
+                .map(|f| {
+                    let mut m = Map::new();
+                    m.insert("path", f.path.as_str());
+                    if let Some(o) = f.owner {
+                        m.insert("owner", CBOR::to_byte_string(o));
+                    }
+                    m.into()
+                })
+                .collect();
+            m.insert("paths", p);
         }
-        Cbor::Map(m)
+        m.into()
     }
 
     /// Whether a record of type `kind` at (`owner`, `path`) goes to this peer.
@@ -418,7 +307,8 @@ impl FederateData {
 }
 
 /// Paths: "/" then one or more "/"-separated segments. Segments are non-empty, not "." or "..",
-/// and free of control characters; the whole is Unicode NFC and at most MAX_PATH_BYTES. Case matters.
+/// and free of control characters; the whole is at most MAX_PATH_BYTES. Case matters. (Paths in
+/// records are Unicode NFC, as all dCBOR text is.)
 pub fn check_path(path: &str) -> Result<(), String> {
     let Some(rest) = path.strip_prefix('/') else {
         return Err("path must start with /".into());
@@ -436,9 +326,6 @@ pub fn check_path(path: &str) -> Result<(), String> {
         if seg.chars().any(char::is_control) {
             return Err("path has a control character".into());
         }
-    }
-    if !unicode_normalization::is_nfc(path) {
-        return Err("path isn't Unicode NFC".into());
     }
     Ok(())
 }
@@ -467,141 +354,119 @@ pub fn verify_sig(pk: &Pubkey, msg: &[u8], sig: &[u8; 64]) -> Result<(), String>
     pk.verify_strict(msg, &Signature::from_bytes(sig)).map_err(|_| "signature doesn't match".into())
 }
 
-/// Takes field `k` out of `m`, converting it with `f`.
-fn field<T>(m: &mut BTreeMap<String, Cbor>, k: &str, f: impl FnOnce(Cbor) -> Option<T>) -> Result<T, String> {
-    m.remove(k).and_then(f).ok_or_else(|| format!("missing or malformed field {k:?}"))
-}
-
-fn opt_field<T>(m: &mut BTreeMap<String, Cbor>, k: &str, f: impl FnOnce(Cbor) -> Option<T>) -> Result<Option<T>, String> {
-    m.remove(k).map(|v| f(v).ok_or_else(|| format!("malformed field {k:?}"))).transpose()
-}
-
-fn bytes<const N: usize>(v: Cbor) -> Option<[u8; N]> {
-    match v {
-        Cbor::Bytes(b) => b.try_into().ok(),
-        _ => None,
-    }
-}
-
-fn text(v: Cbor) -> Option<String> {
-    match v {
-        Cbor::Text(s) => Some(s),
-        _ => None,
-    }
-}
-
-fn no_more_fields(m: BTreeMap<String, Cbor>) -> Result<(), String> {
-    match m.into_keys().next() {
-        Some(k) => Err(format!("unknown field {k:?}")),
-        None => Ok(()),
-    }
-}
-
 impl Record {
-    fn unsigned_map(&self) -> BTreeMap<String, Cbor> {
-        let mut m = BTreeMap::from([
-            ("author".into(), Cbor::Bytes(self.author.to_vec())),
-            ("owner".into(), Cbor::Bytes(self.owner.to_vec())),
-            ("path".into(), Cbor::Text(self.path.clone())),
-            ("version".into(), Cbor::Uint(self.version)),
-            ("type".into(), Cbor::Text(self.kind.clone())),
-            ("data".into(), self.data.clone()),
-        ]);
+    fn unsigned_map(&self) -> Map {
+        let mut m = self.extra.clone();
+        m.insert("author", CBOR::to_byte_string(self.author));
+        m.insert("owner", CBOR::to_byte_string(self.owner));
+        m.insert("path", self.path.as_str());
+        m.insert("version", self.version);
+        m.insert("type", self.kind.as_str());
+        m.insert("data", self.data.clone());
         if let Some(a) = &self.authorization {
-            let a = BTreeMap::from([
-                ("path".into(), Cbor::Text(a.path.clone())),
-                ("signature".into(), Cbor::Bytes(a.signature.to_vec())),
-            ]);
-            m.insert("authorization".into(), Cbor::Map(a));
+            let mut am = Map::new();
+            am.insert("path", a.path.as_str());
+            am.insert("signature", CBOR::to_byte_string(a.signature));
+            m.insert("authorization", am);
         }
         m
     }
 
-    /// The bytes the author signs.
-    pub fn signed_bytes(&self) -> Vec<u8> {
-        [RECORD_CONTEXT, &cbor_encode(&Cbor::Map(self.unsigned_map()))].concat()
+    /// A server record's URL.
+    pub fn server_url(&self) -> Option<String> {
+        let m = self.data.as_map().filter(|_| self.kind == "server")?;
+        field(m, "url", text).ok()
     }
 
-    pub fn to_cbor(&self) -> Cbor {
+    /// An owner record's user: who claimed the server.
+    pub fn owner_user(&self) -> Option<Pubkey> {
+        let m = self.data.as_map().filter(|_| self.kind == "owner")?;
+        field(m, "user", bytes).ok()
+    }
+
+    /// The bytes the author signs.
+    pub fn signed_bytes(&self) -> Vec<u8> {
+        [RECORD_CONTEXT, &CBOR::from(self.unsigned_map()).to_cbor_data()].concat()
+    }
+
+    pub fn to_cbor(&self) -> CBOR {
         let mut m = self.unsigned_map();
-        m.insert("signature".into(), Cbor::Bytes(self.signature.to_vec()));
-        Cbor::Map(m)
+        m.insert("signature", CBOR::to_byte_string(self.signature));
+        m.into()
     }
 
     pub fn to_bytes(&self) -> Vec<u8> {
-        cbor_encode(&self.to_cbor())
+        self.to_cbor().to_cbor_data()
     }
 
     /// Parses a record's structure. Doesn't check its contents or signatures: see `check`.
-    pub fn from_cbor(v: Cbor) -> Result<Self, String> {
-        let Cbor::Map(mut m) = v else { return Err("a record must be a map".into()) };
-        let authorization = opt_field(&mut m, "authorization", |v| match v {
-            Cbor::Map(mut a) => {
-                let r = Authorization { path: field(&mut a, "path", text).ok()?, signature: field(&mut a, "signature", bytes).ok()? };
-                a.is_empty().then_some(r)
-            }
-            _ => None,
+    pub fn from_cbor(v: &CBOR) -> Result<Self, String> {
+        let m = as_map(v, "a record")?;
+        let authorization = opt_field(m, "authorization", |v| {
+            let a = v.as_map()?;
+            Some(Authorization { path: field(a, "path", text).ok()?, signature: field(a, "signature", bytes).ok()? })
         })?;
-        let r = Record {
-            author: field(&mut m, "author", bytes)?,
-            owner: field(&mut m, "owner", bytes)?,
-            path: field(&mut m, "path", text)?,
-            version: field(&mut m, "version", |v| if let Cbor::Uint(n) = v { Some(n) } else { None })?,
-            kind: field(&mut m, "type", text)?,
-            data: field(&mut m, "data", Some)?,
+        let mut extra = Map::new();
+        for (k, v) in m.iter() {
+            if !k.as_text().is_some_and(|k| RECORD_FIELDS.contains(&k)) {
+                extra.insert(k.clone(), v.clone());
+            }
+        }
+        Ok(Record {
+            author: field(m, "author", bytes)?,
+            owner: field(m, "owner", bytes)?,
+            path: field(m, "path", text)?,
+            version: field(m, "version", |v| u64::try_from(v.clone()).ok())?,
+            kind: field(m, "type", text)?,
+            data: field(m, "data", |v| Some(v.clone()))?,
             authorization,
-            signature: field(&mut m, "signature", bytes)?,
-        };
-        no_more_fields(m)?;
-        Ok(r)
+            signature: field(m, "signature", bytes)?,
+            extra,
+        })
     }
 
     pub fn from_bytes(b: &[u8]) -> Result<Self, String> {
-        Self::from_cbor(cbor_decode(b)?)
+        Self::from_cbor(&CBOR::try_from_data(b).map_err(|e| format!("CBOR: {e}"))?)
     }
 
     /// Checks everything that doesn't depend on other records: the path, that `data` fits `type`,
     /// the authorization, and the author's signature.
     pub fn check(&self) -> Result<(), String> {
         check_path(&self.path)?;
-        match (self.kind.as_str(), &self.data) {
-            ("tombstone", Cbor::Null) => {}
-            ("tombstone", _) => return Err("a tombstone's data must be null".into()),
-            ("post", Cbor::Text(t)) if !t.is_empty() && t.trim() == t => {}
-            ("post", _) => return Err("a post's data must be non-empty, trimmed text".into()),
-            ("grant", d) => {
+        match self.kind.as_str() {
+            "tombstone" if !self.data.is_null() => return Err("a tombstone's data must be null".into()),
+            "tombstone" => {}
+            "post" => match self.data.as_text() {
+                Some(t) if !t.is_empty() && t.trim() == t => {}
+                _ => return Err("a post's data must be non-empty, trimmed text".into()),
+            },
+            "grant" => {
                 if self.author != self.owner {
                     return Err("only the owner can grant access to their space".into());
                 }
-                let g = GrantData::from_cbor(d)?;
+                let g = GrantData::from_cbor(&self.data)?;
                 check_path(&g.path).map_err(|e| format!("grant: {e}"))?;
                 verify_sig(&self.owner, &grant_signed_bytes(&g.grantee, &self.owner, &g.path), &g.signature)
                     .map_err(|e| format!("grant: {e}"))?;
             }
-            ("server" | "owner", _) if self.author != self.owner => {
+            "server" | "owner" if self.author != self.owner => {
                 return Err(format!("only a server can write its {} record", self.kind));
             }
-            ("server", d) => {
+            "server" => {
                 if self.path != "/server" {
                     return Err("a server record belongs at /server".into());
                 }
-                let Cbor::Map(m) = d else { return Err("a server record's data must be a map".into()) };
-                let mut m = m.clone();
-                check_url(&field(&mut m, "url", text)?)?;
-                no_more_fields(m)?;
+                check_url(&field(as_map(&self.data, "a server record's data")?, "url", text)?)?;
             }
-            ("owner", d) => {
+            "owner" => {
                 if self.path != "/owner" {
                     return Err("an owner record belongs at /owner".into());
                 }
-                let Cbor::Map(m) = d else { return Err("an owner record's data must be a map".into()) };
-                let mut m = m.clone();
-                field(&mut m, "user", bytes::<32>)?;
-                no_more_fields(m)?;
+                field(as_map(&self.data, "an owner record's data")?, "user", bytes::<32>)?;
             }
-            ("federate", d) => {
+            "federate" => {
                 federate_peer(&self.path).ok_or("a federate record belongs at /federate/<server ID>")?;
-                FederateData::from_cbor(d)?;
+                FederateData::from_cbor(&self.data)?;
             }
             _ => return Err(format!("unknown record type {:?}", self.kind)),
         }
@@ -627,24 +492,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cbor_round_trips_and_rejects_non_deterministic() {
-        let v = Cbor::Map(BTreeMap::from([
-            ("bb".into(), Cbor::Uint(1_700_000_000_000)),
-            ("a".into(), Cbor::Array(vec![Cbor::Neg(0), Cbor::Bytes(vec![1, 2]), Cbor::Null, Cbor::Bool(true)])),
-        ]));
-        let b = cbor_encode(&v);
-        assert_eq!(b[1], 0x61, "shorter key first");
-        assert_eq!(cbor_decode(&b).unwrap(), v);
-        assert!(cbor_decode(&[0x18, 0x05]).is_err(), "non-shortest int");
-        assert!(cbor_decode(&[0xa2, 0x61, b'b', 0x00, 0x61, b'a', 0x00]).is_err(), "unsorted keys");
-        assert!(cbor_decode(&[0x9f, 0xff]).is_err(), "indefinite length");
-        assert!(cbor_decode(&[0x00, 0x00]).is_err(), "trailing bytes");
-    }
-
-    #[test]
     fn paths() {
         assert!(check_path("/a/b c/ü").is_ok());
-        for bad in ["", "/", "a", "/a/", "/a//b", "/a/../b", "/a/\n", "/u\u{0308}"] {
+        for bad in ["", "/", "a", "/a/", "/a//b", "/a/../b", "/a/\n"] {
             assert!(check_path(bad).is_err(), "{bad:?}");
         }
         assert!(path_within("/a/b", "/a") && path_within("/a", "/a") && !path_within("/ab", "/a"));
@@ -663,13 +513,22 @@ mod tests {
             path: "/shared/x".into(),
             version: 1,
             kind: "post".into(),
-            data: Cbor::Text("hi".into()),
+            data: "hi".into(),
             authorization: Some(Authorization { path: "/shared".into(), signature: grant_sig }),
             signature: [0; 64],
+            extra: Map::new(),
         };
         r.signature = author.sign(&r.signed_bytes()).to_bytes();
         let back = Record::from_bytes(&r.to_bytes()).unwrap();
         assert_eq!(back, r);
+        back.check().unwrap();
+
+        // Unknown fields survive a round trip, and the signature covers them.
+        let mut x = r.clone();
+        x.extra.insert("future", 1);
+        x.signature = author.sign(&x.signed_bytes()).to_bytes();
+        let back = Record::from_bytes(&x.to_bytes()).unwrap();
+        assert_eq!(back, x);
         back.check().unwrap();
 
         let mut g = Record {
@@ -681,6 +540,7 @@ mod tests {
             data: GrantData { grantee: a, path: "/shared".into(), signature: grant_sig }.to_cbor(),
             authorization: None,
             signature: [0; 64],
+            extra: Map::new(),
         };
         g.signature = owner.sign(&g.signed_bytes()).to_bytes();
         g.check().unwrap();
@@ -709,5 +569,9 @@ mod tests {
         assert!(FederateData::from_cbor(&FederateData { url: "ftp://x".into(), ..all }.to_cbor()).is_err());
         assert_eq!(federate_peer(&format!("/federate/{}", encode_id(&a))), Some(a));
         assert_eq!(federate_peer("/federate/x/y"), None);
+        for f in ["bb://*/", "bb://*/pub", &format!("bb://{}/x/y", encode_id(&b))] {
+            assert_eq!(PathFilter::parse(f).unwrap().to_string(), f);
+        }
+        assert!(PathFilter::parse("bb://nope/x").is_err() && PathFilter::parse("bb://*").is_err());
     }
 }

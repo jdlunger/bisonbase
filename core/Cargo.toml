@@ -1,0 +1,11 @@
+# Record format, IDs and checks, shared by the server and (via ../wasm) the web client.
+[package]
+name = "fedcrdt-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bs58 = "0.5.1"
+dcbor = "0.25.2"
+ed25519-dalek = "3.0.0"
+sha2 = "0.11.1"

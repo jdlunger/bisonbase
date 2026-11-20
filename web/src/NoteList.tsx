@@ -216,7 +216,7 @@ function PostItem({ post: n, me, busy, run, name }: ItemProps & { name?: string 
             </p>
           ) : n.rec.type === "server" && n.rec.path === "/server" ? (
             <p className="mt-1">
-              🖥 A server, at <code className="font-mono text-sm">{String((n.rec.data as { url?: unknown })?.url)}</code>
+              🖥 A server, at <code className="font-mono text-sm">{n.serverUrl}</code>
             </p>
           ) : n.claimedBy ? (
             <p className="mt-1">

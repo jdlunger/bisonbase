@@ -60,7 +60,7 @@ export default function Browse({
   useEffect(() => {
     setPhrase(null);
     setData(null);
-    if (valid && owner) userPhrase(owner).then(setPhrase);
+    if (valid && owner) setPhrase(userPhrase(owner));
   }, [owner, path, valid]);
 
   useEffect(() => {

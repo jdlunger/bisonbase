@@ -1,7 +1,24 @@
-import EMOJI_TXT from "../../emoji.txt?raw";
-import WORDS_TXT from "../../google-10000-english-usa-no-swears.txt?raw";
+// Records, IDs and paths come from core/src/lib.rs, compiled to wasm (see wasm/src/lib.rs); main.tsx
+// loads it before anything here runs.
+import {
+  type Authorization,
+  type Draft,
+  type Rec,
+  b58,
+  checkPath,
+  claimSignedBytes,
+  decodeId,
+  decodeRecord,
+  decodeRecords,
+  encodeRecord,
+  grantSignedBytes,
+  pathWithin,
+  phrase,
+  signedBytes,
+  twoWords,
+} from "../../wasm/pkg/fedcrdt_wasm.js";
 
-import { type Cbor, decode, encode } from "./cbor.ts";
+export { type Authorization, type Rec, b58, pathWithin };
 
 /** `server`: the key is a server's (its phrase is "server_word"). */
 export type User = { pubkey: string; phrase: string; server: boolean };
@@ -23,45 +40,10 @@ export const getUser = (pubkey: string) => api<User>(`/api/users/${pubkey}`);
 // ---- user IDs ----
 //
 // A user's ID is their raw 32-byte Ed25519 public key. In the API, URLs and the UI it's written in
-// base58 (Bitcoin alphabet: letters and digits only, so a double-click selects it all, and no 0/O/I/l).
-// Store bytes; base58 and phrases are only for input and output. Keep in sync with src/lib.rs.
-
-const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-
-export function b58(bytes: Uint8Array) {
-  let n = 0n;
-  for (const b of bytes) n = (n << 8n) | BigInt(b);
-  let s = "";
-  for (; n > 0n; n /= 58n) s = B58[Number(n % 58n)] + s;
-  for (let i = 0; i < bytes.length && bytes[i] === 0; i++) s = "1" + s; // leading zero bytes
-  return s;
-}
-
-function unb58(s: string) {
-  let n = 0n;
-  for (const c of s) {
-    const d = B58.indexOf(c);
-    if (d < 0) throw new Error("not base58");
-    n = n * 58n + BigInt(d);
-  }
-  const out: number[] = [];
-  for (; n > 0n; n >>= 8n) out.unshift(Number(n & 0xffn));
-  for (let i = 0; i < s.length && s[i] === "1"; i++) out.unshift(0); // leading zero bytes
-  return Uint8Array.from(out);
-}
-
-/** The raw public key for a base58 ID; null unless it's exactly 32 bytes. */
-function decodeId(id: string) {
-  try {
-    const pk = unb58(id);
-    return pk.length === 32 ? pk : null;
-  } catch {
-    return null;
-  }
-}
+// base58 (`b58`, `decodeId`). Store bytes; base58 and phrases are only for input and output.
 
 /** Whether `s` is an ID: 32 bytes of base58. */
-export const isPubkey = (s: string) => decodeId(s) !== null;
+export const isPubkey = (s: string) => decodeId(s) !== undefined;
 
 /** IDs of keys known to be servers', from their /server records and federate records naming them. */
 const servers = new Set<string>();
@@ -70,15 +52,11 @@ export async function loadServers() {
   for (const s of await api<string[]>("/api/servers")) servers.add(s);
 }
 
-/** An ID's "🦬two_words" nickname, from SHA-256 of its raw bytes; same as `phrase` in src/lib.rs. Servers
- * get "server_" and the first word instead, as `server_phrase` does. */
-export async function userPhrase(pubkey: string) {
+/** An ID's "🦬two_words" nickname, or "server_word" for a known server's. */
+export function userPhrase(pubkey: string) {
   const pk = decodeId(pubkey);
   if (!pk) throw new Error("not an ID");
-  const h = new DataView(await crypto.subtle.digest("SHA-256", pk));
-  if (servers.has(pubkey)) return `server_${WORDS[h.getUint32(0) % WORDS.length]}`;
-  const words = [0, 4].map((i) => WORDS[h.getUint32(i) % WORDS.length]).join("_");
-  return `${EMOJI[h.getUint32(8) % EMOJI.length]}${words}`;
+  return phrase(pk, servers.has(pubkey));
 }
 
 // ---- bytes ----
@@ -114,13 +92,6 @@ export type Passkey = {
 
 type PasskeyIds = Pick<Passkey, "credId" | "name">;
 
-const WORDS = WORDS_TXT.split("\n")
-  .map((w) => w.trim())
-  .filter(Boolean);
-const EMOJI = EMOJI_TXT.split("\n")
-  .map((e) => e.trim())
-  .filter(Boolean);
-
 /** user.id length for passkeys whose name is derived from it. */
 const NAMED_USER_ID_LEN = 32;
 
@@ -129,11 +100,8 @@ const NAMED_USER_ID_LEN = 32;
  * and since the user.id comes back on every use (as the user handle), we can show the same name here.
  * Null for passkeys whose name we can't reconstruct.
  */
-async function passkeyName(userId: Uint8Array<ArrayBuffer>): Promise<string | null> {
-  if (userId.length === NAMED_USER_ID_LEN) {
-    const h = new DataView(await crypto.subtle.digest("SHA-256", userId));
-    return [0, 4].map((i) => WORDS[h.getUint32(i) % WORDS.length]).join("_");
-  }
+function passkeyName(userId: Uint8Array): string | null {
+  if (userId.length === NAMED_USER_ID_LEN) return twoWords(userId);
   // Passkeys from the old server-side version: user.id was a v4 UUID, named "user-" + its first 8 hex digits.
   if (userId.length === 16 && userId[6] >> 4 === 4 && userId[8] >> 6 === 2) {
     return `user-${[...userId.slice(0, 4)].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
@@ -182,7 +150,8 @@ async function deriveKeys(secret: Uint8Array<ArrayBuffer>, passkey: PasskeyIds |
   return { secret, pubkey, pk, signKey, passkey: passkey && { ...passkey, pubkey, lastUsed: Date.now() } };
 }
 
-const sign = async (data: Uint8Array<ArrayBuffer>) => new Uint8Array(await crypto.subtle.sign("Ed25519", keys!.signKey, data));
+const sign = async (data: Uint8Array) =>
+  new Uint8Array(await crypto.subtle.sign("Ed25519", keys!.signKey, data as Uint8Array<ArrayBuffer>));
 
 /** Sets freshly derived keys, records the passkey's use, and updates the remembered copy if remembering. */
 function loadKeys(k: Keys) {
@@ -278,7 +247,7 @@ async function prfFromPasskey(credId?: BufferSource) {
   const userHandle = (cred.response as AuthenticatorAssertionResponse).userHandle;
   const ids: PasskeyIds = {
     credId: b64(cred.rawId),
-    name: userHandle ? await passkeyName(new Uint8Array(userHandle)) : null,
+    name: userHandle ? passkeyName(new Uint8Array(userHandle)) : null,
   };
   return { secret: new Uint8Array(out), ids };
 }
@@ -299,8 +268,8 @@ export async function deriveFromExistingPasskey(credId?: string) {
 export async function deriveFromNewPasskey() {
   // The two_word part of the name is derived from the random user.id, so we can recompute it on every use.
   const userId = random(NAMED_USER_ID_LEN);
-  const twoWords = (await passkeyName(userId))!;
-  const name = `bisonbase ${new Date().toISOString().slice(0, 10)} ${twoWords}`;
+  const words = passkeyName(userId)!;
+  const name = `bisonbase ${new Date().toISOString().slice(0, 10)} ${words}`;
   const cred = (await navigator.credentials.create({
     publicKey: {
       challenge: random(32), // nobody verifies the attestation either
@@ -317,7 +286,7 @@ export async function deriveFromNewPasskey() {
     throw new Error(`The passkey was created, but it can't be used: ${NO_PRF}`);
   }
   const secretBytes = secret ? new Uint8Array(secret) : (await prfFromPasskey(cred.rawId)).secret;
-  loadKeys(await deriveKeys(secretBytes, { credId: b64(cred.rawId), name: twoWords }));
+  loadKeys(await deriveKeys(secretBytes, { credId: b64(cred.rawId), name: words }));
 }
 
 export function forgetKeys() {
@@ -327,25 +296,9 @@ export function forgetKeys() {
 
 // ---- records ----
 //
-// Everything users write is a record: a deterministic-CBOR map signed by its author, identified by
-// (owner, path), where the newest version wins. Field by field, see src/lib.rs. The server stores
-// and returns records exactly as signed, so everything here is checked in the browser.
-
-const RECORD_CONTEXT = enc.encode("bisonbase-record-v1\n");
-const GRANT_CONTEXT = enc.encode("bisonbase-grant-v1\n");
-const CLAIM_CONTEXT = enc.encode("bisonbase-claim-v1\n");
-
-export type Authorization = { path: string; signature: Uint8Array };
-export type Rec = {
-  author: Uint8Array;
-  owner: Uint8Array;
-  path: string;
-  version: number;
-  type: string;
-  data: Cbor;
-  authorization?: Authorization;
-  signature: Uint8Array;
-};
+// Everything users write is a record: a dCBOR map signed by its author, identified by (owner, path),
+// where the newest version wins. The server stores and returns records exactly as signed; the wasm
+// core decodes and checks them here in the browser, so nothing depends on trusting the server.
 
 /** A record as shown: its decoded IDs, its bb:// address, and whether it checks out. */
 export type Post = {
@@ -362,131 +315,39 @@ export type Post = {
   grant?: { grantee: User; path: string };
   /** For federate records: which server gets pushed what. `types` and `paths` are null for all. */
   federate?: { peer: User; url: string; types: string[] | null; paths: string[] | null };
+  /** For a server record: its URL. */
+  serverUrl?: string;
   /** For a server's owner record: who claimed it. */
   claimedBy?: User;
 };
 
-const concat = (...parts: Uint8Array[]) => {
-  const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
-  parts.reduce((at, p) => (out.set(p, at), at + p.length), 0);
-  return out;
-};
 const bytesEqual = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((x, i) => x === b[i]);
 
-const unsigned = ({ signature: _, ...rest }: Rec) => rest as Cbor;
-const signedBytes = (r: Rec) => concat(RECORD_CONTEXT, encode(unsigned(r)));
-const grantBytes = (author: Uint8Array, owner: Uint8Array, path: string) =>
-  concat(GRANT_CONTEXT, encode({ author, owner, path }));
-
-/** Paths: "/" then "/"-separated segments: non-empty, not "." or "..", no control characters,
- * Unicode NFC, ≤ 1024 bytes. Returns the NFC form, or throws. Same rules as check_path in src/lib.rs. */
+/** Trims and NFC-normalizes a path someone typed, then checks it (see check_path in core/src/lib.rs). Throws if it's bad. */
 export function normalizePath(input: string) {
   const path = input.trim().normalize("NFC");
-  if (!path.startsWith("/")) throw new Error("A path must start with /");
-  if (enc.encode(path).length > 1024) throw new Error("That path is too long");
-  for (const seg of path.slice(1).split("/")) {
-    if (!seg) throw new Error("A path can't have empty segments (// or a trailing /)");
-    if (seg === "." || seg === "..") throw new Error("Path segments can't be . or ..");
-    if (/\p{Cc}/u.test(seg)) throw new Error("A path can't contain control characters");
-  }
+  checkPath(path);
   return path;
 }
 
-/** Whether `path` is `prefix` or below it, by whole segments. */
-export const pathWithin = (path: string, prefix: string) =>
-  path === prefix || path.startsWith(prefix.endsWith("/") ? prefix : prefix + "/");
+const toUser = (pk: Uint8Array): User => {
+  const pubkey = b58(pk);
+  return { pubkey, phrase: userPhrase(pubkey), server: servers.has(pubkey) };
+};
 
-const isBytes = (v: unknown, n?: number): v is Uint8Array => v instanceof Uint8Array && (n === undefined || v.length === n);
-
-function recFromCbor(v: Cbor): Rec {
-  const r = v as Rec;
-  const a = r?.authorization;
-  if (
-    !isBytes(r?.author, 32) ||
-    !isBytes(r.owner, 32) ||
-    typeof r.path !== "string" ||
-    typeof r.version !== "number" ||
-    typeof r.type !== "string" ||
-    !("data" in r) ||
-    (a !== undefined && (typeof a.path !== "string" || !isBytes(a.signature, 64))) ||
-    !isBytes(r.signature, 64)
-  ) {
-    throw new Error("malformed record");
-  }
-  return r;
-}
-
-async function verifySig(pk: Uint8Array<ArrayBuffer>, msg: Uint8Array<ArrayBuffer>, sig: Uint8Array<ArrayBuffer>) {
-  try {
-    const key = await crypto.subtle.importKey("raw", pk, "Ed25519", false, ["verify"]);
-    return await crypto.subtle.verify("Ed25519", key, sig, msg);
-  } catch {
-    return false;
-  }
-}
-
-/** Checks a record's signature and authorization against its author's and owner's IDs, without trusting the server. */
-export async function verifyRec(r: Rec) {
-  const own = bytesEqual(r.author, r.owner);
-  if (r.type === "grant") {
-    const g = grantData(r);
-    if (!own || !g || !(await verifySig(r.owner as any, grantBytes(g.grantee, r.owner, g.path), g.signature as any))) return false;
-  }
-  const a = r.authorization;
-  if (own ? a : !a) return false;
-  if (a && (!pathWithin(r.path, a.path) || !(await verifySig(r.owner as any, grantBytes(r.author, r.owner, a.path), a.signature as any)))) {
-    return false;
-  }
-  return verifySig(r.author as any, signedBytes(r), r.signature as any);
-}
-
-/** A grant record's data, if well-formed: {grantee, path, signature}. */
-type GrantData = { grantee: Uint8Array; path: string; signature: Uint8Array };
-function grantData(r: Rec): GrantData | null {
-  const g = r.data as GrantData;
-  return r.type === "grant" && isBytes(g?.grantee, 32) && typeof g.path === "string" && isBytes(g.signature, 64) ? g : null;
-}
-
-const toUser = async (pk: Uint8Array): Promise<User> => ({ pubkey: b58(pk), phrase: await userPhrase(b58(pk)), server: servers.has(b58(pk)) });
-
-/** A federate record's data, if well-formed, with its peer's ID. See FederateData in src/lib.rs. */
-type PathFilter = { owner?: Uint8Array; path: string };
-type FederateData = { url: string; types?: string[]; paths?: PathFilter[] };
-function federateData(r: Rec): (FederateData & { peer: Uint8Array }) | null {
-  const peer = r.path.startsWith("/federate/") ? decodeId(r.path.slice("/federate/".length)) : null;
-  const f = r.data as FederateData;
-  return r.type === "federate" && peer && typeof f?.url === "string" ? { ...f, peer } : null;
-}
-
-/** A path filter at the edges: bb://<ID or *><path>, where a bare "/" means the whole space. */
-const showFilter = (f: PathFilter) => `bb://${f.owner ? b58(f.owner) : "*"}${f.path}`;
-function parseFilter(s: string): PathFilter {
-  const m = s.match(/^bb:\/\/([^/]+)(\/.*)$/);
-  const owner = m && m[1] !== "*" ? decodeId(m[1]) : undefined;
-  if (!m || owner === null) throw new Error(`${s} isn't bb://<ID or *>/<path>`);
-  const path = m[2] === "/" ? "/" : normalizePath(m[2]);
-  return owner ? { owner, path } : { path };
-}
-
-export async function viewPost(rec: Rec): Promise<Post> {
-  const [author, owner] = await Promise.all([toUser(rec.author), toUser(rec.owner)]);
-  const g = grantData(rec);
-  const f = federateData(rec);
+export function viewPost(rec: Rec): Post {
+  const f = rec.federate;
   return {
-    grant: g ? { grantee: await toUser(g.grantee), path: g.path } : undefined,
-    federate: f
-      ? { peer: await toUser(f.peer), url: f.url, types: f.types ?? null, paths: f.paths?.map(showFilter) ?? null }
-      : undefined,
-    claimedBy:
-      rec.type === "owner" && isBytes((rec.data as { user?: Cbor })?.user, 32)
-        ? await toUser((rec.data as { user: Uint8Array }).user)
-        : undefined,
+    grant: rec.grant && { grantee: toUser(rec.grant.grantee), path: rec.grant.path },
+    federate: f && { peer: toUser(f.peer), url: f.url, types: f.types ?? null, paths: f.paths ?? null },
+    serverUrl: rec.serverUrl,
+    claimedBy: rec.claimedBy && toUser(rec.claimedBy),
     rec,
-    author,
-    owner,
-    uri: `bb://${owner.pubkey}${rec.path}`,
-    verified: await verifyRec(rec),
-    text: typeof rec.data === "string" ? rec.data : null,
+    author: toUser(rec.author),
+    owner: toUser(rec.owner),
+    uri: `bb://${b58(rec.owner)}${rec.path}`,
+    verified: rec.verified,
+    text: rec.text ?? null,
   };
 }
 
@@ -496,26 +357,22 @@ export async function getPosts(q: { owner?: string; author?: string; user?: stri
   const params = new URLSearchParams(Object.entries(q).filter((e): e is [string, string] => !!e[1]));
   const res = await fetch(`/api/records?${params}`);
   if (!res.ok) throw new Error((await res.text()) || res.statusText);
-  const list = decode(new Uint8Array(await res.arrayBuffer()));
-  if (!Array.isArray(list)) throw new Error("malformed record list");
+  const list = decodeRecords(new Uint8Array(await res.arrayBuffer()));
   // Learn which keys are servers' first, so they get server phrases.
-  for (const v of list) {
-    const r = v as Rec;
-    if (r?.type === "server" && r.path === "/server" && isBytes(r.owner, 32)) servers.add(b58(r.owner));
-    const f = r?.type === "federate" && typeof r.path === "string" && r.path.startsWith("/federate/") ? r.path.slice(10) : "";
-    if (isPubkey(f)) servers.add(f);
+  for (const r of list) {
+    if (r.serverUrl !== undefined && r.path === "/server") servers.add(b58(r.owner));
+    if (r.federate) servers.add(b58(r.federate.peer));
   }
-  return Promise.all(list.map((v) => viewPost(recFromCbor(v))));
+  return list.map(viewPost);
 }
 
-/** Signs `r` (as us) and stores it. */
-async function putRec(r: Omit<Rec, "signature">) {
-  const rec = { ...r, signature: new Uint8Array() };
-  rec.signature = await sign(signedBytes(rec));
+/** Signs `d` (as us) and stores it. */
+async function putRec(d: Draft) {
+  const signature = await sign(signedBytes(d));
   const res = await fetch("/api/records", {
     method: "POST",
     headers: { "content-type": "application/cbor" },
-    body: encode(rec as unknown as Cbor),
+    body: encodeRecord(d, signature) as Uint8Array<ArrayBuffer>,
   });
   if (!res.ok) throw new Error((await res.text()) || res.statusText);
 }
@@ -538,7 +395,7 @@ export async function makeGrant(grantee: string, path: string) {
   const g = decodeId(grantee.trim());
   if (!g) throw new Error("That isn't an ID (32 bytes of base58).");
   path = normalizePath(path);
-  const signature = await sign(grantBytes(g, keys.pk, path));
+  const signature = await sign(grantSignedBytes(g, keys.pk, path));
   const at = `/grants/${b58(random(8))}`;
   await putRec({ author: keys.pk, owner: keys.pk, path: at, version: nextVersion(), type: "grant", data: { grantee: g, path, signature } });
   return `bb://${keys.pubkey}${at}`;
@@ -550,20 +407,17 @@ export async function myGrants(): Promise<Grant[]> {
   const pk = keys.pk;
   return (await getPosts({ type: "grant" }))
     .filter((p) => p.verified && p.grant?.grantee.pubkey === keys?.pubkey && !bytesEqual(p.rec.owner, pk))
-    .map((p) => {
-      const g = grantData(p.rec)!;
-      return { owner: p.owner, ownerPk: p.rec.owner, path: g.path, signature: g.signature, uri: p.uri };
-    });
+    .map((p) => ({ owner: p.owner, ownerPk: p.rec.owner, path: p.rec.grant!.path, signature: p.rec.grant!.signature, uri: p.uri }));
 }
 
 // ---- writing posts ----
 
 /** Who owns the space a write goes to, and the authorization needed if it isn't us. */
-function placement(existing?: Post, grant?: Grant): Pick<Rec, "owner" | "authorization"> {
+function placement(existing?: Post, grant?: Grant): Pick<Draft, "owner" | "authorization"> {
   const owner = existing?.rec.owner ?? grant?.ownerPk ?? keys!.pk;
   if (bytesEqual(owner, keys!.pk)) return { owner };
   // Writing to an existing record of ours in someone's space reuses the authorization it carries.
-  const authorization =
+  const authorization: Authorization | undefined =
     grant && bytesEqual(grant.ownerPk, owner)
       ? { path: grant.path, signature: grant.signature }
       : existing && bytesEqual(existing.rec.author, keys!.pk)
@@ -598,24 +452,24 @@ export async function deletePost(p: Post) {
 export const newPostPath = () => `/posts/${b58(random(8))}`;
 
 /** A post with a made-up signature, to show what a bad one looks like. */
-export function forgedPost(): Promise<Post> {
-  const pk = unb58("4zvwRjXUKGfvwnParsHAS3HuSVzV5cA4McphgmoCtajS");
-  return viewPost({
+export function forgedPost(): Post {
+  const pk = decodeId("4zvwRjXUKGfvwnParsHAS3HuSVzV5cA4McphgmoCtajS")!;
+  const draft: Draft = {
     author: pk,
     owner: pk,
     path: "/demo/forged",
     version: Date.now(),
     type: "post",
     data: "This post was added client-side with a made-up signature, so it should show as a bad signature.",
-    signature: new Uint8Array(64),
-  });
+  };
+  return viewPost(decodeRecord(encodeRecord(draft, new Uint8Array(64))));
 }
 
 // ---- this server, and federation ----
 //
 // Each server has its own key and space. Its owner claims it once with a one-time link (printed by the
 // server), and is then granted /federate in its space, where each "federate" record names a peer
-// server to push records to. See src/lib.rs.
+// server to push records to. See core/src/lib.rs.
 
 export type ServerInfo = { pubkey: string; phrase: string; owner: string | null };
 export const getServer = (url = "") => api<ServerInfo>(`${url}/api/server`);
@@ -626,7 +480,7 @@ export async function claimServer(token: string) {
   const server = await getServer();
   const t = decodeId(token);
   if (!t) throw new Error("This claim link is broken: its token isn't 32 bytes of base58.");
-  const signature = await sign(concat(CLAIM_CONTEXT, encode({ server: decodeId(server.pubkey)!, token: t })));
+  const signature = await sign(claimSignedBytes(decodeId(server.pubkey)!, t));
   await api("/api/claim", { token, user: keys.pubkey, signature: b58(signature) });
   servers.add(server.pubkey);
   return server.pubkey;
@@ -649,8 +503,7 @@ export async function putFederate(server: string, url: string, types: string, pa
   const grant = (await myGrants()).find((g) => g.owner.pubkey === server && pathWithin("/federate", g.path));
   if (!grant) throw new Error("Only this server's owner can federate it.");
   const t = types.split(/[\s,]+/).filter(Boolean);
-  const p = paths.split("\n").map((s) => s.trim()).filter(Boolean).map(parseFilter);
-  const data: FederateData = { url, ...(t.length && { types: t }), ...(p.length && { paths: p }) };
+  const p = paths.split("\n").map((s) => s.trim()).filter(Boolean);
   const path = `/federate/${peer}`;
   servers.add(peer);
   await putRec({
@@ -660,7 +513,7 @@ export async function putFederate(server: string, url: string, types: string, pa
     path,
     version: nextVersion(),
     type: "federate",
-    data: data as unknown as Cbor,
+    data: { url, ...(t.length && { types: t }), ...(p.length && { paths: p }) },
   });
   return `bb://${server}${path}`;
 }

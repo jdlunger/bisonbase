@@ -76,17 +76,13 @@ function Shell({ initialError }: { initialError: string | null }) {
     const pubkey = myPubkey();
     const current = myPasskey();
     const others = recentPasskeys().filter((p) => p.credId !== current?.credId);
-    const [m, g, phrases, s] = await Promise.all([
-      pubkey ? userPhrase(pubkey).then((phrase) => ({ pubkey, phrase, server: false })) : null,
-      myGrants(),
-      Promise.all(others.map((p) => userPhrase(p.pubkey))),
-      getServer(),
-    ]);
+    const [g, s] = await Promise.all([myGrants(), getServer()]);
+    const m = pubkey ? { pubkey, phrase: userPhrase(pubkey), server: false } : null;
     setMe(m);
     setServer(s);
     setGrants(g);
     setPasskey(current);
-    setRecent(others.map((p, i) => ({ ...p, phrase: phrases[i] })));
+    setRecent(others.map((p) => ({ ...p, phrase: userPhrase(p.pubkey) })));
     if (!m) setDraft(null);
   }, []);
 
