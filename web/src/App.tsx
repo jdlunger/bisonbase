@@ -3,6 +3,7 @@ import {
   type NodeInfo,
   type Passkey,
   type RecentPasskey,
+  type DocKind,
   type User,
   DOC_PATH,
   amOwner,
@@ -106,7 +107,7 @@ function Shell({ initialError }: { initialError: string | null }) {
   const newPost = () => open(here && canWrite(here) ? here : owner || !grants.length ? "/post" : grants[0]);
   // A new doc goes where we're looking too, if we may write there; else under /doc.
   const docHere = here && pathWithin(here, DOC_PATH) && canWrite(here) ? here : canWrite(DOC_PATH) ? DOC_PATH : null;
-  const newDoc = run(async () => navigate(docPath(await createDoc(docHere!))));
+  const newDoc = (kind: DocKind) => run(async () => navigate(docPath(await createDoc(kind, docHere!))));
 
   return (
     <Compose.Provider value={{ canWrite, open, writable: owner ? ["/"] : grants }}>
@@ -127,9 +128,14 @@ function Shell({ initialError }: { initialError: string | null }) {
           </div>
           <div className="flex items-center gap-2">
             {me && docHere && (
-              <button className={secondary} disabled={busy} onClick={newDoc}>
-                + New doc
-              </button>
+              <>
+                <button className={secondary} disabled={busy} onClick={newDoc("list")}>
+                  + New list
+                </button>
+                <button className={secondary} disabled={busy} onClick={newDoc("text")}>
+                  + New doc
+                </button>
+              </>
             )}
             {me && !draft && (
               <button className={primary} disabled={busy} onClick={newPost}>
@@ -217,7 +223,7 @@ function Claim({ me, busy, run, tick }: { me: User | null; busy: boolean; run: R
         ))}
         {docs.map((d) => (
           <li key={d.root}>
-            📄 Editing the doc{" "}
+            {d.doc!.kind === "list" ? "🛒 Editing the list" : "📄 Editing the doc"}{" "}
             <Link href={docPath(d.root)} className={`font-semibold ${link}`}>
               {d.doc!.title || "Untitled"}
             </Link>

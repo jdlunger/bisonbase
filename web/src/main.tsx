@@ -10,6 +10,11 @@ if (location.hostname === "127.0.0.1" || location.hostname === "[::1]") {
   location.hostname = "localhost";
 }
 
+// Lets the app open offline, with what it last saw (see public/sw.js).
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("/sw.js").catch((e) => console.warn("No service worker:", e));
+}
+
 // The record core (wasm/src/lib.rs) has to load before anything uses it.
 initWasm().then(() =>
   createRoot(document.getElementById("root")!).render(

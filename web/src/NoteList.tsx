@@ -196,11 +196,11 @@ function Content({ post: n, me }: { post: Post; me: User | null }) {
     const editors = n.doc.editors.length;
     return (
       <p className="mt-1">
-        📄{" "}
+        {n.doc.kind === "list" ? "🛒" : "📄"}{" "}
         <Link href={docPath(n.root)} className={`font-semibold ${link}`}>
           {n.doc.title || "Untitled"}
         </Link>
-        <span className="text-sm text-gray-500"> · a shared doc{editors > 0 && `, with ${editors} more editor${editors > 1 ? "s" : ""}`}</span>
+        <span className="text-sm text-gray-500"> · a shared {n.doc.kind === "list" ? "list" : "doc"}{editors > 0 && `, with ${editors} more editor${editors > 1 ? "s" : ""}`}</span>
       </p>
     );
   }

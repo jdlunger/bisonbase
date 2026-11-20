@@ -1,6 +1,7 @@
 // Records, IDs and paths come from core/src/lib.rs, compiled to wasm (see wasm/src/lib.rs); main.tsx
 // loads it before anything here runs.
 import {
+  type DocKind,
   type Draft,
   type Rec,
   type Who,
@@ -22,7 +23,7 @@ import {
   unb58,
 } from "../../wasm/pkg/fedcrdt_wasm.js";
 
-export { type Rec, b58, pathWithin };
+export { type DocKind, type Rec, b58, pathWithin };
 
 /** `node`: the key is a node's (its phrase is "node_word"). */
 export type User = { pubkey: string; phrase: string; node: boolean };
@@ -393,7 +394,12 @@ export async function deriveFromNewPasskey() {
 export function forgetKeys() {
   setRemember(false);
   keys = null;
+  // What the service worker kept (public/sw.js) may include private records we read as an owner.
+  caches?.delete(OFFLINE_CACHE).catch(() => {});
 }
+
+/** The service worker's cache: the app and the API's latest answers, for when the node can't be reached. */
+const OFFLINE_CACHE = "bisonbase-offline";
 
 // ---- records ----
 //
@@ -434,7 +440,7 @@ export type Post = {
   /** For an owner record: who. */
   owner?: Party;
   /** For a doc: its title, and who may edit it besides its author (`by`). */
-  doc?: { title: string; editors: Party[] };
+  doc?: { title: string; editors: Party[]; kind: DocKind };
 };
 
 const bytesEqual = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((x, i) => x === b[i]);
@@ -475,7 +481,7 @@ export function viewPost(rec: Rec, chain?: { root: Uint8Array; by?: Uint8Array; 
     claim: rec.claim && { claimedBy: rec.claim.user ? toUser(rec.claim.user) : null },
     nodeUrl: rec.nodeUrl,
     owner: rec.owner && toParty(rec.owner),
-    doc: rec.doc && { title: rec.doc.title, editors: rec.doc.editors.map(toParty) },
+    doc: rec.doc && { title: rec.doc.title, editors: rec.doc.editors.map(toParty), kind: rec.doc.kind },
     rec,
     hash: b58(rec.hash),
     root: b58(chain?.root ?? rec.hash),
@@ -730,10 +736,10 @@ export async function putPeer(url: string, types: string, paths: string) {
 
 export const DOC_PATH = "/doc";
 
-/** Starts a doc at `path`. Returns its hash (base58): its chain's, for good. */
-export async function createDoc(path = DOC_PATH, title = "") {
+/** Starts a doc of this kind at `path`. Returns its hash (base58): its chain's, for good. */
+export async function createDoc(kind: DocKind, path = DOC_PATH, title = "") {
   if (!keys) throw new Error("Sign in first.");
-  return putRec({ author: keys.pk, path: normalizePath(path), version: nextVersion(), type: "doc", data: { title, editors: [] } });
+  return putRec({ author: keys.pk, path: normalizePath(path), version: nextVersion(), type: "doc", data: { title, editors: [], kind } });
 }
 
 /** Writes a new version of `doc` with this title and these editors. Its author or an owner only. */
@@ -745,7 +751,7 @@ async function saveDoc(doc: Post, title: string, editors: Who[]) {
     version: nextVersion(doc.rec.version),
     type: "doc",
     edits: doc.rec.hash,
-    data: { title: title.trim(), editors },
+    data: { title: title.trim(), editors, kind: doc.doc!.kind },
   });
 }
 

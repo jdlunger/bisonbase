@@ -393,21 +393,50 @@ impl PeerData {
 
 // ---- shared documents ----
 //
-// A document is a "doc" chain, named by its first record's hash. Its data holds the title and who may
-// edit it besides its author; only the author (or the node's owners) edits that, as with any chain. The
-// text is a Yjs CRDT, built from "doc_update" records: each a signed batch of Yjs updates naming its
-// doc. Updates merge in any order and any number of times, so they arrive however federation brings
+// A document is a "doc" chain, named by its first record's hash. Its data holds the title, who may
+// edit it besides its author, and what kind of doc it is; only the author (or the node's owners) edits
+// that, as with any chain, and never the kind. The content is a Yjs CRDT, built from "doc_update"
+// records: each a signed batch of Yjs updates naming its doc. What the Yjs doc holds depends on the
+// kind (see `DocKind`); nodes never look inside. Updates merge in any order and any number of times, so they arrive however federation brings
 // them. They're never edited or deleted; deleting the doc deletes them all.
 //
 // A node takes an update from the doc's author, its editors and the node's owners, for a live doc,
 // at the doc's current path. Readers check the authors themselves (see `DocData::may_edit`), as peers
 // pass along records without checking who may write them. Neither is ever private, for now.
 
-/// A "doc" record's data: its title, and who may edit its text besides its author.
+/// What a doc holds, and so what its Yjs doc holds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DocKind {
+    /// Markdown: a Y.Text "md".
+    Text,
+    /// A list, e.g. for shopping: a Y.Map "items" of id → Y.Map {text, done, pos}, `pos` a fractional
+    /// index to order them by.
+    List,
+}
+
+impl DocKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DocKind::Text => "text",
+            DocKind::List => "list",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "text" => DocKind::Text,
+            "list" => DocKind::List,
+            _ => return None,
+        })
+    }
+}
+
+/// A "doc" record's data: its title, who may edit it besides its author, and its kind ("text" if missing).
 #[derive(Clone, Debug, PartialEq)]
 pub struct DocData {
     pub title: String,
     pub editors: Vec<Who>,
+    pub kind: DocKind,
 }
 
 impl DocData {
@@ -416,6 +445,7 @@ impl DocData {
         let d = DocData {
             title: field(m, "title", text)?,
             editors: field(m, "editors", |v| Some(v.as_array()?.to_vec()))?.iter().map(Who::from_cbor).collect::<Result<_, _>>()?,
+            kind: opt_field(m, "kind", |v| DocKind::parse(v.as_text()?))?.unwrap_or(DocKind::Text),
         };
         if d.title.trim() != d.title {
             return Err("a doc's title must be trimmed".into());
@@ -427,6 +457,7 @@ impl DocData {
         let mut m = Map::new();
         m.insert("title", self.title.as_str());
         m.insert("editors", self.editors.iter().map(Who::to_cbor).collect::<Vec<_>>());
+        m.insert("kind", self.kind.as_str());
         m.into()
     }
 
@@ -759,7 +790,7 @@ mod tests {
     #[test]
     fn docs() {
         let key = SigningKey::from_bytes(&[1; 32]);
-        let d = DocData { title: "Notes".into(), editors: vec![Who::User([2; 32]), Who::Claim([9; 32])] };
+        let d = DocData { title: "Notes".into(), editors: vec![Who::User([2; 32]), Who::Claim([9; 32])], kind: DocKind::List };
         assert_eq!(DocData::from_cbor(&d.to_cbor()).unwrap(), d);
         let r = signed(&key, "/doc", "doc", d.to_cbor(), None);
         r.check().unwrap();
@@ -769,6 +800,13 @@ mod tests {
         assert!(d.may_edit(&author, &author, none) && d.may_edit(&author, &[2; 32], none) && !d.may_edit(&author, &[3; 32], none));
         assert!(d.may_edit(&author, &[3; 32], |c: &Hash| (*c == [9; 32]).then_some([3; 32])), "via a claim");
         assert!(signed(&key, "/doc", "doc", DocData { title: " x".into(), ..d.clone() }.to_cbor(), None).check().is_err());
+        let mut m = d.to_cbor().as_map().unwrap().clone();
+        m.insert("kind", "spreadsheet");
+        assert!(DocData::from_cbor(&m.clone().into()).is_err(), "unknown kinds are refused");
+        let mut m = Map::new();
+        m.insert("title", "old");
+        m.insert("editors", Vec::<CBOR>::new());
+        assert_eq!(DocData::from_cbor(&m.into()).unwrap().kind, DocKind::Text, "no kind: text");
 
         let u = DocUpdateData { doc: r.hash(), update: vec![1, 2, 3] };
         assert_eq!(DocUpdateData::from_cbor(&u.to_cbor()).unwrap(), u);

@@ -31,18 +31,23 @@ import {
   userPhrase,
 } from "./api.ts";
 import { ClaimLink } from "./Identity.tsx";
+import { ListView } from "./List.tsx";
 import { PartyLink, PathLinks, UserLink } from "./NoteList.tsx";
 import { Link, recordPath } from "./router.tsx";
+import { kvDel, kvGet, kvSet } from "./store.ts";
 import { type Run, input, link, secondary, useLoad } from "./ui.ts";
 
-// A shared doc: its "doc" record (title, editors) and its text, a Yjs CRDT built from "doc_update"
-// records (see the end of api.ts). We stream the doc's records from the node, apply the updates by its
+// A shared doc: its "doc" record (title, editors, kind) and its content, a Yjs CRDT built from
+// "doc_update" records (see the end of api.ts): markdown text, or a list (see List.tsx). We stream the doc's records from the node, apply the updates by its
 // author and editors, and write our own edits as updates: batched, so typing doesn't sign a record per
 // key. Editors also join the doc's live room, to see each other's cursors (Yjs awareness), which
 // nothing stores.
 
-/** The origin we tag updates from the node with, so they aren't sent back. */
+/** The origins we tag updates from the node, and from what this device kept, with: they aren't ours to send. */
 const REMOTE = Symbol("remote");
+const CACHED = Symbol("cached");
+/** Keep the doc's content on this device once it's been still this long. */
+const SAVE_STATE_MS = 500;
 /** Send our edits once typing pauses this long, */
 const FLUSH_IDLE_MS = 250;
 /** or at the latest this long after the first unsent one. */
@@ -74,9 +79,13 @@ function presence(pubkey: string): Presence {
  * connection, and which connection each remote awareness client came from. */
 type Live = { awareness: Awareness; users: Map<number, string>; clients: Map<number, number> };
 
-/** The doc's text and how it syncs with the node: set up for one doc (its hash), torn down on leaving. */
-function useDocSync(hash: string, onDocChange: (doc: Post | null, deleted: boolean) => void) {
-  const [sync, setSync] = useState<{ ytext: Y.Text; live: Live } | null>(null);
+/** A doc's content and how it syncs with the node: set up for one doc (its hash) and one of us (`me`, or
+ * null signed out), torn down on leaving.
+ *
+ * This device keeps (see store.ts) the doc's last known content, shown before the node answers or when it
+ * can't, and the edits we haven't sent, sent when it can: whether the node's unreachable, or we leave first. */
+function useDocSync(hash: string, me: string | null, onDocChange: (doc: Post | null, deleted: boolean) => void) {
+  const [sync, setSync] = useState<{ ydoc: Y.Doc; live: Live } | null>(null);
   const [ready, setReady] = useState(false);
   const [save, setSave] = useState<SaveState>({ unsent: false, sending: false, error: "" });
   const [syncError, setSyncError] = useState("");
@@ -90,7 +99,6 @@ function useDocSync(hash: string, onDocChange: (doc: Post | null, deleted: boole
   useEffect(() => {
     if (!isHash(hash)) return;
     const ydoc = new Y.Doc();
-    const text = ydoc.getText("md");
     const live: Live = { awareness: new Awareness(ydoc), users: new Map(), clients: new Map() };
     // Name remote cursors by who the live room says sent them, not by what they say. Registered
     // before the editor's own listener, so it sees the names already fixed.
@@ -103,23 +111,51 @@ function useDocSync(hash: string, onDocChange: (doc: Post | null, deleted: boole
         if (state) state.user = presence(user);
       }
     });
+    const stateKey = `doc:${hash}`;
+    /** Unsent edits are ours alone: they're sent signed by us. */
+    const outboxKey = me && `outbox:${hash}:${me}`;
     let stopped = false;
     let flushTimer: ReturnType<typeof setTimeout> | undefined;
+    let stateTimer: ReturnType<typeof setTimeout> | undefined;
     /** Updates from the node not applied yet, because we don't know their authors as editors (yet). */
     let pending: Rec[] = [];
     /** Whether the doc record may have changed since we last loaded it; whether new updates came. */
     let docDirty = true;
     let fresh = false;
     let caughtUp = false;
-    /** Our edits not sent yet, and when the first of them was made. */
+    /** Our edits not sent yet, and when the first of them was made; and the ones being sent. */
     const outbox: Uint8Array[] = [];
     let firstUnsent = 0;
-    let sending = false;
+    let inflight: Uint8Array | null = null;
     docRef.current = null;
     setReady(false);
     setIgnored(0);
     setSyncError("");
     setSave({ unsent: false, sending: false, error: "" });
+
+    /** Keeps what we haven't sent (for sure) on this device. */
+    const keepOutbox = () => {
+      if (!outboxKey) return;
+      const all = inflight ? [inflight, ...outbox] : outbox;
+      if (all.length) kvSet(outboxKey, Y.mergeUpdates(all));
+      else kvDel(outboxKey);
+    };
+    const keepState = () => kvSet(stateKey, Y.encodeStateAsUpdate(ydoc));
+
+    /** Loads what this device kept. Whether it had the doc's content. */
+    const restore = async () => {
+      const [state, unsent] = await Promise.all([kvGet<Uint8Array>(stateKey), outboxKey ? kvGet<Uint8Array>(outboxKey) : undefined]);
+      if (stopped) return false;
+      if (state) Y.applyUpdate(ydoc, state, CACHED);
+      if (unsent) {
+        Y.applyUpdate(ydoc, unsent, CACHED);
+        outbox.push(unsent);
+        firstUnsent ||= Date.now();
+        setSave((s) => ({ ...s, unsent: true }));
+        schedule();
+      }
+      return !!state;
+    };
 
     const loadDoc = async () => {
       const chain = await getChain(hash);
@@ -160,10 +196,15 @@ function useDocSync(hash: string, onDocChange: (doc: Post | null, deleted: boole
           }
           fresh = false;
           apply();
+          if (outbox.length) schedule();
         } catch (e) {
+          docDirty = true;
           setSyncError((e as Error).message);
         }
       }));
+
+    // What this device kept is enough to show, until the stream catches up (or if it can't).
+    Promise.all([restore(), process()]).then(([had]) => had && !stopped && docRef.current && setReady(true));
 
     const es = streamRecords({ doc: hash });
     es.addEventListener("record", (e) => {
@@ -179,7 +220,7 @@ function useDocSync(hash: string, onDocChange: (doc: Post | null, deleted: boole
       process().then(() => !stopped && setReady(true));
     });
     es.onopen = () => setSyncError("");
-    es.onerror = () => setSyncError("lost the connection to the node; reconnecting…");
+    es.onerror = () => setSyncError("can't reach the node; reconnecting…");
 
     const schedule = (ms?: number) => {
       clearTimeout(flushTimer);
@@ -189,50 +230,59 @@ function useDocSync(hash: string, onDocChange: (doc: Post | null, deleted: boole
     /** Sends our unsent edits as one update record. */
     const flush = async () => {
       const doc = docRef.current;
-      if (sending || !outbox.length || !doc) return;
-      sending = true;
-      const merged = Y.mergeUpdates(outbox.splice(0));
+      if (inflight || !outbox.length || !doc) return;
+      inflight = Y.mergeUpdates(outbox.splice(0));
       firstUnsent = 0;
       setSave((s) => ({ ...s, sending: true }));
       let error = "";
       try {
-        await putDocUpdate(doc, merged);
+        await putDocUpdate(doc, inflight);
       } catch (e) {
-        error = `Couldn't save: ${(e as Error).message}`;
-        outbox.unshift(merged);
+        error = (e as Error).message;
+        outbox.unshift(inflight);
       }
-      sending = false;
+      inflight = null;
+      keepOutbox();
       setSave({ unsent: outbox.length > 0, sending: false, error });
       if (outbox.length && !stopped) schedule(error ? RETRY_MS : undefined);
     };
 
     ydoc.on("update", (u: Uint8Array, origin: unknown) => {
+      if (origin === CACHED) return;
+      clearTimeout(stateTimer);
+      stateTimer = setTimeout(keepState, SAVE_STATE_MS);
       if (origin === REMOTE) return;
       outbox.push(u);
+      keepOutbox();
       if (!firstUnsent) firstUnsent = Date.now();
       setSave((s) => ({ ...s, unsent: true }));
       schedule();
     });
 
-    const beforeUnload = (e: BeforeUnloadEvent) => {
-      if (outbox.length || sending) e.preventDefault();
-    };
-    window.addEventListener("beforeunload", beforeUnload);
-
-    setSync({ ytext: text, live });
+    setSync({ ydoc, live });
 
     return () => {
       stopped = true;
       es.close();
       clearTimeout(flushTimer);
-      window.removeEventListener("beforeunload", beforeUnload);
-      // Leaving within the app: send what's left, best effort.
-      if (outbox.length && docRef.current) putDocUpdate(docRef.current, Y.mergeUpdates(outbox)).catch(() => {});
+      if (stateTimer) {
+        clearTimeout(stateTimer);
+        keepState();
+      }
+      // Leaving within the app: send what's left now, rather than next time. It's kept here until it's gone.
+      const left = outbox.splice(0);
+      if (left.length && docRef.current) {
+        const merged = Y.mergeUpdates(left);
+        putDocUpdate(docRef.current, merged).then(keepOutbox, () => {
+          outbox.unshift(merged);
+          keepOutbox();
+        });
+      }
       live.awareness.destroy();
       ydoc.destroy();
       setSync(null);
     };
-  }, [hash]);
+  }, [hash, me]);
 
   return { sync, ready, save, syncError, ignored, reload: () => reloadRef.current() };
 }
@@ -398,8 +448,13 @@ function Status(props: { save: SaveState; syncError: string; ignored: number; ed
       </span>,
     );
   }
-  if (save.error) parts.push(<span className="text-red-700">{save.error} (retrying)</span>);
-  else if (save.sending) parts.push("Saving…");
+  if (save.error) {
+    parts.push(
+      <span className="text-amber-700" title={save.error}>
+        Not sent yet: kept on this device, and sent once the node takes it
+      </span>,
+    );
+  } else if (save.sending) parts.push("Saving…");
   else if (save.unsent) parts.push("Unsaved changes");
   else if (editable) parts.push("All changes saved");
   if (syncError) parts.push(<span className="text-red-700">Couldn't sync: {syncError}</span>);
@@ -503,7 +558,7 @@ export function DocPage({ hash, me, busy, run, tick }: { hash: string; me: User 
   const [doc, setDoc] = useState<{ post: Post | null; deleted: boolean } | null>(null);
   const [mode, setMode] = useState<Mode>("split");
   useEffect(() => setDoc(null), [hash]);
-  const { sync, ready, save, syncError, ignored, reload } = useDocSync(hash, (post, deleted) => setDoc({ post, deleted }));
+  const { sync, ready, save, syncError, ignored, reload } = useDocSync(hash, me?.pubkey ?? null, (post, deleted) => setDoc({ post, deleted }));
   const post = doc?.post && !doc.deleted ? doc.post : null;
   const editable = !!me && !!post && mayEditDoc(post, me.pubkey);
   useLiveRoom(hash, sync?.live ?? null, me, editable);
@@ -516,7 +571,7 @@ export function DocPage({ hash, me, busy, run, tick }: { hash: string; me: User 
   if (!post) {
     return (
       <p className="rounded-md bg-gray-50 p-3 text-sm text-gray-600 ring-1 ring-gray-200">
-        {doc.deleted ? "This doc was deleted." : "That isn't a doc."}{" "}
+        {doc.deleted ? "This was deleted." : "That isn't a doc or a list."}{" "}
         <Link href={recordPath(hash)} className={link}>
           See its record
         </Link>
@@ -525,6 +580,7 @@ export function DocPage({ hash, me, busy, run, tick }: { hash: string; me: User 
     );
   }
   const manage = !!me && (post.by?.pubkey === me.pubkey || amOwner());
+  const list = post.doc!.kind === "list";
   const tab = (m: Mode, label: string) => (
     <button
       className={`cursor-pointer px-2.5 py-1 ${mode === m ? "bg-gray-900 text-white" : "bg-white hover:bg-gray-50"}`}
@@ -551,19 +607,23 @@ export function DocPage({ hash, me, busy, run, tick }: { hash: string; me: User 
 
       <div className="flex items-center justify-between gap-2">
         <Status save={save} syncError={syncError} ignored={ignored} editable={editable} here={here} />
-        <div className="flex overflow-hidden rounded-md text-xs font-medium ring-1 ring-gray-300">
-          {tab("write", "Write")}
-          {tab("split", "Split")}
-          {tab("preview", "Preview")}
-        </div>
+        {!list && (
+          <div className="flex overflow-hidden rounded-md text-xs font-medium ring-1 ring-gray-300">
+            {tab("write", "Write")}
+            {tab("split", "Split")}
+            {tab("preview", "Preview")}
+          </div>
+        )}
       </div>
 
       {!sync || !ready ? (
-        <p className="text-gray-500">Loading its text…</p>
+        <p className="text-gray-500">Loading…</p>
+      ) : list ? (
+        <ListView ydoc={sync.ydoc} editable={editable} />
       ) : (
         <div className={`grid gap-4 ${mode === "split" ? "md:grid-cols-2" : ""}`}>
-          {mode !== "preview" && <Editor ytext={sync.ytext} awareness={sync.live.awareness} editable={editable} />}
-          {mode !== "write" && <Preview ytext={sync.ytext} />}
+          {mode !== "preview" && <Editor ytext={sync.ydoc.getText("md")} awareness={sync.live.awareness} editable={editable} />}
+          {mode !== "write" && <Preview ytext={sync.ydoc.getText("md")} />}
         </div>
       )}
 

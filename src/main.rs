@@ -454,6 +454,11 @@ impl App {
         if rec.kind != "tombstone" && rec.kind != prev.kind {
             return Err("an edit can't change a record's type".into());
         }
+        if let (Some(new), Some(old)) = (rec.doc(), prev.doc())
+            && new.kind != old.kind
+        {
+            return Err("an edit can't change a doc's kind".into());
+        }
         if prev.claim().is_some_and(|c| c.user.is_some()) && rec.kind != "tombstone" {
             return Err("that claim was already claimed".into());
         }
@@ -1444,13 +1449,13 @@ mod tests {
 
     #[tokio::test]
     async fn docs() {
-        use fedcrdt_core::DocData;
+        use fedcrdt_core::{DocData, DocKind};
         let (app, alice, bob) = setup();
         let carol = key(3);
         let grant = GrantData { path: "/doc".into(), grantees: Grantees::Anyone };
         put(&app, &sign(&alice, GRANT_PATH, "grant", grant.to_cbor(), None, 1)).unwrap();
 
-        let doc = sign(&bob, "/doc", "doc", DocData { title: "Plans".into(), editors: vec![] }.to_cbor(), None, 1);
+        let doc = sign(&bob, "/doc", "doc", DocData { title: "Plans".into(), editors: vec![], kind: DocKind::Text }.to_cbor(), None, 1);
         put(&app, &doc).unwrap();
         put(&app, &doc_update(&bob, &doc, "/doc", b"bob")).unwrap();
         put(&app, &doc_update(&alice, &doc, "/doc", b"alice")).expect("owners may edit anything");
@@ -1467,8 +1472,11 @@ mod tests {
         let token = [42u8; 32];
         let claim_rec = sign(&bob, "/doc", "claim", ClaimData { token_hash: Sha256::digest(token).into(), user: None }.to_cbor(), None, 1);
         put(&app, &claim_rec).expect("claims go anywhere one may write");
-        let v2 = sign(&bob, "/doc", "doc", DocData { title: "Plans".into(), editors: vec![Who::Claim(claim_rec.hash())] }.to_cbor(), Some(&doc), 2);
+        let v2 = sign(&bob, "/doc", "doc", DocData { title: "Plans".into(), editors: vec![Who::Claim(claim_rec.hash())], kind: DocKind::Text }.to_cbor(), Some(&doc), 2);
         put(&app, &v2).unwrap();
+        let as_list = sign(&bob, "/doc", "doc", DocData { title: "Plans".into(), editors: vec![], kind: DocKind::List }.to_cbor(), Some(&v2), 3);
+        let err = put(&app, &as_list).unwrap_err();
+        assert!(err.contains("kind"), "{err}");
         let app = Arc::new(app);
         let sig = carol.sign(&claim_signed_bytes(&app.pk, &token)).to_bytes();
         let c = Claim { token: encode_b58(&token), user: encode_id(&id(&carol)), signature: encode_b58(&sig) };
@@ -1513,12 +1521,12 @@ mod tests {
 
     #[tokio::test]
     async fn streams_and_live_rooms() {
-        use fedcrdt_core::DocData;
+        use fedcrdt_core::{DocData, DocKind};
         let (app, alice, bob) = setup();
         let carol = key(3);
         let grant = GrantData { path: "/doc".into(), grantees: Grantees::Anyone };
         put(&app, &sign(&alice, GRANT_PATH, "grant", grant.to_cbor(), None, 1)).unwrap();
-        let doc = sign(&bob, "/doc", "doc", DocData { title: "".into(), editors: vec![Who::User(id(&carol))] }.to_cbor(), None, 1);
+        let doc = sign(&bob, "/doc", "doc", DocData { title: "".into(), editors: vec![Who::User(id(&carol))], kind: DocKind::Text }.to_cbor(), None, 1);
         put(&app, &doc).unwrap();
 
         // What a stream of the doc, and one of /post, would pass on as records are stored.
