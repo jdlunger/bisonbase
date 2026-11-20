@@ -4,8 +4,8 @@ import {
   type Passkey,
   type User,
   amOwner,
-  claimNode,
   deriveFromExistingPasskey,
+  findClaim,
   deriveFromNewPasskey,
   forgetKeys,
   forgetRecentPasskey,
@@ -17,6 +17,7 @@ import {
   pathWithin,
   putPost,
   recentPasskeys,
+  redeemClaim,
   restoreKeys,
   setRemember,
   userPhrase,
@@ -24,7 +25,7 @@ import {
 import { Compose, type Draft, NoteEditor } from "./NoteList.tsx";
 import { PathPage, RecordPage, UserPage } from "./Record.tsx";
 import { Link, idPath, navigate, recordPath, useRoute } from "./router.tsx";
-import { type Run, link, hl, primary, secondary } from "./ui.ts";
+import { type Run, link, hl, primary, secondary, useLoad } from "./ui.ts";
 
 /** A recently used passkey, with its keys' phrase. */
 type Recent = Passkey & { phrase: string };
@@ -97,7 +98,7 @@ function Shell({ initialError }: { initialError: string | null }) {
   };
   // "New post" goes where we're looking, if we may write there; else the first place we may.
   const here = route.page === "path" && route.path !== "/" ? route.path : null;
-  const newPost = () => open(here && canWrite(here) ? here : owner || !grants.length ? "/posts" : grants[0]);
+  const newPost = () => open(here && canWrite(here) ? here : owner || !grants.length ? "/post" : grants[0]);
 
   return (
     <Compose.Provider value={{ canWrite, open, writable: owner ? ["/"] : grants }}>
@@ -147,7 +148,7 @@ function Shell({ initialError }: { initialError: string | null }) {
 
         <div className="mt-6">
           {route.page === "claim" ? (
-            <Claim node={node} me={me} busy={busy} run={run} />
+            <Claim me={me} busy={busy} run={run} tick={tick} />
           ) : route.page === "user" ? (
             <UserPage pubkey={route.pubkey} node={node} me={me} busy={busy} run={run} tick={tick} />
           ) : route.page === "record" ? (
@@ -161,48 +162,62 @@ function Shell({ initialError }: { initialError: string | null }) {
   );
 }
 
-/** /claim#<token>: the one-time link a new node prints, to make whoever signs in here its first owner. */
-function Claim({ node, me, busy, run }: { node: NodeInfo | null; me: User | null; busy: boolean; run: Run }) {
+/** /claim#<token>: a claim link. Shows what it grants (from the owner and grant records naming its claim),
+ * and claims it for whoever's signed in. */
+function Claim({ me, busy, run, tick }: { me: User | null; busy: boolean; run: Run; tick: number }) {
   const token = location.hash.slice(1);
-  if (!node) return <p className="text-gray-500">Loading…</p>;
-  const name = <span className={hl(node.phrase)}>{node.phrase}</span>;
-  return (
+  const { data, error } = useLoad(token ? () => findClaim(token) : null, [token], tick);
+  const box = (children: React.ReactNode) => (
     <section className="space-y-3">
-      <h1 className="text-2xl font-bold tracking-tight">Claim {name}</h1>
-      {node.owners.length ? (
-        <p>
-          This node already has an owner:{" "}
-          <Link href={idPath(node.pubkey)} className={link}>
-            see its page
-          </Link>
-          .
-        </p>
-      ) : !token ? (
-        <p>This link is missing its token. Use the whole link the node printed.</p>
-      ) : (
-        <>
-          <p className="text-sm text-gray-600">
-            A node's owners can write anywhere on it, let others write under paths, add owners, and federate it with
-            other nodes. This link works once.
-          </p>
-          {me ? (
-            <button
-              className={secondary}
-              disabled={busy}
-              onClick={run(async () => {
-                const id = await claimNode(token);
-                history.replaceState(null, "", location.pathname); // the token is spent
-                navigate(idPath(id));
-              })}
-            >
-              Claim as <span className={hl(me.phrase)}>{me.phrase}</span>
-            </button>
-          ) : (
-            <p>Sign in first (top right), with the keys that should own this node.</p>
-          )}
-        </>
-      )}
+      <h1 className="text-2xl font-bold tracking-tight">Claim link</h1>
+      {children}
     </section>
+  );
+  if (!token) return box(<p>This link is missing its token. Use the whole link.</p>);
+  if (error) return box(<p className="text-red-700">{error}</p>);
+  if (!data) return box(<p className="text-gray-500">Loading…</p>);
+  const { claim, owner, grants } = data;
+  if (!claim) return box(<p>This link isn't for this node, or its claim was deleted.</p>);
+  const by = claim.claim?.claimedBy;
+  if (by) {
+    return box(
+      <p>
+        This link was already claimed, by{" "}
+        <Link href={idPath(by.pubkey)} className={link}>
+          <span className={hl(by.phrase)}>{by.phrase}</span>
+        </Link>
+        {me?.pubkey === by.pubkey && " (you)"}.
+      </p>,
+    );
+  }
+  return box(
+    <>
+      <p>It works once, and gives whoever claims it:</p>
+      <ul className="list-disc pl-6 text-sm">
+        {owner && <li>👑 Ownership of this node: writing anywhere, editing or deleting anything, adding owners, grants and peers</li>}
+        {grants.map((g) => (
+          <li key={g}>
+            🔑 Writing at or under <code className="font-mono">{g}</code>
+          </li>
+        ))}
+        {!owner && !grants.length && <li>Nothing yet (no owner or grant record names it)</li>}
+      </ul>
+      {me ? (
+        <button
+          className={secondary}
+          disabled={busy}
+          onClick={run(async () => {
+            await redeemClaim(token);
+            history.replaceState(null, "", location.pathname); // the token is spent
+            navigate(idPath(me.pubkey));
+          })}
+        >
+          Claim as <span className={hl(me.phrase)}>{me.phrase}</span>
+        </button>
+      ) : (
+        <p>Sign in first (top right), with the keys that should get it.</p>
+      )}
+    </>,
   );
 }
 

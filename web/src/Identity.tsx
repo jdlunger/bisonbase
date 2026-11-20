@@ -1,6 +1,20 @@
-import { type MouseEvent, useState } from "react";
+import { type MouseEvent, useEffect, useState } from "react";
 import { encode } from "uqr";
-import { type NodeInfo, type Post, type User, addOwner, amOwner, getPosts, makeGrant, putFederate, userPhrase } from "./api.ts";
+import {
+  type Choice,
+  type NodeInfo,
+  type Post,
+  type User,
+  type Written,
+  addOwner,
+  amOwner,
+  getPosts,
+  getUsers,
+  isPubkey,
+  makeGrant,
+  putPeer,
+  userPhrase,
+} from "./api.ts";
 import { PostItem, UserLink } from "./NoteList.tsx";
 import { Link, idPath, recordPath } from "./router.tsx";
 import { type Run, hl, input, link, primary, secondary, textarea, useLoad } from "./ui.ts";
@@ -56,33 +70,95 @@ function CopyBox({ label, value, id }: { label: string; value: string; id?: bool
   );
 }
 
-/** A form's result: the record it wrote, linked. */
-function Saved({ hash, children }: { hash: string; children?: React.ReactNode }) {
-  if (!hash) return null;
+/** A form's result: the record it wrote, linked, and the claim link it made, if any. */
+function Saved({ saved, children }: { saved: Written | null; children?: React.ReactNode }) {
+  if (!saved) return null;
   return (
-    <p className="mt-2 text-sm text-gray-600">
-      Saved as{" "}
-      <Link href={recordPath(hash)} className={`font-mono ${link}`}>
-        #{hash.slice(0, 8)}
-      </Link>
-      . {children}
-    </p>
+    <div className="mt-2 space-y-2">
+      <p className="text-sm text-gray-600">
+        Saved as{" "}
+        <Link href={recordPath(saved.hash)} className={`font-mono ${link}`}>
+          #{saved.hash.slice(0, 8)}
+        </Link>
+        . {children}
+      </p>
+      {saved.link && <ClaimLink link={saved.link} />}
+    </div>
   );
 }
 
-/** Lets an owner (us) let users (IDs, or "anyone") write at or under a path, saved as a grant record. */
-function GrantForm({ grantee = "", busy, run }: { grantee?: string; busy: boolean; run: Run }) {
-  const [who, setWho] = useState(grantee);
-  const [path, setPath] = useState("/posts");
-  const [saved, setSaved] = useState("");
+/** A new claim link, to pass on. It's only shown this once: the node keeps just its token's hash. */
+function ClaimLink({ link }: { link: string }) {
+  return (
+    <div className="flex flex-col gap-3 rounded-lg bg-amber-50 p-3 ring-1 ring-amber-200 sm:flex-row sm:items-start">
+      <QrCode text={link} className="w-32 shrink-0 self-center rounded ring-1 ring-gray-200 sm:self-start" />
+      <div className="min-w-0 flex-1 space-y-2">
+        <CopyBox label="Claim link" value={link} />
+        <p className="text-xs text-amber-900">
+          Whoever opens this first and signs in gets what it grants. It works once, and it won't be shown again: copy it now.
+          Deleting the claim record cancels it.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+/** Picks who a record names: a known user or a typed ID, a new claim link, or (with `anyone`) anyone. */
+function WhoPicker({ value, onChange, anyone }: { value: Choice; onChange: (c: Choice) => void; anyone?: boolean }) {
+  const [users, setUsers] = useState<User[]>([]);
+  useEffect(() => {
+    getUsers().then((u) => setUsers(u.filter((u) => !u.node)), () => {});
+  }, []);
+  const [id, setId] = useState(value.kind === "user" ? value.id : "");
+  const toggle = (kind: "claim" | "anyone") => (e: React.ChangeEvent<HTMLInputElement>) =>
+    onChange(e.target.checked ? { kind } : { kind: "user", id });
+  const known = value.kind === "user" && users.find((u) => u.pubkey === value.id.trim());
+  return (
+    <div className="space-y-1.5">
+      <input
+        className={`${input} font-mono disabled:opacity-50`}
+        placeholder="A user's ID (pick a known one, or paste one)"
+        list="known-users"
+        disabled={value.kind !== "user"}
+        value={id}
+        onChange={(e) => {
+          setId(e.target.value);
+          onChange({ kind: "user", id: e.target.value });
+        }}
+      />
+      <datalist id="known-users">
+        {users.map((u) => (
+          <option key={u.pubkey} value={u.pubkey} label={u.phrase} />
+        ))}
+      </datalist>
+      {known && <span className={`text-xs ${hl(known.phrase)}`}>{known.phrase}</span>}
+      <div className="flex flex-wrap gap-x-4">
+        <label className="flex items-center gap-1.5">
+          <input type="checkbox" checked={value.kind === "claim"} onChange={toggle("claim")} />
+          Someone new: make a claim link
+        </label>
+        {anyone && (
+          <label className="flex items-center gap-1.5">
+            <input type="checkbox" checked={value.kind === "anyone"} onChange={toggle("anyone")} />
+            Anyone
+          </label>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const ready = (c: Choice) => c.kind !== "user" || isPubkey(c.id.trim());
+
+/** Lets an owner (us) let someone write at or under a path, saved as a grant record. `grantee`: an ID,
+ * when it's for a given user. */
+function GrantForm({ grantee, busy, run }: { grantee?: string; busy: boolean; run: Run }) {
+  const [who, setWho] = useState<Choice>(grantee ? { kind: "user", id: grantee } : { kind: "anyone" });
+  const [path, setPath] = useState("/post");
+  const [saved, setSaved] = useState<Written | null>(null);
   return (
     <div className="mt-3 space-y-2 text-sm">
-      {!grantee && (
-        <label className="block">
-          Who <span className="text-gray-500">(IDs, separated by spaces or commas, or "anyone")</span>
-          <input className={`${input} font-mono`} placeholder="anyone" value={who} onChange={(e) => setWho(e.target.value)} />
-        </label>
-      )}
+      {!grantee && <WhoPicker value={who} onChange={setWho} anyone />}
       <div className="flex flex-wrap items-center gap-2">
         <label className="flex min-w-48 flex-1 items-center gap-1.5 whitespace-nowrap">
           May write at or under
@@ -90,26 +166,26 @@ function GrantForm({ grantee = "", busy, run }: { grantee?: string; busy: boolea
         </label>
         <button
           className={primary}
-          disabled={busy || !who.trim()}
+          disabled={busy || !ready(who)}
           onClick={run(async () => {
-            setSaved("");
+            setSaved(null);
             setSaved(await makeGrant(who, path));
           })}
         >
           Grant
         </button>
       </div>
-      <Saved hash={saved}>It can't be revoked yet: deleting the record doesn't take back what was written under it.</Saved>
+      <Saved saved={saved}>It can't be revoked yet: deleting the record doesn't take back what was written under it.</Saved>
     </div>
   );
 }
 
-/** Lets an owner (us) have this node push records to another node, saved as a federate record. */
-function FederateForm({ busy, run }: { busy: boolean; run: Run }) {
+/** Lets an owner (us) have this node push records to another node, saved as a peer record. */
+function PeerForm({ busy, run }: { busy: boolean; run: Run }) {
   const [url, setUrl] = useState("");
   const [types, setTypes] = useState("");
   const [paths, setPaths] = useState("");
-  const [saved, setSaved] = useState("");
+  const [saved, setSaved] = useState<Written | null>(null);
   return (
     <div className="mt-3 space-y-2 text-sm">
       <label className="block">
@@ -122,39 +198,41 @@ function FederateForm({ busy, run }: { busy: boolean; run: Run }) {
       </label>
       <label className="block">
         Paths <span className="text-gray-500">(one per line, each with what's under it; empty for all)</span>
-        <textarea className={`${textarea} font-mono`} rows={2} placeholder={"/posts"} value={paths} onChange={(e) => setPaths(e.target.value)} />
+        <textarea className={`${textarea} font-mono`} rows={2} placeholder={"/post"} value={paths} onChange={(e) => setPaths(e.target.value)} />
       </label>
       <button
         className={primary}
         disabled={busy || !url.trim()}
         onClick={run(async () => {
-          setSaved("");
-          setSaved(await putFederate(url, types, paths));
+          setSaved(null);
+          setSaved({ hash: await putPeer(url, types, paths) });
         })}
       >
-        Federate
+        Add peer
       </button>
-      <Saved hash={saved}>Delete that record to stop pushing there.</Saved>
+      <Saved saved={saved}>Delete that record to stop pushing there.</Saved>
     </div>
   );
 }
 
 /** Lets an owner (us) add an owner. */
 function AddOwnerForm({ busy, run }: { busy: boolean; run: Run }) {
-  const [who, setWho] = useState("");
+  const [who, setWho] = useState<Choice>({ kind: "user", id: "" });
+  const [saved, setSaved] = useState<Written | null>(null);
   return (
-    <div className="mt-3 flex flex-wrap items-center gap-2 text-sm">
-      <input className={`${input} min-w-48 flex-1 font-mono`} placeholder="Their ID" value={who} onChange={(e) => setWho(e.target.value)} />
+    <div className="mt-3 space-y-2 text-sm">
+      <WhoPicker value={who} onChange={setWho} />
       <button
         className={secondary}
-        disabled={busy || !who.trim()}
+        disabled={busy || !ready(who)}
         onClick={run(async () => {
-          await addOwner(who);
-          setWho("");
+          setSaved(null);
+          setSaved(await addOwner(who));
         })}
       >
         Add owner
       </button>
+      <Saved saved={saved} />
     </div>
   );
 }
@@ -225,7 +303,7 @@ export function Identity({
           </h2>
           <GrantForm grantee={pubkey} busy={busy} run={run} />
           {!isOwner && (
-            <button className={`${secondary} mt-3`} disabled={busy} onClick={run(() => addOwner(pubkey))}>
+            <button className={`${secondary} mt-3`} disabled={busy} onClick={run(() => addOwner({ kind: "user", id: pubkey }))}>
               👑 Make <span className={hl(phrase)}>{phrase}</span> an owner
             </button>
           )}
@@ -235,12 +313,12 @@ export function Identity({
   );
 }
 
-/** On this node's page: its owners, grants and peers (its /node records), and forms to add them if we own it. */
+/** On this node's page: its owners, grants, claims and peers (its /node records), and forms to add them if we own it. */
 export function NodeAdmin({ me, busy, run, tick }: { me: User | null; busy: boolean; run: Run; tick: number }) {
   const { data } = useLoad(() => getPosts({ prefix: "/node" }), [], tick);
   const owner = !!me && amOwner();
   const items = { me, busy, run };
-  const section = (title: string, type: string, form: React.ReactNode, note?: string) => {
+  const section = (title: string, type: string, form: React.ReactNode | null, note?: string) => {
     const posts = data?.filter((p) => p.rec.type === type) ?? [];
     return (
       <section className="mt-10">
@@ -268,9 +346,15 @@ export function NodeAdmin({ me, busy, run, tick }: { me: User | null; busy: bool
       {section("Owners", "owner", <AddOwnerForm busy={busy} run={run} />, "They can write anything, anywhere on this node, and edit or delete any record.")}
       {section("Grants", "grant", <GrantForm busy={busy} run={run} />, "Who else may write where.")}
       {section(
-        "Federation",
-        "federate",
-        <FederateForm busy={busy} run={run} />,
+        "Claims",
+        "claim",
+        null,
+        "One-time links, for owners and grants to name someone not known yet. Make one by checking \"claim link\" above.",
+      )}
+      {section(
+        "Peers",
+        "peer",
+        <PeerForm busy={busy} run={run} />,
         "Nodes this one pushes new records to (and everything so far, to start). Each passes on only records new to it, so loops die out. Records under /node never leave.",
       )}
     </>

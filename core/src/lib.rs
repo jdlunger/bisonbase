@@ -101,7 +101,7 @@ fn as_map<'a>(v: &'a CBOR, what: &str) -> Result<&'a Map, String> {
 // Everything users write is a record: a CBOR map, signed by its author.
 //
 //   author     bytes(32)  Ed25519 public key of whoever wrote and signed it
-//   path       text       a category to find it by, e.g. "/posts/dogs" (see `check_path`). Not unique:
+//   path       text       a category to find it by, e.g. "/post/dogs" (see `check_path`). Not unique:
 //                         any number of records share a path
 //   version    uint       ms since the epoch, by the author's clock
 //   type       text       what `data` holds: "post" (data: text), "tombstone" (data: null, a delete),
@@ -145,26 +145,32 @@ const RECORD_FIELDS: [&str; 7] = ["author", "path", "version", "type", "data", "
 //
 // Each node has its own key. Its own records live under /node, and are never federated:
 //
-//   /node/info      type "node", data {url}: written by the node itself
-//   /node/owner     type "owner", data {user: bytes(32)}: one per owner. The node writes the first when
-//                   someone claims it with its one-time link (see `claim_signed_bytes`); after that,
-//                   owners add (and delete) them
-//   /node/grants    type "grant" (see `GrantData`): written by owners, lets users write at or under a path
-//   /node/federate  type "federate" (see `FederateData`): written by owners, pushes records to a peer
+//   /node/info   type "node", data {url}: written by the node itself
+//   /node/owner  type "owner", data a `Who`: one per owner
+//   /node/grant  type "grant" (see `GrantData`): lets users write at or under a path
+//   /node/peer   type "peer" (see `PeerData`): has the node push records to another node
+//   /node/claim  type "claim" (see `ClaimData`): a one-time link, for a user nobody knows yet
 //
-// Owners may write anything, anywhere. Others need a grant covering the path, except to edit or delete
-// their own records. A node checks all of that when a record is written to it, against its own /node
-// records; records pushed by peers are taken as they are.
+// Owners write all of these (except /node/info) and may write anything, anywhere. Others need a grant
+// covering the path, except to edit or delete their own records. A node checks all of that when a
+// record is written to it, against its own /node records; records pushed by peers are taken as they are.
+//
+// Owner and grant records name users directly, or name a claim: then they're for whoever claims it.
+// A claim holds the SHA-256 of a random token; the token itself only travels in the claim link. Whoever
+// opens the link signs `claim_signed_bytes` with it, and the node then writes a new version of the claim
+// naming them. On a fresh database the node writes a claim and an owner record naming it, and prints the
+// link: that's how a node gets its first owner.
 
 pub const NODE_PATH: &str = "/node";
 pub const NODE_INFO_PATH: &str = "/node/info";
 pub const OWNER_PATH: &str = "/node/owner";
-pub const GRANTS_PATH: &str = "/node/grants";
-pub const FEDERATE_PATH: &str = "/node/federate";
+pub const GRANT_PATH: &str = "/node/grant";
+pub const PEER_PATH: &str = "/node/peer";
+pub const CLAIM_PATH: &str = "/node/claim";
 
-pub const CLAIM_CONTEXT: &[u8] = b"bisonbase-claim-v1\n";
+pub const CLAIM_CONTEXT: &[u8] = b"bisonbase-claim-v2\n";
 
-/// The bytes a user signs to claim `node`, with the token from its one-time claim link.
+/// The bytes a user signs to claim a claim on `node`, with the token from its link.
 pub fn claim_signed_bytes(node: &Pubkey, token: &[u8]) -> Vec<u8> {
     let mut m = Map::new();
     m.insert("node", CBOR::to_byte_string(node));
@@ -172,11 +178,47 @@ pub fn claim_signed_bytes(node: &Pubkey, token: &[u8]) -> Vec<u8> {
     [CLAIM_CONTEXT, &CBOR::from(m).to_cbor_data()].concat()
 }
 
+/// A user, as owner and grant records name them: {user: their ID}, or {claim: the hash of a claim
+/// chain's first record}, for whoever claims it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Who {
+    User(Pubkey),
+    Claim(Hash),
+}
+
+impl Who {
+    pub fn from_cbor(v: &CBOR) -> Result<Self, String> {
+        let m = as_map(v, "a user reference")?;
+        match (opt_field(m, "user", bytes)?, opt_field(m, "claim", bytes)?) {
+            (Some(u), None) => Ok(Who::User(u)),
+            (None, Some(c)) => Ok(Who::Claim(c)),
+            _ => Err("a user reference is {user: ID} or {claim: hash}".into()),
+        }
+    }
+
+    pub fn to_cbor(&self) -> CBOR {
+        let mut m = Map::new();
+        match self {
+            Who::User(u) => m.insert("user", CBOR::to_byte_string(u)),
+            Who::Claim(c) => m.insert("claim", CBOR::to_byte_string(c)),
+        }
+        m.into()
+    }
+
+    /// The user this names, given who claimed what (claim hash → its user, if claimed).
+    pub fn resolve(&self, claimed: impl Fn(&Hash) -> Option<Pubkey>) -> Option<Pubkey> {
+        match self {
+            Who::User(u) => Some(*u),
+            Who::Claim(c) => claimed(c),
+        }
+    }
+}
+
 /// Who a grant lets write.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Grantees {
     Anyone,
-    Users(Vec<Pubkey>),
+    Some(Vec<Who>),
 }
 
 /// A "grant" record's data: lets `grantees` write at or under `path` ("/" for everywhere).
@@ -191,11 +233,11 @@ impl GrantData {
         let m = as_map(v, "a grant's data")?;
         let grantees = match m.get::<_, CBOR>("grantees") {
             Some(g) if g.as_text() == Some("anyone") => Grantees::Anyone,
-            Some(g) => Grantees::Users(
+            Some(g) => Grantees::Some(
                 g.as_array()
-                    .ok_or("grantees must be \"anyone\" or a list of IDs")?
+                    .ok_or("grantees must be \"anyone\" or a list of user references")?
                     .iter()
-                    .map(|u| bytes(u).ok_or("grantees must be 32-byte IDs"))
+                    .map(Who::from_cbor)
                     .collect::<Result<_, _>>()?,
             ),
             None => return Err("missing field \"grantees\"".into()),
@@ -210,27 +252,51 @@ impl GrantData {
         m.insert("path", self.path.as_str());
         match &self.grantees {
             Grantees::Anyone => m.insert("grantees", "anyone"),
-            Grantees::Users(u) => m.insert("grantees", u.iter().map(CBOR::to_byte_string).collect::<Vec<_>>()),
+            Grantees::Some(w) => m.insert("grantees", w.iter().map(Who::to_cbor).collect::<Vec<_>>()),
         }
         m.into()
     }
 
-    /// Whether this lets `author` write at `path`.
-    pub fn covers(&self, author: &Pubkey, path: &str) -> bool {
+    /// Whether this lets `author` write at `path`, given who claimed what (see `Who::resolve`).
+    pub fn covers(&self, author: &Pubkey, path: &str, claimed: impl Fn(&Hash) -> Option<Pubkey>) -> bool {
         path_within(path, &self.path)
             && match &self.grantees {
                 Grantees::Anyone => true,
-                Grantees::Users(u) => u.contains(author),
+                Grantees::Some(w) => w.iter().any(|w| w.resolve(&claimed).as_ref() == Some(author)),
             }
     }
 }
 
-/// A "federate" record's data: push records to the node `peer` at `url`, if their type is in `types`
-/// and they're at or under one of `paths`. Either missing means all. Tombstones always pass the type
-/// filter, so deletes follow what they delete.
+/// A "claim" record's data: the SHA-256 of its link's token, and once claimed (by the node only), who
+/// claimed it.
 #[derive(Clone, Debug, PartialEq)]
-pub struct FederateData {
-    pub peer: Pubkey,
+pub struct ClaimData {
+    pub token_hash: Hash,
+    pub user: Option<Pubkey>,
+}
+
+impl ClaimData {
+    pub fn from_cbor(v: &CBOR) -> Result<Self, String> {
+        let m = as_map(v, "a claim's data")?;
+        Ok(ClaimData { token_hash: field(m, "token_hash", bytes)?, user: opt_field(m, "user", bytes)? })
+    }
+
+    pub fn to_cbor(&self) -> CBOR {
+        let mut m = Map::new();
+        m.insert("token_hash", CBOR::to_byte_string(self.token_hash));
+        if let Some(u) = self.user {
+            m.insert("user", CBOR::to_byte_string(u));
+        }
+        m.into()
+    }
+}
+
+/// A "peer" record's data: push records to `node` at `url`, if their type is in `types` and they're
+/// at or under one of `paths`. Either missing means all. Tombstones always pass the type filter, so
+/// deletes follow what they delete.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PeerData {
+    pub node: Pubkey,
     pub url: String,
     pub types: Option<Vec<String>>,
     pub paths: Option<Vec<String>>,
@@ -247,11 +313,11 @@ fn text_list(v: &CBOR) -> Option<Vec<String>> {
     v.as_array()?.iter().map(text).collect()
 }
 
-impl FederateData {
+impl PeerData {
     pub fn from_cbor(v: &CBOR) -> Result<Self, String> {
-        let m = as_map(v, "a federate record's data")?;
-        let d = FederateData {
-            peer: field(m, "peer", bytes)?,
+        let m = as_map(v, "a peer record's data")?;
+        let d = PeerData {
+            node: field(m, "node", bytes)?,
             url: field(m, "url", text)?,
             types: opt_field(m, "types", text_list)?,
             paths: opt_field(m, "paths", text_list)?,
@@ -265,7 +331,7 @@ impl FederateData {
 
     pub fn to_cbor(&self) -> CBOR {
         let mut m = Map::new();
-        m.insert("peer", CBOR::to_byte_string(self.peer));
+        m.insert("node", CBOR::to_byte_string(self.node));
         m.insert("url", self.url.as_str());
         if let Some(t) = &self.types {
             m.insert("types", t.clone());
@@ -328,8 +394,9 @@ fn node_type_path(kind: &str) -> Option<&'static str> {
     Some(match kind {
         "node" => NODE_INFO_PATH,
         "owner" => OWNER_PATH,
-        "grant" => GRANTS_PATH,
-        "federate" => FEDERATE_PATH,
+        "grant" => GRANT_PATH,
+        "peer" => PEER_PATH,
+        "claim" => CLAIM_PATH,
         _ => return None,
     })
 }
@@ -355,9 +422,13 @@ impl Record {
     }
 
     /// An owner record's user.
-    pub fn owner_user(&self) -> Option<Pubkey> {
-        let m = self.data.as_map().filter(|_| self.kind == "owner")?;
-        field(m, "user", bytes).ok()
+    pub fn owner(&self) -> Option<Who> {
+        (self.kind == "owner").then(|| Who::from_cbor(&self.data).ok()).flatten()
+    }
+
+    /// A claim record's data.
+    pub fn claim(&self) -> Option<ClaimData> {
+        (self.kind == "claim").then(|| ClaimData::from_cbor(&self.data).ok()).flatten()
     }
 
     /// Whether it's one of a node's own records, which are never federated.
@@ -434,10 +505,13 @@ impl Record {
             }
             "node" => check_url(&field(as_map(&self.data, "a node record's data")?, "url", text)?)?,
             "owner" => {
-                field(as_map(&self.data, "an owner record's data")?, "user", bytes::<32>)?;
+                Who::from_cbor(&self.data).map_err(|e| format!("owner: {e}"))?;
             }
-            "federate" => {
-                FederateData::from_cbor(&self.data)?;
+            "peer" => {
+                PeerData::from_cbor(&self.data)?;
+            }
+            "claim" => {
+                ClaimData::from_cbor(&self.data)?;
             }
             _ => return Err(format!("unknown record type {:?}", self.kind)),
         }
@@ -478,7 +552,7 @@ mod tests {
     #[test]
     fn records() {
         let key = SigningKey::from_bytes(&[1; 32]);
-        let r = signed(&key, "/posts/dogs", "post", "hi".into(), None);
+        let r = signed(&key, "/post/dogs", "post", "hi".into(), None);
         let back = Record::from_bytes(&r.to_bytes()).unwrap();
         assert_eq!(back, r);
         assert_eq!(back.hash(), r.hash());
@@ -493,11 +567,11 @@ mod tests {
         back.check().unwrap();
         assert_ne!(x.hash(), r.hash());
 
-        let edit = signed(&key, "/posts/cats", "post", "hello".into(), Some(r.hash()));
+        let edit = signed(&key, "/post/cats", "post", "hello".into(), Some(r.hash()));
         assert_eq!(Record::from_bytes(&edit.to_bytes()).unwrap(), edit);
         edit.check().unwrap();
-        signed(&key, "/posts/dogs", "tombstone", CBOR::null(), Some(r.hash())).check().unwrap();
-        assert!(signed(&key, "/posts/dogs", "tombstone", CBOR::null(), None).check().is_err());
+        signed(&key, "/post/dogs", "tombstone", CBOR::null(), Some(r.hash())).check().unwrap();
+        assert!(signed(&key, "/post/dogs", "tombstone", CBOR::null(), None).check().is_err());
 
         let mut bad = r.clone();
         bad.data = "changed".into();
@@ -507,40 +581,53 @@ mod tests {
     #[test]
     fn node_records() {
         let key = SigningKey::from_bytes(&[1; 32]);
-        let g = GrantData { path: "/posts".into(), grantees: Grantees::Users(vec![[2; 32]]) };
+        let none = |_: &Hash| None;
+        let g = GrantData { path: "/post".into(), grantees: Grantees::Some(vec![Who::User([2; 32]), Who::Claim([9; 32])]) };
         assert_eq!(GrantData::from_cbor(&g.to_cbor()).unwrap(), g);
-        assert!(g.covers(&[2; 32], "/posts/dogs") && !g.covers(&[3; 32], "/posts") && !g.covers(&[2; 32], "/postsx"));
+        assert!(g.covers(&[2; 32], "/post/dogs", none) && !g.covers(&[3; 32], "/post", none) && !g.covers(&[2; 32], "/postx", none));
+        assert!(g.covers(&[3; 32], "/post", |c: &Hash| (*c == [9; 32]).then_some([3; 32])), "via a claim");
         let anyone = GrantData { path: "/".into(), grantees: Grantees::Anyone };
         assert_eq!(GrantData::from_cbor(&anyone.to_cbor()).unwrap(), anyone);
-        assert!(anyone.covers(&[3; 32], "/x"));
-        signed(&key, GRANTS_PATH, "grant", g.to_cbor(), None).check().unwrap();
-        assert!(signed(&key, "/grants", "grant", g.to_cbor(), None).check().is_err());
+        assert!(anyone.covers(&[3; 32], "/x", none));
+        signed(&key, GRANT_PATH, "grant", g.to_cbor(), None).check().unwrap();
+        assert!(signed(&key, "/grant", "grant", g.to_cbor(), None).check().is_err());
         assert!(signed(&key, "/node/x", "post", "hi".into(), None).check().is_err());
 
-        let mut owner = Map::new();
-        owner.insert("user", CBOR::to_byte_string([2u8; 32]));
-        let o = signed(&key, OWNER_PATH, "owner", owner.into(), None);
+        let o = signed(&key, OWNER_PATH, "owner", Who::User([2; 32]).to_cbor(), None);
         o.check().unwrap();
-        assert_eq!(o.owner_user(), Some([2; 32]));
+        assert_eq!(o.owner(), Some(Who::User([2; 32])));
         assert!(o.is_node_record());
+        let o = signed(&key, OWNER_PATH, "owner", Who::Claim([9; 32]).to_cbor(), None);
+        assert_eq!(o.owner(), Some(Who::Claim([9; 32])));
+        let mut both = Map::new();
+        both.insert("user", CBOR::to_byte_string([2u8; 32]));
+        both.insert("claim", CBOR::to_byte_string([9u8; 32]));
+        assert!(signed(&key, OWNER_PATH, "owner", both.into(), None).check().is_err());
+
+        let c = ClaimData { token_hash: [5; 32], user: None };
+        assert_eq!(ClaimData::from_cbor(&c.to_cbor()).unwrap(), c);
+        let claimed = ClaimData { user: Some([2; 32]), ..c.clone() };
+        let r = signed(&key, CLAIM_PATH, "claim", claimed.to_cbor(), None);
+        r.check().unwrap();
+        assert_eq!(r.claim(), Some(claimed));
     }
 
     #[test]
-    fn federate_filters() {
-        let all = FederateData { peer: [1; 32], url: "http://x".into(), types: None, paths: None };
-        assert_eq!(FederateData::from_cbor(&all.to_cbor()).unwrap(), all);
+    fn peer_filters() {
+        let all = PeerData { node: [1; 32], url: "http://x".into(), types: None, paths: None };
+        assert_eq!(PeerData::from_cbor(&all.to_cbor()).unwrap(), all);
         assert!(all.wants("/anything", "post"));
-        let some = FederateData {
-            peer: [1; 32],
+        let some = PeerData {
+            node: [1; 32],
             url: "http://x".into(),
             types: Some(vec!["post".into()]),
             paths: Some(vec!["/pub".into(), "/b".into()]),
         };
-        assert_eq!(FederateData::from_cbor(&some.to_cbor()).unwrap(), some);
+        assert_eq!(PeerData::from_cbor(&some.to_cbor()).unwrap(), some);
         assert!(some.wants("/pub/x", "post") && some.wants("/b", "post"));
         assert!(some.wants("/pub/x", "tombstone"), "deletes follow");
         assert!(!some.wants("/pubx", "post") && !some.wants("/pub/x", "grant"));
-        assert!(FederateData::from_cbor(&FederateData { url: "ftp://x".into(), ..all.clone() }.to_cbor()).is_err());
-        assert!(FederateData::from_cbor(&FederateData { paths: Some(vec!["nope".into()]), ..all }.to_cbor()).is_err());
+        assert!(PeerData::from_cbor(&PeerData { url: "ftp://x".into(), ..all.clone() }.to_cbor()).is_err());
+        assert!(PeerData::from_cbor(&PeerData { paths: Some(vec!["nope".into()]), ..all }.to_cbor()).is_err());
     }
 }

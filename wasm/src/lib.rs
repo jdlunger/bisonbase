@@ -2,9 +2,8 @@
 //! Built into wasm/pkg by `npm run wasm`.
 
 use fedcrdt_core::{
-    CBOR, FederateData, GrantData, Grantees, Map, Record, check_path, check_prefix, claim_signed_bytes, decode_b58, decode_id,
-    encode_b58,
-    node_phrase, path_within, phrase, two_words,
+    CBOR, ClaimData, GrantData, Grantees, Map, PeerData, Record, Who, check_path, check_prefix, claim_signed_bytes, decode_b58,
+    decode_id, encode_b58, node_phrase, path_within, phrase, two_words,
 };
 use serde::{Deserialize, Serialize};
 use serde_bytes::ByteBuf;
@@ -12,11 +11,17 @@ use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen(typescript_custom_section)]
 const TYPES: &str = r#"
-/** A grant's data: who may write at or under `path` ("/" for everywhere). */
-export type GrantData = { path: string; grantees: "anyone" | Uint8Array[] };
+/** A user, named directly by ID, or by the hash of a claim (its chain's first record), for whoever claims it. */
+export type Who = { user: Uint8Array } | { claim: Uint8Array };
 
-/** A federate record's data. Missing `types` or `paths` means all. */
-export type FederateData = { peer: Uint8Array; url: string; types?: string[]; paths?: string[] };
+/** A grant's data: who may write at or under `path` ("/" for everywhere). */
+export type GrantData = { path: string; grantees: "anyone" | Who[] };
+
+/** A peer record's data: push to `node` at `url`. Missing `types` or `paths` means all. */
+export type PeerData = { node: Uint8Array; url: string; types?: string[]; paths?: string[] };
+
+/** A claim's data: SHA-256 of its link's token, and who claimed it, once someone has. */
+export type ClaimData = { tokenHash: Uint8Array; user?: Uint8Array };
 
 /** A record, decoded and checked. Field by field, see core/src/lib.rs. */
 export type Rec = {
@@ -35,11 +40,12 @@ export type Rec = {
   /** A post's text. */
   text?: string;
   grant?: GrantData;
-  federate?: FederateData;
+  peer?: PeerData;
+  claim?: ClaimData;
   /** A node record's URL. */
   nodeUrl?: string;
   /** An owner record's user. */
-  ownerUser?: Uint8Array;
+  owner?: Who;
 };
 
 /** A chain's current version, as GET /api/records lists them: `root` is the chain's first record's
@@ -47,14 +53,14 @@ export type Rec = {
 export type Entry = { rec: Rec; root: Uint8Array; by?: Uint8Array; versions: number };
 
 /** A record to sign and write. `data` is the text of a "post", null for a "tombstone", or a grant's,
- * federate record's or owner record's data. */
+ * peer record's, claim's or owner record's data. */
 export type Draft = {
   author: Uint8Array;
   path: string;
   version: number;
   type: string;
   edits?: Uint8Array;
-  data: string | null | GrantData | FederateData | { user: Uint8Array };
+  data: string | null | GrantData | PeerData | ClaimData | Who;
 };
 "#;
 
@@ -98,18 +104,43 @@ struct RecJs {
     #[serde(skip_serializing_if = "Option::is_none")]
     grant: Option<GrantJs>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    federate: Option<FederateJs>,
+    peer: Option<PeerJs>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claim: Option<ClaimJs>,
     #[serde(skip_serializing_if = "Option::is_none")]
     node_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    owner_user: Option<ByteBuf>,
+    owner: Option<WhoJs>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum WhoJs {
+    User { user: ByteBuf },
+    Claim { claim: ByteBuf },
+}
+
+impl WhoJs {
+    fn from(w: &Who) -> Self {
+        match w {
+            Who::User(u) => WhoJs::User { user: buf(u) },
+            Who::Claim(c) => WhoJs::Claim { claim: buf(c) },
+        }
+    }
+
+    fn to(&self) -> Result<Who> {
+        Ok(match self {
+            WhoJs::User { user } => Who::User(fixed(user, "user")?),
+            WhoJs::Claim { claim } => Who::Claim(fixed(claim, "claim")?),
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize)]
 #[serde(untagged)]
 enum GranteesJs {
     Anyone(String),
-    Users(Vec<ByteBuf>),
+    Some(Vec<WhoJs>),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -119,8 +150,16 @@ struct GrantJs {
 }
 
 #[derive(Serialize, Deserialize)]
-struct FederateJs {
-    peer: ByteBuf,
+#[serde(rename_all = "camelCase")]
+struct ClaimJs {
+    token_hash: ByteBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<ByteBuf>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PeerJs {
+    node: ByteBuf,
     url: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     types: Option<Vec<String>>,
@@ -131,7 +170,7 @@ struct FederateJs {
 fn rec_js(r: &Record) -> RecJs {
     let problem = r.check().err();
     let grant = (r.kind == "grant").then(|| GrantData::from_cbor(&r.data).ok()).flatten();
-    let federate = (r.kind == "federate").then(|| FederateData::from_cbor(&r.data).ok()).flatten();
+    let peer = (r.kind == "peer").then(|| PeerData::from_cbor(&r.data).ok()).flatten();
     RecJs {
         hash: buf(&r.hash()),
         author: buf(&r.author),
@@ -147,12 +186,13 @@ fn rec_js(r: &Record) -> RecJs {
             path: g.path,
             grantees: match g.grantees {
                 Grantees::Anyone => GranteesJs::Anyone("anyone".into()),
-                Grantees::Users(u) => GranteesJs::Users(u.iter().map(|u| buf(u)).collect()),
+                Grantees::Some(w) => GranteesJs::Some(w.iter().map(WhoJs::from).collect()),
             },
         }),
-        federate: federate.map(|f| FederateJs { peer: buf(&f.peer), url: f.url, types: f.types, paths: f.paths }),
+        peer: peer.map(|p| PeerJs { node: buf(&p.node), url: p.url, types: p.types, paths: p.paths }),
+        claim: r.claim().map(|c| ClaimJs { token_hash: buf(&c.token_hash), user: c.user.map(|u| buf(&u)) }),
         node_url: r.node_url(),
-        owner_user: r.owner_user().map(|u| buf(&u)),
+        owner: r.owner().as_ref().map(WhoJs::from),
     }
 }
 
@@ -218,8 +258,9 @@ struct DraftJs {
 enum DataJs {
     Text(String),
     Grant(GrantJs),
-    Federate(FederateJs),
-    Owner { user: ByteBuf },
+    Peer(PeerJs),
+    Claim(ClaimJs),
+    Owner(WhoJs),
 }
 
 fn record(draft: JsValue, signature: [u8; 64]) -> Result<Record> {
@@ -232,18 +273,15 @@ fn record(draft: JsValue, signature: [u8; 64]) -> Result<Record> {
             grantees: match g.grantees {
                 GranteesJs::Anyone(s) if s == "anyone" => Grantees::Anyone,
                 GranteesJs::Anyone(s) => return Err(err(format!("grantees must be \"anyone\" or a list of IDs, not {s:?}"))),
-                GranteesJs::Users(u) => Grantees::Users(u.iter().map(|u| fixed(u, "grantee")).collect::<Result<_>>()?),
+                GranteesJs::Some(w) => Grantees::Some(w.iter().map(WhoJs::to).collect::<Result<_>>()?),
             },
         }
         .to_cbor(),
-        Some(DataJs::Federate(f)) => {
-            FederateData { peer: fixed(&f.peer, "peer")?, url: f.url, types: f.types, paths: f.paths }.to_cbor()
+        Some(DataJs::Peer(p)) => PeerData { node: fixed(&p.node, "node")?, url: p.url, types: p.types, paths: p.paths }.to_cbor(),
+        Some(DataJs::Claim(c)) => {
+            ClaimData { token_hash: fixed(&c.token_hash, "tokenHash")?, user: c.user.map(|u| fixed(&u, "user")).transpose()? }.to_cbor()
         }
-        Some(DataJs::Owner { user }) => {
-            let mut m = Map::new();
-            m.insert("user", CBOR::to_byte_string(fixed::<32>(&user, "user")?));
-            m.into()
-        }
+        Some(DataJs::Owner(w)) => w.to()?.to_cbor(),
     };
     Ok(Record {
         author: fixed(&d.author, "author")?,
@@ -269,7 +307,7 @@ pub fn encode_record(#[wasm_bindgen(unchecked_param_type = "Draft")] draft: JsVa
     Ok(record(draft, fixed(signature, "signature")?)?.to_bytes())
 }
 
-/// The bytes a user signs to claim `node`, with the token from its claim link.
+/// The bytes a user signs to claim a claim on `node`, with the token from its link.
 #[wasm_bindgen(js_name = claimSignedBytes)]
 pub fn claim_signed_bytes_js(node: &[u8], token: &[u8]) -> Result<Vec<u8>> {
     Ok(claim_signed_bytes(&fixed(node, "node")?, token))

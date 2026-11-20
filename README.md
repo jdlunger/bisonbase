@@ -1,26 +1,14 @@
 # federated crdt
 
-Simple Rust web server (a **node**) that:
- - Serves a React + Tailwind SPA
- - Shares one Rust core (`core/`: record format, signing, checks, IDs and phrases) between the node and the SPA, which loads it as wasm (`wasm/`)
- - Uses SQLite (users, records); no sessions: every write is signed by its author
- - On main page, offers A) a list of all users (if any) and B) "Derive keys: [with new passkey] [with existing passkey]"; once derived, shows "Keys loaded (<word phrase>)" with the same buttons to derive different keys. If deriving fails, tells the user and suggests a new passkey
- - No sign-in: the passkey is only used, client-side, to derive the user's keys
- - Identifies users only by an Ed25519 public key derived from their passkey (via the WebAuthn PRF extension; nobody without the passkey can derive the private key). The passkey flow runs entirely client-side; the node never sees the passkey and has no sign-in flow
- - For human convenience, when listing users, displays both their derived public key (their main ID, in base58: letters and digits only, so a double-click selects it), along with a unique deterministic english phrase, built from the word list in this repo (thank you to https://github.com/first20hours/google-10000-english), e.g. "🦬river_candle".
- - Everything users write is a **record**: a [dCBOR](https://datatracker.ietf.org/doc/draft-mcnally-deterministic-cbor/) (deterministic CBOR) map with `author`, `path`, `version`, `type`, `data`, optional `edits`, and the author's Ed25519 `signature` over the rest (field details in `core/src/lib.rs`). Records are passed around and stored exactly as signed
- - A record is identified by its hash (SHA-256 of its bytes), linked as `/r/<hash>`. Records never change: an edit or delete (`tombstone`) is a new record whose `edits` names the version it replaces. A record and its edits form a chain; the newest version wins, a tombstone anywhere deletes it, and every version stays viewable
- - Paths (e.g. `/posts/dogs`) are only categories: they're not unique and say nothing about ownership. `/posts/dogs` in the app lists everything at or under it
- - Types so far: `post` (text), `tombstone`, and the node types below
- - Each **node** has its own key and keeps its own records under `/node`, which are never federated: `/node/info` (its URL), `/node/owner` (one per owner), `/node/grants` and `/node/federate`. Whoever opens the one-time claim link the node prints becomes its first owner; owners can add and remove owners (not the last one), write anywhere, and edit or delete any record. A **grant** lets a list of users, or anyone, write at or under a path. Authors can edit and delete their own records. A node checks all of this for records written to it; records pushed by peers are taken as they are. Grants can't be revoked yet
- - A **federate** record has the node push new records to a peer node, optionally only some types and paths
- - The signing key (derived from one PRF secret) lives in memory; an opt-in "remember keys on this device" toggle stores the secret in localStorage so it survives reloads
+A full stack web app exploring ideas around identity, sharing, & federation.
 
 ## Run
 
-Needs `rustup target add wasm32-unknown-unknown` and `cargo install wasm-pack` once.
+Install [Node](https://github.com/nvm-sh/nvm#install--update-script) & [Rust](https://rust-lang.org/tools/install/).
 
 ```
+cargo install wasm-pack
+rustup target add wasm32-unknown-unknown
 cargo build
 npm install
 npm run dev
@@ -44,3 +32,21 @@ npm run dev:fresh
  - Applications to build
    - Social network - without API, just plain text & replies?
    - Shared documents
+
+## Model & logic (human written)
+
+ - Each server instance is a node, which holds users & records.
+ - Users and nodes have a public/private key pair, identified by their public key. In URLs and for copying and pasting, keys are base58 encoded. For users, the key is shown as an English_snake_case_phrase, generated from 10k word list:
+   - Users (emoji prefix): 🦬two_words
+   - Nodes: node_word
+ - Each server has 1 or more owners: users identified by a node owner record.
+ - Every record is signed by either a user or the node, and goes at a categorical path.
+   - /node/owner contains all owner records.
+   - /node/grant contains all user authorization grant records (e.g. anyone can create a record under /post)
+   - /node/peer contains all node peer federation records (other server instances to push records to)
+   - /node/claim lists one-time-use token records, which can be pointed to to grant permissions to an as-of-yet-unknown user. The tokens in these records are set by the author and never shared by the server, although the existence of them is known. On claim, they are edited to reference the claiming user.
+   - /node/info has a "node" record listing info (just URL for now).
+   - /node records are not federated / pushed to other servers.
+   - Other paths will be usage & applicaton specific - for now, we have /post (use singular!) for random text posts.
+ - Things can be shared & claimed via link with a "claim" record, which contains a random secret token to be shared. When someone opens the node with that token, the node creates & signs a new version of that claim record. The token is kept hidden, and claim records are never sent to peers.
+   - This process enables a user to become the first owner: when a node first starts up / creates a fresh DB, it creates two records: a claim record, and an owner record pointing at that claim record. The node prints the claim link in the server logs for an administrator to claim and set their user as the owner.

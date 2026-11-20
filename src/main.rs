@@ -8,8 +8,8 @@ use axum::{
 };
 use ed25519_dalek::{Signer, SigningKey};
 use fedcrdt_core::{
-    CBOR, FederateData, GrantData, Hash, Map, NODE_INFO_PATH, NODE_PATH, OWNER_PATH, Pubkey, Record, check_prefix,
-    claim_signed_bytes, decode_id, encode_b58, encode_id, node_phrase, path_within, phrase, verify_sig,
+    CBOR, CLAIM_PATH, ClaimData, GrantData, Hash, Map, NODE_INFO_PATH, NODE_PATH, OWNER_PATH, PeerData, Pubkey, Record,
+    Who, check_prefix, claim_signed_bytes, decode_id, encode_b58, encode_id, node_phrase, path_within, phrase, verify_sig,
 };
 use rusqlite::{Connection, OptionalExtension};
 use serde::Deserialize;
@@ -110,12 +110,10 @@ async fn main() {
             pubkey BLOB PRIMARY KEY,
             secret BLOB NOT NULL -- 32-byte Ed25519 seed
         );
-        -- SHA-256 of the token in the unused claim link, while the node has no owner.
-        CREATE TABLE IF NOT EXISTS claim_tokens (hash BLOB PRIMARY KEY);
-        -- How far each federate record (by hash) has been pushed: every record with seq <= this one.
-        -- An edited federate record starts over.
+        -- How far each peer record (by hash) has been pushed: every record with seq <= this one.
+        -- An edited peer record starts over.
         CREATE TABLE IF NOT EXISTS peer_cursors (
-            federate BLOB PRIMARY KEY,
+            peer BLOB PRIMARY KEY,
             seq INTEGER NOT NULL
         );",
     )
@@ -180,15 +178,31 @@ fn heads_of(db: &Connection, kind: &str) -> Vec<(Hash, Record)> {
     stmt.query_map([kind], |r| Ok((r.get(0)?, parse_record(r.get(1)?)))).unwrap().flatten().collect()
 }
 
-/// This node's owners, from its owner records.
+/// The current version of the live claim chain `root`, and its data.
+fn claim_head(db: &Connection, root: &Hash) -> Option<(Hash, ClaimData)> {
+    let (hash, rec): (Hash, Vec<u8>) = db
+        .query_row("SELECT hash, record FROM heads WHERE root = ?1 AND type = 'claim'", [root], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()
+        .unwrap()?;
+    Some((hash, parse_record(rec).claim()?))
+}
+
+/// Who claimed the claim chain `root`, if anyone has.
+fn claimed_by(db: &Connection, root: &Hash) -> Option<Pubkey> {
+    claim_head(db, root)?.1.user
+}
+
+/// This node's owners, from its owner records: users named directly, or who claimed a claim named.
 fn owners(db: &Connection) -> Vec<Pubkey> {
-    heads_of(db, "owner").iter().filter_map(|(_, r)| r.owner_user()).collect()
+    heads_of(db, "owner").iter().filter_map(|(_, r)| r.owner()?.resolve(|c| claimed_by(db, c))).collect()
 }
 
 /// Whether `author` may write new records at `path`: they're an owner, or a grant covers it.
 fn may_write(db: &Connection, author: &Pubkey, path: &str) -> bool {
     owners(db).contains(author)
-        || heads_of(db, "grant").iter().any(|(_, r)| GrantData::from_cbor(&r.data).is_ok_and(|g| g.covers(author, path)))
+        || heads_of(db, "grant")
+            .iter()
+            .any(|(_, r)| GrantData::from_cbor(&r.data).is_ok_and(|g| g.covers(author, path, |c| claimed_by(db, c))))
 }
 
 /// Stores `rec` if it's valid and new here. Ok(false): this node already has it. `from`: the node that
@@ -239,14 +253,25 @@ impl App {
         r
     }
 
-    /// Writes a record as this node.
-    fn write(&self, db: &Connection, path: &str, kind: &str, data: CBOR, edits: Option<Hash>) {
+    /// Writes a record as this node. Returns its hash.
+    fn write(&self, db: &Connection, path: &str, kind: &str, data: CBOR, edits: Option<Hash>) -> Hash {
         let r = self.sign(db, path, kind, data, edits);
         store(db, &r, None).unwrap();
         self.push.notify_one();
+        r.hash()
     }
 
-    /// Keeps the node record's URL current and, while there's no owner, prints a fresh claim link.
+    /// Writes (or with `edits`, renews) an unclaimed claim with a fresh token. Returns the claim's hash and its link.
+    fn new_claim(&self, db: &Connection, origin: &str, edits: Option<Hash>) -> (Hash, String) {
+        let token: [u8; 32] = random();
+        let data = ClaimData { token_hash: Sha256::digest(token).into(), user: None };
+        let hash = self.write(db, CLAIM_PATH, "claim", data.to_cbor(), edits);
+        (hash, format!("{origin}/claim#{}", encode_b58(&token)))
+    }
+
+    /// Keeps the node record's URL current. On a fresh database, writes a claim and an owner record naming
+    /// it, for whoever claims it first; while that's unclaimed, gives it a new token on each start and
+    /// prints the link (the node only keeps the token's hash).
     fn init(&self, public_url: &str, origin: &str) {
         let db = self.db.lock().unwrap();
         let mut m = Map::new();
@@ -259,11 +284,22 @@ impl App {
         if current.as_ref().is_none_or(|(_, r)| parse_record(r.clone()).data != data) {
             self.write(&db, NODE_INFO_PATH, "node", data, current.map(|c| c.0));
         }
-        if owners(&db).is_empty() {
-            let token: [u8; 32] = random();
-            db.execute("DELETE FROM claim_tokens", []).unwrap();
-            db.execute("INSERT INTO claim_tokens (hash) VALUES (?1)", [Sha256::digest(token).as_slice()]).unwrap();
-            println!("\nThis node has no owner yet. Open this one-time link to claim it:\n  {origin}/claim#{}\n", bs58::encode(token).into_string());
+        let owner_records = heads_of(&db, "owner");
+        let link = if owner_records.is_empty() {
+            let (claim, link) = self.new_claim(&db, origin, None);
+            self.write(&db, OWNER_PATH, "owner", Who::Claim(claim).to_cbor(), None);
+            Some(link)
+        } else {
+            // The node's own unclaimed owner claim, if there is one.
+            owner_records.iter().find_map(|(_, r)| {
+                let Some(Who::Claim(root)) = r.owner() else { return None };
+                let (head, data) = claim_head(&db, &root)?;
+                let author: Pubkey = db.query_row("SELECT author FROM records WHERE hash = ?1", [head], |r| r.get(0)).unwrap();
+                (data.user.is_none() && author == self.pk).then(|| self.new_claim(&db, origin, Some(head)).1)
+            })
+        };
+        if let Some(link) = link {
+            println!("\nThis node has no owner yet. Open this one-time link to claim it:\n  {link}\n");
         }
     }
 
@@ -275,6 +311,9 @@ impl App {
         }
         if rec.kind == "node" {
             return Err("only the node itself writes its node record".into());
+        }
+        if rec.claim().is_some_and(|c| c.user.is_some()) {
+            return Err("only the node fills in who claimed a claim".into());
         }
         let owner = owners(db).contains(&rec.author);
         if rec.is_node_record() && !owner {
@@ -297,6 +336,9 @@ impl App {
         if rec.kind != "tombstone" && rec.kind != prev.kind {
             return Err("an edit can't change a record's type".into());
         }
+        if prev.claim().is_some_and(|c| c.user.is_some()) && rec.kind != "tombstone" {
+            return Err("that claim was already claimed".into());
+        }
         if !owner {
             let original: Option<Pubkey> = db.query_row("SELECT author FROM records WHERE hash = ?1", [root], |r| r.get(0)).optional().unwrap();
             if original != Some(rec.author) {
@@ -315,9 +357,9 @@ impl App {
         Ok(())
     }
 
-    /// Every node this one knows of: itself, and the peers its federate records name.
+    /// Every node this one knows of: itself, and the peers its peer records name.
     fn nodes(&self, db: &Connection) -> HashSet<Pubkey> {
-        let mut keys: HashSet<Pubkey> = peers(db).into_iter().map(|(_, f)| f.peer).collect();
+        let mut keys: HashSet<Pubkey> = peers(db).into_iter().map(|(_, p)| p.node).collect();
         keys.insert(self.pk);
         keys
     }
@@ -456,12 +498,12 @@ async fn node_info(State(app): S) -> Response {
     ([(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")], Json(body)).into_response()
 }
 
-/// IDs (base58) of every node this one knows of: itself, and the peers its federate records name.
+/// IDs (base58) of every node this one knows of: itself, and the peers its peer records name.
 async fn nodes(State(app): S) -> Json<Vec<String>> {
     Json(app.nodes(&app.db.lock().unwrap()).iter().map(encode_id).collect())
 }
 
-/// A claim: the token from the one-time link, and the claiming user's ID and signature over
+/// A claim: the token from a claim link, and the claiming user's ID and signature over
 /// `claim_signed_bytes`, all base58.
 #[derive(Deserialize)]
 struct Claim {
@@ -470,7 +512,8 @@ struct Claim {
     signature: String,
 }
 
-/// Makes the claiming user this node's first owner, with an owner record signed by the node.
+/// Claims the claim whose token this is, for the signing user: the node writes a new version of it
+/// naming them. Answers with the claim's hash (base58: its chain's first record).
 async fn claim(State(app): S, Json(c): Json<Claim>) -> Response {
     let user = match parse_id(&c.user) {
         Ok(u) => u,
@@ -485,15 +528,24 @@ async fn claim(State(app): S, Json(c): Json<Claim>) -> Response {
     if let Err(e) = verify_sig(&user, &claim_signed_bytes(&app.pk, &token), &sig) {
         return err(StatusCode::BAD_REQUEST, format!("claim: {e}"));
     }
+    let token_hash: Hash = Sha256::digest(&token).into();
     let db = app.db.lock().unwrap();
-    if db.execute("DELETE FROM claim_tokens WHERE hash = ?1", [Sha256::digest(&token).as_slice()]).unwrap() == 0 {
-        return err(StatusCode::FORBIDDEN, "This claim link was already used, or isn't for this node.");
+    let mut stmt = db.prepare("SELECT hash, root, record FROM heads WHERE type = 'claim'").unwrap();
+    let found = stmt
+        .query_map([], |r| Ok((r.get::<_, Hash>(0)?, r.get::<_, Hash>(1)?, r.get::<_, Vec<u8>>(2)?)))
+        .unwrap()
+        .flatten()
+        .find_map(|(h, root, b)| Some((h, root, parse_record(b).claim().filter(|c| c.token_hash == token_hash)?)));
+    let Some((head, root, data)) = found else {
+        return err(StatusCode::NOT_FOUND, "This claim link isn't for this node, or its claim was deleted.");
+    };
+    if data.user.is_some() {
+        return err(StatusCode::FORBIDDEN, "This claim link was already used.");
     }
-    let mut m = Map::new();
-    m.insert("user", CBOR::to_byte_string(user));
-    app.write(&db, OWNER_PATH, "owner", m.into(), None);
-    println!("claimed by {} ({})", encode_id(&user), phrase(&user));
-    Json(json!({ "node": encode_id(&app.pk) })).into_response()
+    db.execute("INSERT OR IGNORE INTO users (pubkey) VALUES (?1)", [user]).unwrap();
+    app.write(&db, CLAIM_PATH, "claim", ClaimData { user: Some(user), ..data }.to_cbor(), Some(head));
+    println!("claim {} claimed by {} ({})", encode_b58(&root), encode_id(&user), phrase(&user));
+    Json(json!({ "claim": encode_b58(&root) })).into_response()
 }
 
 /// A CBOR array of stored records (each already dCBOR).
@@ -537,44 +589,44 @@ async fn receive(State(app): S, headers: HeaderMap, body: Bytes) -> Response {
 /// Pushes new records to every peer whenever something is stored, and retries every 10s.
 async fn push_loop(app: Arc<App>) {
     loop {
-        let feds = {
+        let peers = {
             let db = app.db.lock().unwrap();
-            let feds = peers(&db);
-            // Forget how far removed (or edited) federate records got.
-            let live: HashSet<Hash> = feds.iter().map(|f| f.0).collect();
-            let mut stmt = db.prepare("SELECT federate FROM peer_cursors").unwrap();
-            for gone in stmt.query_map([], |r| r.get::<_, Hash>(0)).unwrap().flatten().filter(|f| !live.contains(f)) {
-                db.execute("DELETE FROM peer_cursors WHERE federate = ?1", [gone]).unwrap();
+            let peers = peers(&db);
+            // Forget how far removed (or edited) peer records got.
+            let live: HashSet<Hash> = peers.iter().map(|p| p.0).collect();
+            let mut stmt = db.prepare("SELECT peer FROM peer_cursors").unwrap();
+            for gone in stmt.query_map([], |r| r.get::<_, Hash>(0)).unwrap().flatten().filter(|p| !live.contains(p)) {
+                db.execute("DELETE FROM peer_cursors WHERE peer = ?1", [gone]).unwrap();
             }
-            feds
+            peers
         };
-        for (hash, fed) in feds {
-            if let Err(e) = push_to(&app, hash, &fed).await {
-                eprintln!("push to {} at {}: {e}", node_phrase(&fed.peer), fed.url);
+        for (hash, peer) in peers {
+            if let Err(e) = push_to(&app, hash, &peer).await {
+                eprintln!("push to {} at {}: {e}", node_phrase(&peer.node), peer.url);
             }
         }
         let _ = tokio::time::timeout(Duration::from_secs(10), app.push.notified()).await;
     }
 }
 
-/// This node's live federate records: (hash of the current version, what to push where).
-fn peers(db: &Connection) -> Vec<(Hash, FederateData)> {
-    let mut stmt = db.prepare("SELECT hash, record FROM heads WHERE type = 'federate'").unwrap();
+/// This node's live peer records: (hash of the current version, what to push where).
+fn peers(db: &Connection) -> Vec<(Hash, PeerData)> {
+    let mut stmt = db.prepare("SELECT hash, record FROM heads WHERE type = 'peer'").unwrap();
     stmt.query_map([], |r| Ok((r.get::<_, Hash>(0)?, r.get::<_, Vec<u8>>(1)?)))
         .unwrap()
         .flatten()
-        .filter_map(|(h, b)| Some((h, FederateData::from_cbor(&parse_record(b).data).ok()?)))
+        .filter_map(|(h, b)| Some((h, PeerData::from_cbor(&parse_record(b).data).ok()?)))
         .collect()
 }
 
-/// Pushes everything the federate record `fed_hash` hasn't sent yet, in batches, moving its cursor
+/// Pushes everything the peer record `peer_hash` hasn't sent yet, in batches, moving its cursor
 /// after each one the peer accepts. Leaves out node records, and records the peer pushed here.
-async fn push_to(app: &App, fed_hash: Hash, fed: &FederateData) -> Result<(), reqwest::Error> {
+async fn push_to(app: &App, peer_hash: Hash, peer: &PeerData) -> Result<(), reqwest::Error> {
     loop {
         let (batch, last) = {
             let db = app.db.lock().unwrap();
             let cursor: i64 =
-                db.query_row("SELECT seq FROM peer_cursors WHERE federate = ?1", [fed_hash], |r| r.get(0)).optional().unwrap().unwrap_or(0);
+                db.query_row("SELECT seq FROM peer_cursors WHERE peer = ?1", [peer_hash], |r| r.get(0)).optional().unwrap().unwrap_or(0);
             let mut stmt =
                 db.prepare("SELECT seq, path, type, received_from, record FROM records WHERE seq > ?1 ORDER BY seq LIMIT ?2").unwrap();
             let rows: Vec<(i64, String, String, Option<Pubkey>, Vec<u8>)> = stmt
@@ -585,14 +637,14 @@ async fn push_to(app: &App, fed_hash: Hash, fed: &FederateData) -> Result<(), re
             let Some(last) = rows.last().map(|r| r.0) else { return Ok(()) };
             let batch: Vec<Vec<u8>> = rows
                 .into_iter()
-                .filter(|(_, path, kind, from, _)| *from != Some(fed.peer) && !path_within(path, NODE_PATH) && fed.wants(path, kind))
+                .filter(|(_, path, kind, from, _)| *from != Some(peer.node) && !path_within(path, NODE_PATH) && peer.wants(path, kind))
                 .map(|r| r.4)
                 .collect();
             (batch, last)
         };
         if !batch.is_empty() {
             app.http
-                .post(format!("{}/receive", fed.url.trim_end_matches('/')))
+                .post(format!("{}/receive", peer.url.trim_end_matches('/')))
                 .header(header::CONTENT_TYPE, "application/cbor")
                 .header("x-from", encode_id(&app.pk))
                 .body(cbor_array(&batch))
@@ -604,7 +656,7 @@ async fn push_to(app: &App, fed_hash: Hash, fed: &FederateData) -> Result<(), re
         app.db
             .lock()
             .unwrap()
-            .execute("INSERT OR REPLACE INTO peer_cursors (federate, seq) VALUES (?1, ?2)", (fed_hash, last))
+            .execute("INSERT OR REPLACE INTO peer_cursors (peer, seq) VALUES (?1, ?2)", (peer_hash, last))
             .unwrap();
     }
 }

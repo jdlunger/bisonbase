@@ -3,6 +3,7 @@
 import {
   type Draft,
   type Rec,
+  type Who,
   b58,
   checkPath,
   checkPrefix,
@@ -63,7 +64,18 @@ export async function loadNode() {
   const [n, list] = await Promise.all([getNode(), api<string[]>("/api/nodes")]);
   thisNode = n;
   for (const s of list) nodes.add(s);
+  await loadClaims();
   return n;
+}
+
+/** Who claimed each claim on this node (by its hash, base58): their ID, or null while unclaimed. */
+const claims = new Map<string, string | null>();
+
+/** Loads who claimed which claim, for showing owner and grant records that name claims. */
+async function loadClaims() {
+  const list = await getPosts({ type: "claim", prefix: CLAIM_PATH });
+  claims.clear();
+  for (const c of list) if (c.verified && c.claim) claims.set(c.root, c.claim.claimedBy?.pubkey ?? null);
 }
 
 /** Whether we own this node (as of the last `loadNode`). */
@@ -319,6 +331,10 @@ export function forgetKeys() {
 // hash. The node stores and returns records exactly as signed; the wasm core decodes and checks them
 // here in the browser, so nothing depends on trusting the node.
 
+/** A user as an owner or grant record names them: `user` directly, or via `claim` (a claim's hash,
+ * base58), in which case `user` is whoever claimed it, or null while it's unclaimed. */
+export type Party = { user: User | null; claim?: string };
+
 /** A record as shown: its decoded IDs, its chain, and whether it checks out. */
 export type Post = {
   rec: Rec;
@@ -336,13 +352,15 @@ export type Post = {
   /** The text, if it's a plain post. */
   text: string | null;
   /** For grant records: who may write, and where. */
-  grant?: { path: string; grantees: User[] | "anyone" };
-  /** For federate records: which node gets pushed what. `types` and `paths` are null for all. */
-  federate?: { peer: User; url: string; types: string[] | null; paths: string[] | null };
+  grant?: { path: string; grantees: Party[] | "anyone" };
+  /** For peer records: which node gets pushed what. `types` and `paths` are null for all. */
+  peer?: { node: User; url: string; types: string[] | null; paths: string[] | null };
+  /** For claim records: who claimed it, if anyone has yet. */
+  claim?: { claimedBy: User | null };
   /** For a node record: its URL. */
   nodeUrl?: string;
   /** For an owner record: who. */
-  ownerUser?: User;
+  owner?: Party;
 };
 
 const bytesEqual = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((x, i) => x === b[i]);
@@ -367,14 +385,22 @@ const toUser = (pk: Uint8Array): User => {
   return { pubkey, phrase: userPhrase(pubkey), node: nodes.has(pubkey) };
 };
 
+const toParty = (w: Who): Party => {
+  if ("user" in w) return { user: toUser(w.user) };
+  const claim = b58(w.claim);
+  const user = claims.get(claim);
+  return { user: user ? toUser(decodeId(user)!) : null, claim };
+};
+
 export function viewPost(rec: Rec, chain?: { root: Uint8Array; by?: Uint8Array; versions: number }): Post {
-  const f = rec.federate;
+  const p = rec.peer;
   const g = rec.grant;
   return {
-    grant: g && { path: g.path, grantees: g.grantees === "anyone" ? "anyone" : g.grantees.map(toUser) },
-    federate: f && { peer: toUser(f.peer), url: f.url, types: f.types ?? null, paths: f.paths ?? null },
+    grant: g && { path: g.path, grantees: g.grantees === "anyone" ? "anyone" : g.grantees.map(toParty) },
+    peer: p && { node: toUser(p.node), url: p.url, types: p.types ?? null, paths: p.paths ?? null },
+    claim: rec.claim && { claimedBy: rec.claim.user ? toUser(rec.claim.user) : null },
     nodeUrl: rec.nodeUrl,
-    ownerUser: rec.ownerUser && toUser(rec.ownerUser),
+    owner: rec.owner && toParty(rec.owner),
     rec,
     hash: b58(rec.hash),
     root: b58(chain?.root ?? rec.hash),
@@ -427,44 +453,92 @@ async function putRec(d: Draft) {
 /** A version newer than both the clock and `prev`, so quick successive edits still go through. */
 const nextVersion = (prev = 0) => Math.max(Date.now(), prev + 1);
 
-// ---- grants: who may write where ----
+// ---- grants, owners and claims ----
 //
-// Owners may write anywhere. They let others write at or under a path with grant records, at /node/grants.
+// Owners may write anywhere. They let others write at or under a path with grant records. Owner and grant
+// records name users by ID, or name a claim: a one-time link for someone not known yet. All of these
+// live under /node.
+
+export const OWNER_PATH = "/node/owner";
+export const GRANT_PATH = "/node/grant";
+export const PEER_PATH = "/node/peer";
+export const CLAIM_PATH = "/node/claim";
+
+/** Whether a grant's grantees include `pubkey` (or anyone, if `anyone`). */
+export const grantNames = (p: Post, pubkey: string, anyone = true) =>
+  p.verified && !!p.grant && (p.grant.grantees === "anyone" ? anyone : p.grant.grantees.some((g) => g.user?.pubkey === pubkey));
 
 /** Where we may write, from the grants that name us (or anyone). */
 export async function myGrants(): Promise<string[]> {
   if (!keys) return [];
   const me = keys.pubkey;
-  return (await getPosts({ type: "grant", prefix: "/node/grants" }))
-    .filter((p) => p.verified && p.grant && (p.grant.grantees === "anyone" || p.grant.grantees.some((u) => u.pubkey === me)))
-    .map((p) => p.grant!.path);
+  return (await getPosts({ type: "grant", prefix: GRANT_PATH })).filter((p) => grantNames(p, me)).map((p) => p.grant!.path);
 }
 
-/** Parses IDs (base58) separated by spaces, commas or new lines, or "anyone". */
-function parseGrantees(s: string): Uint8Array[] | "anyone" {
-  if (s.trim().toLowerCase() === "anyone") return "anyone";
-  const ids = s.split(/[\s,]+/).filter(Boolean);
-  if (!ids.length) throw new Error("Say who: IDs, or \"anyone\".");
-  return ids.map((id) => {
-    const pk = decodeId(id);
-    if (!pk) throw new Error(`${id} isn't an ID (32 bytes of base58).`);
-    return pk;
-  });
+/** Who a form names: a user (ID), a new claim link, or (for grants) anyone. */
+export type Choice = { kind: "user"; id: string } | { kind: "claim" } | { kind: "anyone" };
+
+/** A new claim, made by us (an owner), to name in an owner or grant record. */
+async function newClaim() {
+  const token = random(32);
+  const tokenHash = new Uint8Array(await crypto.subtle.digest("SHA-256", token));
+  const hash = await putRec({ author: keys!.pk, path: CLAIM_PATH, version: nextVersion(), type: "claim", data: { tokenHash } });
+  return { who: { claim: unb58(hash)! } as Who, link: `${location.origin}/claim#${b58(token)}` };
 }
 
-/** Lets `grantees` (IDs, or "anyone") write at or under `path` ("/" for everywhere). Owners only. Returns the grant's hash. */
-export async function makeGrant(grantees: string, path: string) {
+/** The record data naming `c`, and the claim link, if it made one. */
+async function choose(c: Choice): Promise<{ who: Who; link?: string }> {
+  if (c.kind === "claim") return newClaim();
+  if (c.kind === "anyone") throw new Error("Only a grant can name anyone.");
+  const pk = decodeId(c.id.trim());
+  if (!pk) throw new Error("That isn't an ID (32 bytes of base58).");
+  return { who: { user: pk } };
+}
+
+/** A record we wrote (its hash), and the claim link it names, if it made one. */
+export type Written = { hash: string; link?: string };
+
+/** Lets `c` write at or under `path` ("/" for everywhere). Owners only. */
+export async function makeGrant(c: Choice, path: string): Promise<Written> {
   if (!keys) throw new Error("Sign in first.");
-  const data = { path: normalizePath(path, true), grantees: parseGrantees(grantees) };
-  return putRec({ author: keys.pk, path: "/node/grants", version: nextVersion(), type: "grant", data });
+  path = normalizePath(path, true);
+  const { who, link } = c.kind === "anyone" ? { who: null } : await choose(c);
+  const data = { path, grantees: who ? [who] : ("anyone" as const) };
+  return { hash: await putRec({ author: keys.pk, path: GRANT_PATH, version: nextVersion(), type: "grant", data }), link };
 }
 
-/** Makes `user` (an ID) an owner of this node. Owners only. */
-export async function addOwner(user: string) {
+/** Makes `c` an owner of this node. Owners only. */
+export async function addOwner(c: Choice): Promise<Written> {
   if (!keys) throw new Error("Sign in first.");
-  const u = decodeId(user.trim());
-  if (!u) throw new Error("That isn't an ID (32 bytes of base58).");
-  return putRec({ author: keys.pk, path: "/node/owner", version: nextVersion(), type: "owner", data: { user: u } });
+  const { who, link } = await choose(c);
+  return { hash: await putRec({ author: keys.pk, path: OWNER_PATH, version: nextVersion(), type: "owner", data: who }), link };
+}
+
+/** What a claim link's token is for: its claim (null if this node has none with that token), and the
+ * owner and grant records that name it. */
+export async function findClaim(token: string) {
+  const t = unb58(token);
+  if (!t) throw new Error("This claim link is broken: its token isn't base58.");
+  const tokenHash = new Uint8Array(await crypto.subtle.digest("SHA-256", t as Uint8Array<ArrayBuffer>));
+  const records = await getPosts({ prefix: "/node" });
+  const claim = records.find((p) => p.verified && p.rec.claim && bytesEqual(p.rec.claim.tokenHash, tokenHash)) ?? null;
+  const names = (w?: Party) => !!claim && w?.claim === claim.root;
+  return {
+    claim,
+    owner: records.some((p) => p.verified && names(p.owner)),
+    grants: records.filter((p) => p.verified && p.grant?.grantees !== "anyone" && p.grant?.grantees.some(names)).map((p) => p.grant!.path),
+  };
+}
+
+/** Claims the claim with this token (from its link) as us. */
+export async function redeemClaim(token: string) {
+  if (!keys) throw new Error("Sign in first.");
+  const node = await getNode();
+  const t = unb58(token);
+  if (!t) throw new Error("This claim link is broken: its token isn't base58.");
+  const signature = await sign(claimSignedBytes(decodeId(node.pubkey)!, t));
+  await api("/api/claim", { token, user: keys.pubkey, signature: b58(signature) });
+  await loadNode();
 }
 
 // ---- writing posts ----
@@ -505,45 +579,32 @@ export function forgedPost(): Post {
   return viewPost(decodeRecord(encodeRecord(draft, new Uint8Array(64))));
 }
 
-// ---- this node, and federation ----
+// ---- federation ----
 //
-// Each node has its own key. Its owner claims it once with a one-time link (printed by the node); owners
-// may then add other owners, grants, and "federate" records naming peer nodes to push records to. All
-// of those live under /node and are never federated. See core/src/lib.rs.
-
-/** Claims this node as its first owner (us), with the token from its claim link. Returns the node's ID. */
-export async function claimNode(token: string) {
-  if (!keys) throw new Error("Sign in first.");
-  const node = await getNode();
-  const t = unb58(token);
-  if (!t) throw new Error("This claim link is broken: its token isn't base58.");
-  const signature = await sign(claimSignedBytes(decodeId(node.pubkey)!, t));
-  await api("/api/claim", { token, user: keys.pubkey, signature: b58(signature) });
-  await loadNode();
-  return node.pubkey;
-}
+// Owners may add "peer" records naming other nodes for this one to push records to. Like everything
+// under /node, they're never federated themselves. See core/src/lib.rs.
 
 /** Has this node push records to the node at `url`: those of the given types (comma- or space-separated;
  * none for all) at or under the given paths (one per line; none for all). Owners only. Returns the record's hash. */
-export async function putFederate(url: string, types: string, paths: string) {
+export async function putPeer(url: string, types: string, paths: string) {
   if (!keys) throw new Error("Sign in first.");
   url = url.trim().replace(/\/+$/, "");
   if (!/^https?:\/\/\S+$/.test(url)) throw new Error("Enter the other node's http:// or https:// URL.");
-  const peer = await getNode(url).then(
+  const node = await getNode(url).then(
     (s) => s.pubkey,
     (e) => {
       throw new Error(`Couldn't reach a node at ${url}: ${e.message}`);
     },
   );
-  if (peer === thisNode?.pubkey) throw new Error("That's this node.");
+  if (node === thisNode?.pubkey) throw new Error("That's this node.");
   const t = types.split(/[\s,]+/).filter(Boolean);
   const p = paths.split("\n").map((s) => s.trim()).filter(Boolean).map((s) => normalizePath(s, true));
-  nodes.add(peer);
+  nodes.add(node);
   return putRec({
     author: keys.pk,
-    path: "/node/federate",
+    path: PEER_PATH,
     version: nextVersion(),
-    type: "federate",
-    data: { peer: decodeId(peer)!, url, ...(t.length && { types: t }), ...(p.length && { paths: p }) },
+    type: "peer",
+    data: { node: decodeId(node)!, url, ...(t.length && { types: t }), ...(p.length && { paths: p }) },
   });
 }

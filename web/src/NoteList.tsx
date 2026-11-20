@@ -1,5 +1,5 @@
 import { createContext, useContext, useState } from "react";
-import { type Post, type User, canEdit, deletePost, pathWithin, putPost } from "./api.ts";
+import { type Party, type Post, type User, canEdit, deletePost, pathWithin, putPost } from "./api.ts";
 import { Link, idPath, pathPath, recordPath } from "./router.tsx";
 import { type Run, badge, danger, fmtTime, input, link, hl, primary, secondary, textarea } from "./ui.ts";
 
@@ -73,7 +73,7 @@ const typeColors = [
   "bg-orange-50 text-orange-700 ring-orange-200",
   "bg-lime-50 text-lime-700 ring-lime-200",
 ];
-const knownTypes: Record<string, number> = { post: 0, grant: 1, tombstone: 2, node: 6, owner: 6, federate: 6 };
+const knownTypes: Record<string, number> = { post: 0, grant: 1, tombstone: 2, node: 6, owner: 6, peer: 6, claim: 6 };
 
 function typeColor(type: string) {
   if (type in knownTypes) return typeColors[knownTypes[type]];
@@ -109,6 +109,26 @@ export function PathLinks({ path, className = "" }: { path: string; className?: 
   );
 }
 
+/** Who an owner or grant record names: a user, or a claim link (and who claimed it, once someone has). */
+function PartyLink({ party, me }: { party: Party; me: User | null }) {
+  const user = party.user && <UserLink user={party.user} me={me} className="font-semibold" />;
+  if (!party.claim) return user;
+  const claim = (
+    <Link href={recordPath(party.claim)} className={`font-mono text-sm ${link}`}>
+      🎟 #{party.claim.slice(0, 8)}
+    </Link>
+  );
+  return user ? (
+    <>
+      {user} <span className="text-sm text-gray-500">(via {claim})</span>
+    </>
+  ) : (
+    <>
+      <span className="italic">whoever claims</span> {claim}
+    </>
+  );
+}
+
 /** What a record holds, as shown. */
 function Content({ post: n, me }: { post: Post; me: User | null }) {
   if (n.grant) {
@@ -118,10 +138,10 @@ function Content({ post: n, me }: { post: Post; me: User | null }) {
         {n.grant.grantees === "anyone" ? (
           <b>anyone</b>
         ) : (
-          n.grant.grantees.map((u, i) => (
-            <span key={u.pubkey}>
+          n.grant.grantees.map((g, i) => (
+            <span key={g.claim ?? g.user?.pubkey}>
               {i > 0 && ", "}
-              <UserLink user={u} me={me} className="font-semibold" />
+              <PartyLink party={g} me={me} />
             </span>
           ))
         )}{" "}
@@ -129,14 +149,28 @@ function Content({ post: n, me }: { post: Post; me: User | null }) {
       </p>
     );
   }
-  if (n.federate) {
+  if (n.peer) {
     return (
       <p className="mt-1">
-        ↔ Pushes to <UserLink user={n.federate.peer} me={me} className="font-semibold" /> at{" "}
-        <code className="font-mono text-sm">{n.federate.url}</code>
+        ↔ Pushes to <UserLink user={n.peer.node} me={me} className="font-semibold" /> at{" "}
+        <code className="font-mono text-sm">{n.peer.url}</code>
         <span className="block text-sm text-gray-600">
-          Types: {n.federate.types?.join(", ") ?? "all"} · Paths: <code className="font-mono">{n.federate.paths?.join(" ") ?? "all"}</code>
+          Types: {n.peer.types?.join(", ") ?? "all"} · Paths: <code className="font-mono">{n.peer.paths?.join(" ") ?? "all"}</code>
         </span>
+      </p>
+    );
+  }
+  if (n.claim) {
+    return (
+      <p className="mt-1">
+        🎟 A claim link:{" "}
+        {n.claim.claimedBy ? (
+          <>
+            claimed by <UserLink user={n.claim.claimedBy} me={me} className="font-semibold" />
+          </>
+        ) : (
+          <span className="italic">not claimed yet</span>
+        )}
       </p>
     );
   }
@@ -147,10 +181,10 @@ function Content({ post: n, me }: { post: Post; me: User | null }) {
       </p>
     );
   }
-  if (n.ownerUser) {
+  if (n.owner) {
     return (
       <p className="mt-1">
-        👑 Owned by <UserLink user={n.ownerUser} me={me} className="font-semibold" />
+        👑 Owned by <PartyLink party={n.owner} me={me} />
       </p>
     );
   }

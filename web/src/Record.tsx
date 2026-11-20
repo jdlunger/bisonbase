@@ -1,4 +1,17 @@
-import { type Chain, type NodeInfo, type Post, type User, forgedPost, getChain, getPosts, isHash, isPubkey, normalizePath } from "./api.ts";
+import {
+  type Chain,
+  type NodeInfo,
+  type Post,
+  type User,
+  GRANT_PATH,
+  forgedPost,
+  getChain,
+  getPosts,
+  grantNames,
+  isHash,
+  isPubkey,
+  normalizePath,
+} from "./api.ts";
 import { Identity, NodeAdmin } from "./Identity.tsx";
 import { NewHere, PathLinks, PostItem, Subtree } from "./NoteList.tsx";
 import { Link } from "./router.tsx";
@@ -97,9 +110,8 @@ export function UserPage({ pubkey, node, me, busy, run, tick }: { pubkey: string
   const { data, error } = useLoad<UserData>(
     valid
       ? async () => {
-          const [grants, written] = await Promise.all([getPosts({ type: "grant", prefix: "/node/grants" }), getPosts({ author: pubkey })]);
-          const named = grants.filter((g) => g.verified && g.grant?.grantees !== "anyone" && g.grant?.grantees.some((u) => u.pubkey === pubkey));
-          return { grants: named, written };
+          const [grants, written] = await Promise.all([getPosts({ type: "grant", prefix: GRANT_PATH }), getPosts({ author: pubkey })]);
+          return { grants: grants.filter((g) => grantNames(g, pubkey, false)), written };
         }
       : null,
     [pubkey],
