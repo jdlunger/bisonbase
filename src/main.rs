@@ -97,7 +97,10 @@ type S = State<Arc<App>>;
 
 #[tokio::main]
 async fn main() {
-    let db_path = std::env::var("DB").unwrap_or("users.db".into());
+    // The database and certificates live next to the binary. `DB` names another database file (relative to the
+    // binary), for running several nodes from one binary in dev and tests.
+    let dir = std::env::current_exe().unwrap().parent().unwrap().to_path_buf();
+    let db_path = dir.join(std::env::var("DB").unwrap_or("bb.db".into())).to_string_lossy().into_owned();
     // `--drop-db` deletes the database and exits; it doesn't start the node, so that dev-mode
     // restarts (which re-run the same command) can't wipe it again. See `npm run dev:fresh`.
     if std::env::args().skip(1).any(|a| a == "--drop-db") {
@@ -156,7 +159,7 @@ async fn main() {
 
     println!("listening {public_url}");
     match domain {
-        Some(domain) => serve_https(router, domain).await,
+        Some(domain) => serve_https(router, domain, dir.join("certs")).await,
         None => {
             let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await.unwrap();
             axum::serve(listener, router).await.unwrap();
@@ -165,15 +168,13 @@ async fn main() {
 }
 
 /// Serves HTTPS for `domain` on port 443, getting and renewing its certificate from Let's Encrypt (through
-/// TLS-ALPN-01, on that same port), and redirects port 80 to it. Certificates are kept in `CERTS` (default
-/// `certs`), so restarts don't ask for new ones. `ACME_STAGING=1` uses Let's Encrypt's staging directory,
-/// whose certificates browsers don't trust but whose rate limits are loose: for trying a setup out.
-/// `ACME_EMAIL`, if set, is given to Let's Encrypt as a contact.
-async fn serve_https(router: Router, domain: String) {
+/// TLS-ALPN-01, on that same port), and redirects port 80 to it. Certificates are kept in `certs`, so restarts
+/// don't ask for new ones. `ACME_STAGING=1` uses Let's Encrypt's staging directory, whose certificates browsers
+/// don't trust but whose rate limits are loose: for trying a setup out.
+async fn serve_https(router: Router, domain: String, certs: std::path::PathBuf) {
     use tokio_stream::StreamExt;
     let mut acme = rustls_acme::AcmeConfig::new([domain.clone()])
-        .contact(std::env::var("ACME_EMAIL").ok().map(|e| format!("mailto:{e}")))
-        .cache(rustls_acme::caches::DirCache::new(std::env::var("CERTS").unwrap_or("certs".into())))
+        .cache(rustls_acme::caches::DirCache::new(certs))
         .directory_lets_encrypt(std::env::var("ACME_STAGING").is_err())
         .state();
     let acceptor = acme.axum_acceptor(acme.default_rustls_config());

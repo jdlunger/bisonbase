@@ -12,43 +12,27 @@ rustup target add wasm32-unknown-unknown
 cargo build
 npm install
 npm run dev
+npm run dev:fresh # drop db
 ```
-
-When modifying schema, to drop DB on each run:
-
-```
-npm run dev:fresh
-```
-
-Tests: `cargo test` (core and node), and `npm run test:client` (the client library against a real node).
 
 ## Deploy
-
-The node is a single binary with the web app compiled in, that serves HTTPS itself with a certificate from Let's
-Encrypt. Build it (the web app must be built first, which these scripts do):
-
-```
-npm run build:release      # for this machine → target/release/fedcrdt
-npm run build:linux-x64    # static Linux binaries → target/<target>/release/fedcrdt
-npm run build:linux-arm64
-```
-
-The Linux builds cross-compile from anywhere, with [Zig](https://ziglang.org/download/) (or `pip install ziglang`) and:
 
 ```
 cargo install cargo-zigbuild
 rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+npm run build:release
+npm run build:linux-arm64
 ```
 
 On the server, point the domain's DNS at it, open ports 80 and 443, and run:
 
 ```
-DOMAIN=example.com DB=/var/lib/bisonbase/users.db CERTS=/var/lib/bisonbase/certs ./fedcrdt
+DOMAIN=example.com ./fedcrdt
 ```
 
-It serves HTTPS on 443 and redirects 80 to it. The first start prints the link to claim the node. `ACME_STAGING=1`
-uses Let's Encrypt's staging certificates (untrusted, but no rate limits) for trying a setup out; `ACME_EMAIL` gives
-them a contact. Binding 80 and 443 as a non-root user needs `AmbientCapabilities=CAP_NET_BIND_SERVICE` (systemd) or
+It serves HTTPS on 443 and redirects 80 to it. The first start prints the link to claim the node. The database
+(`bb.db`) and certificates (`certs/`) are kept next to the binary. `ACME_STAGING=1` uses Let's Encrypt's staging
+certificates (untrusted, but no rate limits) for trying a setup out. Binding 80 and 443 as a non-root user needs `AmbientCapabilities=CAP_NET_BIND_SERVICE` (systemd) or
 `setcap cap_net_bind_service=+ep fedcrdt`. Back up the database: it holds the node's key, not only its records.
 
 Without `DOMAIN`, it serves plain HTTP on `PORT` (default 8080), for running behind another proxy (set `PUBLIC_URL`).
@@ -69,6 +53,7 @@ Any app can keep its data on a node, as records of its own types (namespaced, e.
  - Applications to build
    - Social network - without API, just plain text & replies?
    - Shared documents
+   - Add apps by dropping static html/assets into a folder next to server binary
 
 ## Model & logic (human written)
 
