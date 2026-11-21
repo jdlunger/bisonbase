@@ -3,11 +3,13 @@ import {
   type NodeInfo,
   type Passkey,
   type RecentPasskey,
-  type DocKind,
   type User,
   DOC_PATH,
+  SCHEMAS,
   amOwner,
   createDoc,
+  docLabel,
+  ensureEncKey,
   deriveFromExistingPasskey,
   findClaim,
   deriveFromNewPasskey,
@@ -28,7 +30,10 @@ import {
   userPhrase,
 } from "./api.ts";
 import { Compose, type Draft, NoteEditor } from "./NoteList.tsx";
+import { ConnectPage } from "./Connect.tsx";
 import { DocPage } from "./Doc.tsx";
+import { kvSet } from "./store.ts";
+import { unb58 } from "../../client/src/index.ts";
 import { PathPage, RecordPage, UserPage } from "./Record.tsx";
 import { Link, docPath, idPath, navigate, recordPath, useRoute } from "./router.tsx";
 import { type Run, link, hl, primary, secondary, useLoad } from "./ui.ts";
@@ -77,6 +82,8 @@ function Shell({ initialError }: { initialError: string | null }) {
     setPasskey(current);
     setRecent(others.map((p) => ({ ...p, phrase: userPhrase(p.pubkey) })));
     if (!m) setDraft(null);
+    // So others can share encrypted docs with us; quietly skipped where this node doesn't let us.
+    else ensureEncKey();
   }, []);
 
   useEffect(() => {
@@ -107,7 +114,7 @@ function Shell({ initialError }: { initialError: string | null }) {
   const newPost = () => open(here && canWrite(here) ? here : owner || !grants.length ? "/post" : grants[0]);
   // A new doc goes where we're looking too, if we may write there; else under /doc.
   const docHere = here && pathWithin(here, DOC_PATH) && canWrite(here) ? here : canWrite(DOC_PATH) ? DOC_PATH : null;
-  const newDoc = (kind: DocKind) => run(async () => navigate(docPath(await createDoc(kind, docHere!))));
+  const newDoc = (schema: string, encrypted = false) => run(async () => navigate(docPath(await createDoc(schema, docHere!, encrypted))));
 
   return (
     <Compose.Provider value={{ canWrite, open, writable: owner ? ["/"] : grants }}>
@@ -126,14 +133,22 @@ function Shell({ initialError }: { initialError: string | null }) {
               </span>
             )}
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center justify-end gap-2 *:whitespace-nowrap">
             {me && docHere && (
               <>
-                <button className={secondary} disabled={busy} onClick={newDoc("list")}>
+                <button className={secondary} disabled={busy} onClick={newDoc(SCHEMAS.list)}>
                   + New list
                 </button>
-                <button className={secondary} disabled={busy} onClick={newDoc("text")}>
+                <button className={secondary} disabled={busy} onClick={newDoc(SCHEMAS.markdown)}>
                   + New doc
+                </button>
+                <button
+                  className={secondary}
+                  disabled={busy}
+                  onClick={newDoc(SCHEMAS.markdown, true)}
+                  title="A doc only its editors can read: the node only gets ciphertext"
+                >
+                  + 🔒 Doc
                 </button>
               </>
             )}
@@ -168,6 +183,8 @@ function Shell({ initialError }: { initialError: string | null }) {
         <div className="mt-6">
           {route.page === "claim" ? (
             <Claim me={me} busy={busy} run={run} tick={tick} />
+          ) : route.page === "connect" ? (
+            <ConnectPage me={me} busy={busy} run={run} />
           ) : route.page === "user" ? (
             <UserPage pubkey={route.pubkey} node={node} me={me} busy={busy} run={run} tick={tick} />
           ) : route.page === "doc" ? (
@@ -184,9 +201,10 @@ function Shell({ initialError }: { initialError: string | null }) {
 }
 
 /** /claim#<token>: a claim link. Shows what it grants (from the owner and grant records naming its claim),
- * and claims it for whoever's signed in. */
+ * and claims it for whoever's signed in. An invite to an encrypted doc is /claim#<token>.<the doc's key>:
+ * claiming it keeps the key on this device, until the doc's author seals it to us. */
 function Claim({ me, busy, run, tick }: { me: User | null; busy: boolean; run: Run; tick: number }) {
-  const token = location.hash.slice(1);
+  const [token, docKey] = location.hash.slice(1).split(".");
   const { data, error } = useLoad(token ? () => findClaim(token) : null, [token], tick);
   const box = (children: React.ReactNode) => (
     <section className="space-y-3">
@@ -223,7 +241,8 @@ function Claim({ me, busy, run, tick }: { me: User | null; busy: boolean; run: R
         ))}
         {docs.map((d) => (
           <li key={d.root}>
-            {d.doc!.kind === "list" ? "🛒 Editing the list" : "📄 Editing the doc"}{" "}
+            {docLabel(d.doc!.schema).icon} Editing the {d.doc!.encrypted && "🔒 encrypted "}
+            {docLabel(d.doc!.schema).noun}{" "}
             <Link href={docPath(d.root)} className={`font-semibold ${link}`}>
               {d.doc!.title || "Untitled"}
             </Link>
@@ -237,6 +256,8 @@ function Claim({ me, busy, run, tick }: { me: User | null; busy: boolean; run: R
           disabled={busy}
           onClick={run(async () => {
             await redeemClaim(token);
+            const key = docKey && unb58(docKey);
+            if (key?.length === 32) for (const d of docs) if (d.doc!.encrypted) await kvSet(`dockey:${d.root}`, key);
             history.replaceState(null, "", location.pathname); // the token is spent
             navigate(docs.length === 1 && !owner && !grants.length ? docPath(docs[0].root) : idPath(me.pubkey));
           })}
@@ -304,6 +325,9 @@ function AuthMenu({ me, passkey, recent, busy, run }: { me: User | null; passkey
                   forever. Signing out removes it.
                 </p>
               )}
+              <Link href="/connect" className={`mt-2 block text-sm ${link}`} onClick={() => setOpenMenu(false)}>
+                🔌 Connected apps
+              </Link>
               <button className={`${secondary} mt-2 w-full`} disabled={busy} onClick={act(forgetKeys)}>
                 Sign out
               </button>

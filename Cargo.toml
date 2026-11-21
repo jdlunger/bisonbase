@@ -21,6 +21,7 @@ serde_json = "1.0.154"
 sha2 = "0.11.1"
 tokio = { version = "1.54.1", features = ["full"] }
 tokio-stream = "0.1.19"
+tower-http = { version = "0.6", features = ["cors"] }
 
 # For the web client's wasm (see `npm run wasm`): small over fast.
 [profile.wasm]

@@ -22,7 +22,7 @@ export function navigate(to: string) {
 }
 
 // Routes: /u/<ID> a user's page, /r/<hash> a record (and its edits), /d/<hash> a shared doc, /claim a
-// claim link, and any other path the records at or under that path.
+// claim link, /connect an app asking to sign for us, and any other path the records at or under that path.
 
 /** A user's page. */
 export const idPath = (pubkey: string) => `/u/${pubkey}`;
@@ -41,6 +41,7 @@ export type Route =
   | { page: "record"; hash: string }
   | { page: "doc"; hash: string }
   | { page: "claim" }
+  | { page: "connect" }
   | { page: "path"; path: string };
 
 export function useRoute(): Route {
@@ -50,6 +51,7 @@ export function useRoute(): Route {
   if ((m = p.match(/^\/r\/([^/]+)\/?$/))) return { page: "record", hash: decodeURIComponent(m[1]) };
   if ((m = p.match(/^\/d\/([^/]+)\/?$/))) return { page: "doc", hash: decodeURIComponent(m[1]) };
   if (p === "/claim") return { page: "claim" };
+  if (p === "/connect") return { page: "connect" };
   return { page: "path", path: p.replace(/\/+$/, "").split("/").map(decodeURIComponent).join("/") || "/" };
 }
 

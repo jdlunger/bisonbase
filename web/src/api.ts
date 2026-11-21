@@ -1,29 +1,42 @@
-// Records, IDs and paths come from core/src/lib.rs, compiled to wasm (see wasm/src/lib.rs); main.tsx
-// loads it before anything here runs.
+// This app's side of things: passkeys and keys, and what its pages show and write. Records, nodes, docs and
+// encryption come from the client library (client/src), which any app can use; main.tsx loads its wasm
+// core before anything here runs.
 import {
-  type DocKind,
+  type ConnectRequest,
   type Draft,
+  type EncKeys,
+  type NewRecord,
   type Rec,
+  type Signer,
   type Who,
+  NodeClient,
   b58,
   checkPath,
   checkPrefix,
   claimSignedBytes,
-  decodeEntries,
+  createDoc as createDocRecord,
   decodeId,
   decodeRecord,
-  decodeRecords,
+  delegatePath,
+  encKeysFromSeed,
   encodeRecord,
-  liveSignedBytes,
+  joinLive,
+  keySigner,
+  nextVersion,
   pathWithin,
   phrase,
+  publishEncKey,
   readSignedBytes,
-  signedBytes,
+  saveDoc as saveDocRecord,
+  sealTo,
   twoWords,
   unb58,
-} from "../../wasm/pkg/fedcrdt_wasm.js";
+} from "../../client/src/index.ts";
 
-export { type DocKind, type Rec, b58, pathWithin };
+export { type Rec, b58, pathWithin };
+
+/** The node this page talks to: its own origin. Owners' reads carry their read token (see `readHeaders`). */
+export const node = new NodeClient("", () => readHeaders());
 
 /** `node`: the key is a node's (its phrase is "node_word"). */
 export type User = { pubkey: string; phrase: string; node: boolean };
@@ -46,6 +59,13 @@ export const getUser = (pubkey: string) => api<User>(`/api/users/${pubkey}`);
 //
 // A user's ID is their raw 32-byte Ed25519 public key. In the API, URLs and the UI it's written in
 // base58 (`b58`, `decodeId`). Store bytes; base58 and phrases are only for input and output.
+
+/** The public key for a base58 ID; throws if it isn't one. */
+export function decodeIdOrThrow(id: string) {
+  const pk = decodeId(id);
+  if (!pk) throw new Error("That isn't an ID (32 bytes of base58).");
+  return pk;
+}
 
 /** Whether `s` is an ID: 32 bytes of base58. */
 export const isPubkey = (s: string) => decodeId(s) !== undefined;
@@ -146,13 +166,21 @@ type Keys = {
   secret: Uint8Array<ArrayBuffer>;
   pubkey: string;
   pk: Uint8Array;
-  signKey: CryptoKey;
+  signer: Signer;
+  /** For encrypted docs: their keys get sealed to `enc.publicKey`, published as our enckey. */
+  enc: EncKeys;
   passkey: Passkey | null;
 };
 let keys: Keys | null = null;
 
 /** The loaded keys' ID, i.e. the derived public signing key, if keys are loaded. */
 export const myPubkey = () => keys?.pubkey ?? null;
+
+/** What signs our records, if keys are loaded. */
+export const mySigner = () => keys?.signer ?? null;
+
+/** Our X25519 keys, for encrypted docs, if keys are loaded. */
+export const myEncKeys = () => keys?.enc ?? null;
 
 /** The passkey the loaded keys came from, if known. */
 export const myPasskey = () => keys?.passkey ?? null;
@@ -178,13 +206,16 @@ async function deriveKeys(secret: Uint8Array<ArrayBuffer>, passkey: PasskeyIds |
   seed.fill(0);
   pkcs8.fill(0);
 
+  const encSeed = new Uint8Array(await crypto.subtle.deriveBits(hkdf("bisonbase/encryption/x25519"), ikm, 256));
+  const encKeys = await encKeysFromSeed(encSeed);
+  encSeed.fill(0);
+
   const pk = unb64(jwk.x!);
   const pubkey = b58(pk);
-  return { secret, pubkey, pk, signKey, passkey: passkey && { ...passkey, pubkey, lastUsed: Date.now() } };
+  return { secret, pubkey, pk, signer: keySigner(signKey, pk), enc: encKeys, passkey: passkey && { ...passkey, pubkey, lastUsed: Date.now() } };
 }
 
-const sign = async (data: Uint8Array) =>
-  new Uint8Array(await crypto.subtle.sign("Ed25519", keys!.signKey, data as Uint8Array<ArrayBuffer>));
+const sign = (data: Uint8Array) => keys!.signer.sign(data);
 
 /**
  * Sets freshly derived keys and records the passkey's use. Their secret is saved if it already was,
@@ -420,8 +451,11 @@ export type Post = {
   hash: string;
   /** Its chain's first record's hash (base58): the link that stays the same across edits. */
   root: string;
+  /** Whose it is: its principal (see `as` in core/src/lib.rs). */
   author: User;
-  /** Who wrote the chain's first version, if known: who may edit it, besides the node's owners. */
+  /** Who signed it, if not its author: a key signing for them, under their delegation. */
+  signedBy: User | null;
+  /** Whose the chain's first version is, if known: who may edit it, besides the node's owners. */
   by: User | null;
   /** How many versions its chain has. */
   versions: number;
@@ -439,17 +473,14 @@ export type Post = {
   nodeUrl?: string;
   /** For an owner record: who. */
   owner?: Party;
-  /** For a doc: its title, and who may edit it besides its author (`by`). */
-  doc?: { title: string; editors: Party[]; kind: DocKind };
+  /** For a doc: its title, who may edit it besides its author (`by`), what it holds, and whether it's encrypted. */
+  doc?: { title: string; editors: Party[]; format: string; schema: string; encrypted: boolean };
+  /** For a delegation: the key it lets sign for its author, what it's called, and what it covers. */
+  delegate?: { key: string; name: string; paths: string[] | null; types: string[] | null; expires: number | null };
 };
 
 const bytesEqual = (a: Uint8Array, b: Uint8Array) => a.length === b.length && a.every((x, i) => x === b[i]);
 
-/** Compares bytes like the node does (memcmp, then length). */
-const bytesCmp = (a: Uint8Array, b: Uint8Array) => {
-  for (let i = 0; i < Math.min(a.length, b.length); i++) if (a[i] !== b[i]) return a[i] - b[i];
-  return a.length - b.length;
-};
 
 /** Trims and NFC-normalizes a path someone typed, then checks it (see check_path in core/src/lib.rs).
  * Throws if it's bad. `prefix`: "/" is fine too. */
@@ -481,12 +512,26 @@ export function viewPost(rec: Rec, chain?: { root: Uint8Array; by?: Uint8Array; 
     claim: rec.claim && { claimedBy: rec.claim.user ? toUser(rec.claim.user) : null },
     nodeUrl: rec.nodeUrl,
     owner: rec.owner && toParty(rec.owner),
-    doc: rec.doc && { title: rec.doc.title, editors: rec.doc.editors.map(toParty), kind: rec.doc.kind },
+    doc: rec.doc && {
+      title: rec.doc.title,
+      editors: rec.doc.editors.map(toParty),
+      format: rec.doc.format,
+      schema: rec.doc.schema,
+      encrypted: !!rec.doc.keys,
+    },
+    delegate: rec.delegate && {
+      key: b58(rec.delegate.key),
+      name: rec.delegate.name,
+      paths: rec.delegate.paths ?? null,
+      types: rec.delegate.types ?? null,
+      expires: rec.delegate.expires ?? null,
+    },
     rec,
     hash: b58(rec.hash),
     root: b58(chain?.root ?? rec.hash),
-    author: toUser(rec.author),
-    by: chain ? (chain.by ? toUser(chain.by) : null) : toUser(rec.author),
+    author: toUser(rec.principal),
+    signedBy: rec.as ? toUser(rec.author) : null,
+    by: chain ? (chain.by ? toUser(chain.by) : null) : toUser(rec.principal),
     versions: chain?.versions ?? 1,
     verified: rec.verified,
     text: rec.text ?? null,
@@ -496,10 +541,7 @@ export function viewPost(rec: Rec, chain?: { root: Uint8Array; by?: Uint8Array; 
 /** The current version of each live record, newest first; optionally only those first written by
  * `author`, of one `type`, or at or under `prefix`. */
 export async function getPosts(q: { author?: string; type?: string; prefix?: string } = {}) {
-  const params = new URLSearchParams(Object.entries(q).filter((e): e is [string, string] => !!e[1]));
-  const res = await fetch(`/api/records?${params}`, { headers: await readHeaders() });
-  if (!res.ok) throw new Error((await res.text()) || res.statusText);
-  return decodeEntries(new Uint8Array(await res.arrayBuffer())).map((e) => viewPost(e.rec, e));
+  return (await node.list(q)).map((e) => viewPost(e.rec, e));
 }
 
 /** A record's whole chain: every version, oldest first; the current one; and the tombstone, if it was deleted. */
@@ -507,16 +549,10 @@ export type Chain = { versions: Post[]; current: Post | null; deleted: Post | nu
 
 /** The chain that the record with this hash (base58) is in. */
 export async function getChain(hash: string): Promise<Chain> {
-  const res = await fetch(`/api/records/${hash}`, { headers: await readHeaders() });
-  if (!res.ok) throw new Error((await res.text()) || res.statusText);
-  const recs = decodeRecords(new Uint8Array(await res.arrayBuffer()));
-  // The first record: the one whose `edits` isn't here.
-  const root = recs.find((r) => !r.edits || !recs.some((o) => bytesEqual(o.hash, r.edits!))) ?? recs[0];
-  const chain = { root: root.hash, by: root.edits ? undefined : root.author, versions: recs.length };
-  const versions = recs.map((r) => viewPost(r, chain));
-  const newest = (a: Post, b: Post) => a.rec.version - b.rec.version || bytesCmp(a.rec.hash, b.rec.hash);
-  const live = versions.filter((p) => p.rec.type !== "tombstone").sort(newest);
-  return { versions, current: live.at(-1) ?? null, deleted: versions.find((p) => p.rec.type === "tombstone") ?? null };
+  const c = await node.chain(hash);
+  const chain = { root: unb58(c.root)!, by: c.by ? decodeId(c.by) : undefined, versions: c.versions.length };
+  const view = (r: Rec) => viewPost(r, chain);
+  return { versions: c.versions.map(view), current: c.current && view(c.current), deleted: c.deleted && view(c.deleted) };
 }
 
 // ---- reading private records ----
@@ -543,20 +579,10 @@ async function readHeaders(): Promise<Record<string, string>> {
 }
 
 /** Signs `d` (as us) and stores it; public unless it says otherwise. Returns its hash (base58). */
-async function putRec(draft: Omit<Draft, "private"> & { private?: boolean }) {
-  const d: Draft = { ...draft, private: draft.private ?? false };
-  const signature = await sign(signedBytes(d));
-  const res = await fetch("/api/records", {
-    method: "POST",
-    headers: { "content-type": "application/cbor" },
-    body: encodeRecord(d, signature) as Uint8Array<ArrayBuffer>,
-  });
-  if (!res.ok) throw new Error((await res.text()) || res.statusText);
-  return ((await res.json()) as { hash: string }).hash;
+async function putRec(draft: NewRecord) {
+  if (!keys) throw new Error("Sign in first.");
+  return node.write(keys.signer, draft);
 }
-
-/** A version newer than both the clock and `prev`, so quick successive edits still go through. */
-const nextVersion = (prev = 0) => Math.max(Date.now(), prev + 1);
 
 // ---- grants, owners and claims ----
 //
@@ -588,7 +614,7 @@ export type Choice = { kind: "user"; id: string } | { kind: "claim" } | { kind: 
 async function newClaim(path = CLAIM_PATH) {
   const token = random(32);
   const tokenHash = new Uint8Array(await crypto.subtle.digest("SHA-256", token));
-  const hash = await putRec({ author: keys!.pk, path, version: nextVersion(), type: "claim", data: { tokenHash } });
+  const hash = await putRec({ path, version: nextVersion(), type: "claim", data: { tokenHash } });
   return { who: { claim: unb58(hash)! } as Who, link: `${location.origin}/claim#${b58(token)}` };
 }
 
@@ -610,14 +636,14 @@ export async function makeGrant(c: Choice, path: string): Promise<Written> {
   path = normalizePath(path, true);
   const { who, link } = c.kind === "anyone" ? { who: null } : await choose(c);
   const data = { path, grantees: who ? [who] : ("anyone" as const) };
-  return { hash: await putRec({ author: keys.pk, path: GRANT_PATH, version: nextVersion(), type: "grant", data }), link };
+  return { hash: await putRec({ path: GRANT_PATH, version: nextVersion(), type: "grant", data }), link };
 }
 
 /** Makes `c` an owner of this node. Owners only. */
 export async function addOwner(c: Choice): Promise<Written> {
   if (!keys) throw new Error("Sign in first.");
   const { who, link } = await choose(c);
-  return { hash: await putRec({ author: keys.pk, path: OWNER_PATH, version: nextVersion(), type: "owner", data: who }), link };
+  return { hash: await putRec({ path: OWNER_PATH, version: nextVersion(), type: "owner", data: who }), link };
 }
 
 /** What a claim link's token is for: its claim (null if this node has none with that token), and the
@@ -646,20 +672,24 @@ export async function redeemClaim(token: string) {
   const signature = await sign(claimSignedBytes(decodeId(node.pubkey)!, t));
   await api("/api/claim", { token, user: keys.pubkey, signature: b58(signature) });
   await loadNode();
+  // The claim may have let us write in our space: try publishing our encryption key again.
+  tried.delete(keys.pubkey);
+  await ensureEncKey();
 }
 
 // ---- writing posts ----
 
-/** Whether we may edit or delete this record: we wrote it, or we own this node. (Doc updates never change.) */
+/** Whether we may edit or delete this record: we wrote it, or we own this node. (Doc updates and snapshots never change.) */
 export const canEdit = (p: Post) =>
-  !!keys && p.rec.type !== "node" && p.rec.type !== "doc_update" && (amOwner() || (p.by?.pubkey === keys.pubkey && !pathWithin(p.rec.path, "/node")));
+  !!keys &&
+  !["node", "doc_update", "doc_snapshot"].includes(p.rec.type) &&
+  (amOwner() || (p.by?.pubkey === keys.pubkey && !pathWithin(p.rec.path, "/node")));
 
 /** Creates a post at `path`, or edits `existing` (possibly moving it to `path`). `isPrivate`: only this
  * node's owners may read it, and it's never federated. Returns its hash. */
 export async function putPost(text: string, path: string, isPrivate: boolean, existing?: Post) {
   if (!keys) throw new Error("Sign in first.");
   return putRec({
-    author: keys.pk,
     path: normalizePath(path),
     version: nextVersion(existing?.rec.version),
     type: "post",
@@ -674,7 +704,6 @@ export async function putPost(text: string, path: string, isPrivate: boolean, ex
 export async function deletePost(p: Post) {
   if (!keys) throw new Error("Sign in first.");
   await putRec({
-    author: keys.pk,
     path: p.rec.path,
     version: nextVersion(p.rec.version),
     type: "tombstone",
@@ -720,7 +749,6 @@ export async function putPeer(url: string, types: string, paths: string) {
   const p = paths.split("\n").map((s) => s.trim()).filter(Boolean).map((s) => normalizePath(s, true));
   nodes.add(node);
   return putRec({
-    author: keys.pk,
     path: PEER_PATH,
     version: nextVersion(),
     type: "peer",
@@ -728,85 +756,142 @@ export async function putPeer(url: string, types: string, paths: string) {
   });
 }
 
+// ---- encryption keys ----
+//
+// Encrypted docs' keys are sealed to each reader's X25519 public key, which they publish as an "enckey"
+// record in their space (/u/<ID>/key). We publish ours once we're signed in, if this node lets us write
+// there (see "user spaces" in core/src/lib.rs).
+
+/** Whose keys we've tried to publish this session: once is enough, unless something changes (`retry`). */
+const tried = new Set<string>();
+
+/** Publishes our encryption key on this node, unless it has it. Quietly does nothing if it can't, or
+ * already tried, unless `required`. */
+export async function ensureEncKey(required = false) {
+  if (!keys || (tried.has(keys.pubkey) && !required)) return;
+  tried.add(keys.pubkey);
+  try {
+    await publishEncKey(node, keys.signer, keys.enc);
+  } catch (e) {
+    if (required) throw new Error(`Couldn't publish your encryption key: ${(e as Error).message}`);
+  }
+}
+
+// ---- apps acting for us ----
+//
+// Other apps make their own keys, and ask us to let them sign records for us, at /connect (see
+// client/src/signer.ts). Agreeing writes a "delegate" record; deleting it revokes it.
+
+/** Lets the app's key sign records for us, as it asked. Returns the delegation's hash. */
+export async function connectApp(r: ConnectRequest) {
+  if (!keys) throw new Error("Sign in first.");
+  const data = {
+    key: r.key,
+    name: r.name,
+    ...(r.paths?.length && { paths: r.paths.map((p) => normalizePath(p, true)) }),
+    ...(r.types?.length && { types: r.types }),
+    ...(r.expires && { expires: r.expires }),
+  };
+  return putRec({ path: delegatePath(keys.pk), version: nextVersion(), type: "delegate", data });
+}
+
+/** The apps we've let sign for us, on this node. */
+export async function myDelegations() {
+  if (!keys) return [];
+  const me = keys.pubkey;
+  return (await getPosts({ prefix: delegatePath(keys.pk), type: "delegate" })).filter((p) => p.verified && p.author.pubkey === me && !p.signedBy);
+}
+
 // ---- shared documents ----
 //
-// A doc is a "doc" chain: its title, and who may edit it besides its author. Its text is a Yjs CRDT,
-// built from "doc_update" records, each a signed batch of Yjs updates naming the doc by its chain's
-// hash. They merge in any order, so it doesn't matter how they get here. See core/src/lib.rs.
+// A doc is a "doc" chain: its title, who may edit it besides its author, and what it holds: its format
+// (always Yjs, here) and schema (markdown or a list, here). Its content is built from "doc_update" records,
+// kept in sync by `openDoc` (client/src/docs.ts). Encrypted docs have their key sealed to each editor.
 
 export const DOC_PATH = "/doc";
 
-/** Starts a doc of this kind at `path`. Returns its hash (base58): its chain's, for good. */
-export async function createDoc(kind: DocKind, path = DOC_PATH, title = "") {
+/** The schemas this app shows: markdown (a Y.Text "md"), and lists (see List.tsx). */
+export const SCHEMAS = { markdown: "bisonbase.markdown", list: "bisonbase.list" } as const;
+
+/** How a doc with this schema is shown in lists: an icon, and what to call it. */
+export const docLabel = (schema: string) =>
+  schema === SCHEMAS.list ? { icon: "🛒", noun: "list" } : schema === SCHEMAS.markdown ? { icon: "📄", noun: "doc" } : { icon: "🧩", noun: `${schema} doc` };
+
+/** Starts a doc with this schema at `path`; `encrypted`: only its editors can read it. Returns its hash
+ * (base58): its chain's, for good. */
+export async function createDoc(schema: string, path = DOC_PATH, encrypted = false) {
   if (!keys) throw new Error("Sign in first.");
-  return putRec({ author: keys.pk, path: normalizePath(path), version: nextVersion(), type: "doc", data: { title, editors: [], kind } });
+  if (encrypted) await ensureEncKey(true);
+  return createDocRecord(node, keys.signer, { path: normalizePath(path), format: "yjs", schema, encryption: encrypted ? keys.enc : null });
 }
 
-/** Writes a new version of `doc` with this title and these editors. Its author or an owner only. */
-async function saveDoc(doc: Post, title: string, editors: Who[]) {
+/** Writes a new version of `doc` with these changes. Its author or an owner only. */
+function saveDoc(doc: Post, changes: { title?: string; editors?: Who[]; keys?: { user: Uint8Array; sealed: Uint8Array }[] }) {
   if (!keys) throw new Error("Sign in first.");
-  return putRec({
-    author: keys.pk,
-    path: doc.rec.path,
-    version: nextVersion(doc.rec.version),
-    type: "doc",
-    edits: doc.rec.hash,
-    data: { title: title.trim(), editors, kind: doc.doc!.kind },
-  });
+  return saveDocRecord(node, keys.signer, doc.rec, changes);
 }
 
 const editorsOf = (doc: Post) => doc.rec.doc?.editors ?? [];
 
-export const renameDoc = (doc: Post, title: string) => saveDoc(doc, title, editorsOf(doc));
+export const renameDoc = (doc: Post, title: string) => saveDoc(doc, { title });
 
-/** Lets the user with this ID edit `doc`. */
-export async function addDocEditor(doc: Post, id: string) {
+/** Lets the user with this ID edit `doc`. For an encrypted doc, seals its key (`docKey`) to them. */
+export async function addDocEditor(doc: Post, id: string, docKey: Uint8Array | null) {
   const pk = decodeId(id.trim());
   if (!pk) throw new Error("That isn't an ID (32 bytes of base58).");
   if (doc.doc?.editors.some((e) => e.user?.pubkey === b58(pk)) || doc.by?.pubkey === b58(pk)) throw new Error("They can already edit it.");
-  return saveDoc(doc, doc.doc!.title, [...editorsOf(doc), { user: pk }]);
+  const editors = [...editorsOf(doc), { user: pk }];
+  if (!doc.doc?.encrypted) return saveDoc(doc, { editors });
+  if (!docKey) throw new Error("You don't have this doc's key, so you can't share it.");
+  const sealed = await sealTo(node, doc.rec.doc!.keys!, docKey, [pk]);
+  if (sealed.missing.length) throw new Error("They haven't published an encryption key on this node yet: they need to sign in here once.");
+  return saveDoc(doc, { editors, keys: sealed.keys });
 }
 
-/** Stops `doc`'s `i`th editor from editing it. What they wrote stays. */
-export const removeDocEditor = (doc: Post, i: number) => saveDoc(doc, doc.doc!.title, editorsOf(doc).filter((_, j) => j !== i));
+/** Stops `doc`'s `i`th editor from editing it. What they wrote stays, and so does what they could read. */
+export function removeDocEditor(doc: Post, i: number) {
+  const removed = editorsOf(doc)[i];
+  const editors = editorsOf(doc).filter((_, j) => j !== i);
+  const gone = removed && ("user" in removed ? b58(removed.user) : claims.get(b58(removed.claim)));
+  const keys = doc.rec.doc?.keys?.filter((k) => b58(k.user) !== gone);
+  return saveDoc(doc, { editors, ...(keys && { keys }) });
+}
 
-/** Makes a claim link, next to `doc`, for whoever opens it to become an editor. Returns the link. */
-export async function inviteToDoc(doc: Post) {
+/** Makes a claim link, next to `doc`, for whoever opens it to become an editor. Returns the link. For an
+ * encrypted doc, the link carries its key (`docKey`): whoever has the link can read the doc. */
+export async function inviteToDoc(doc: Post, docKey: Uint8Array | null) {
+  if (doc.doc?.encrypted && !docKey) throw new Error("You don't have this doc's key, so you can't share it.");
   const { who, link } = await newClaim(doc.rec.path);
-  await saveDoc(doc, doc.doc!.title, [...editorsOf(doc), who]);
-  return link;
+  await saveDoc(doc, { editors: [...editorsOf(doc), who] });
+  return doc.doc?.encrypted ? `${link}.${b58(docKey!)}` : link;
+}
+
+/** For an encrypted doc we may change: seals its key to any editor who has none yet, if they've published
+ * an encryption key (e.g. since claiming an invite). Whether it wrote a new version. */
+export async function sealForEditors(doc: Post, docKey: Uint8Array) {
+  const sealed = doc.rec.doc?.keys;
+  if (!sealed) return false;
+  await loadClaims();
+  const users = [doc.by?.pubkey, ...editorsOf(doc).map((w) => ("user" in w ? b58(w.user) : claims.get(b58(w.claim))))]
+    .filter((u): u is string => !!u)
+    .map((u) => decodeId(u)!);
+  const next = await sealTo(node, sealed, docKey, users);
+  if (next.keys.length === sealed.length) return false;
+  await saveDoc(doc, { keys: next.keys });
+  return true;
 }
 
 /** Whether `pubkey` may write updates to `doc`: they started it, it names them as an editor, or they own
- * this node. Checked here for every update, as peers pass records along without checking. */
+ * this node. Checked for every update, as peers pass records along without checking. */
 export const mayEditDoc = (doc: Post, pubkey: string) =>
   doc.by?.pubkey === pubkey || !!doc.doc?.editors.some((e) => e.user?.pubkey === pubkey) || !!thisNode?.owners.includes(pubkey);
 
 /** Whether some editor of `doc` is named by a claim we don't know to be claimed (as of `loadClaims`). */
 export const docHasOpenClaims = (doc: Post) => !!doc.doc?.editors.some((e) => e.claim && !e.user);
 
-/** Records as they're stored on this node (see `stream` in src/main.rs): a doc's, with `doc` (its hash,
- * base58), or those at or under `prefix`. Each "record" event's data is a record (base64); after what's
- * already there comes a "ready" event. EventSource reconnects by itself, picking up where it left off. */
-export const streamRecords = (q: { doc?: string; prefix?: string }) =>
-  new EventSource(`/api/stream?${new URLSearchParams(Object.entries(q).filter((e): e is [string, string] => !!e[1]))}`);
-
-/** A "record" event's record, decoded and checked. */
-export const streamedRecord = (data: string) => decodeRecord(unb64(data));
-
-/** A WebSocket to `doc`'s live room on this node (see `live` in src/main.rs), and the signed hello that
- * has to be its first message: we may only join as one of its editors. */
-export async function joinLive(doc: string) {
+/** A WebSocket to `doc`'s live room on this node, and the hello to send first: we may only join as one of
+ * its editors. */
+export async function joinDocLive(doc: string) {
   if (!keys || !thisNode) throw new Error("Sign in first.");
-  const expires = Date.now() + READ_TOKEN_MS;
-  const signature = await sign(liveSignedBytes(decodeId(thisNode.pubkey)!, unb58(doc)!, BigInt(expires)));
-  const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/docs/${doc}/live`);
-  ws.binaryType = "arraybuffer";
-  return { ws, hello: JSON.stringify({ user: keys.pubkey, expires, signature: b58(signature) }) };
-}
-
-/** Writes a Yjs update to `doc`'s text, as us. */
-export async function putDocUpdate(doc: Post, update: Uint8Array) {
-  if (!keys) throw new Error("Sign in first.");
-  return putRec({ author: keys.pk, path: doc.rec.path, version: nextVersion(), type: "doc_update", data: { doc: unb58(doc.root)!, update } });
+  return joinLive(node, keys.signer, doc, decodeId(thisNode.pubkey)!);
 }

@@ -1,5 +1,5 @@
 import { createContext, useContext, useState } from "react";
-import { type Party, type Post, type User, b58, canEdit, deletePost, pathWithin, putPost } from "./api.ts";
+import { type Party, type Post, type User, b58, canEdit, deletePost, docLabel, pathWithin, putPost } from "./api.ts";
 import { Link, docPath, idPath, pathPath, recordPath } from "./router.tsx";
 import { type Run, badge, danger, fmtTime, input, link, hl, primary, secondary, textarea } from "./ui.ts";
 
@@ -77,7 +77,20 @@ const typeColors = [
   "bg-orange-50 text-orange-700 ring-orange-200",
   "bg-lime-50 text-lime-700 ring-lime-200",
 ];
-const knownTypes: Record<string, number> = { post: 0, grant: 1, tombstone: 2, node: 6, owner: 6, peer: 6, claim: 6, doc: 5, doc_update: 5 };
+const knownTypes: Record<string, number> = {
+  post: 0,
+  grant: 1,
+  tombstone: 2,
+  node: 6,
+  owner: 6,
+  peer: 6,
+  claim: 6,
+  delegate: 6,
+  enckey: 6,
+  doc: 5,
+  doc_update: 5,
+  doc_snapshot: 5,
+};
 
 function typeColor(type: string) {
   if (type in knownTypes) return typeColors[knownTypes[type]];
@@ -194,32 +207,65 @@ function Content({ post: n, me }: { post: Post; me: User | null }) {
   }
   if (n.doc) {
     const editors = n.doc.editors.length;
+    const { icon, noun } = docLabel(n.doc.schema);
     return (
       <p className="mt-1">
-        {n.doc.kind === "list" ? "🛒" : "📄"}{" "}
+        {icon}{" "}
         <Link href={docPath(n.root)} className={`font-semibold ${link}`}>
           {n.doc.title || "Untitled"}
         </Link>
-        <span className="text-sm text-gray-500"> · a shared {n.doc.kind === "list" ? "list" : "doc"}{editors > 0 && `, with ${editors} more editor${editors > 1 ? "s" : ""}`}</span>
+        <span className="text-sm text-gray-500">
+          {" "}
+          · a shared {n.doc.encrypted && "🔒 encrypted "}
+          {noun}
+          {editors > 0 && `, with ${editors} more editor${editors > 1 ? "s" : ""}`}
+        </span>
       </p>
     );
   }
-  if (n.rec.docUpdate) {
-    const doc = b58(n.rec.docUpdate.doc);
+  const docRef = n.rec.docUpdate ?? n.rec.docSnapshot;
+  if (docRef) {
+    const doc = b58(docRef.doc);
+    const size = n.rec.docUpdate?.update.length ?? n.rec.docSnapshot!.state.length;
     return (
       <p className="mt-1 text-sm">
-        ✏️ An edit to the doc{" "}
+        {n.rec.docUpdate ? "✏️ An edit to" : "📸 A snapshot of"} the doc{" "}
         <Link href={docPath(doc)} className={`font-mono ${link}`}>
           #{doc.slice(0, 8)}
         </Link>{" "}
-        <span className="text-gray-500">({n.rec.docUpdate.update.length} bytes of Yjs update)</span>
+        <span className="text-gray-500">
+          ({size} bytes{n.rec.docSnapshot && `, with ${n.rec.docSnapshot.covers.length} updates in it`})
+        </span>
       </p>
+    );
+  }
+  if (n.delegate) {
+    const d = n.delegate;
+    return (
+      <p className="mt-1">
+        🔌 Lets <b>{d.name || "an app"}</b> (key <code className="font-mono text-sm">{d.key.slice(0, 8)}…</code>) sign records for{" "}
+        <UserLink user={n.author} me={me} className="font-semibold" />
+        <span className="block text-sm text-gray-600">
+          Types: {d.types?.join(", ") ?? "all"} · Paths: <code className="font-mono">{d.paths?.join(" ") ?? "all"}</code>
+          {d.expires && ` · until ${new Date(d.expires).toLocaleString()}`}
+        </span>
+      </p>
+    );
+  }
+  if (n.rec.enckey) return <p className="mt-1 text-sm">🔐 An encryption key, for sealing encrypted docs' keys to its author</p>;
+  if (n.rec.data !== undefined) {
+    return (
+      <pre className="mt-1 max-h-60 overflow-auto rounded-md bg-gray-50 p-2 text-xs whitespace-pre-wrap break-words">{showData(n.rec.data)}</pre>
     );
   }
   if (n.text !== null) return <p className="mt-1 whitespace-pre-wrap break-words">{n.text}</p>;
   if (n.rec.type === "tombstone") return <p className="mt-1 text-sm text-gray-500 italic">Deleted.</p>;
   return <p className="mt-1 text-sm text-gray-500 italic">(a {n.rec.type} record this page can't show)</p>;
 }
+
+/** An app type's data, as readable JSON: bytes as their length, BigInts as numbers. */
+const showData = (data: unknown) =>
+  JSON.stringify(data, (_, v) => (typeof v === "bigint" ? v.toString() : v instanceof Uint8Array ? `<${v.length} bytes>` : v), 2);
 
 type ItemProps = { post: Post; me: User | null; busy: boolean; run: Run };
 
@@ -241,6 +287,11 @@ export function PostItem({ post: n, me, busy, run, hidePath, history }: ItemProp
             </>
           ) : (
             <UserLink user={n.author} me={me} />
+          )}
+          {n.signedBy && (
+            <span className="text-gray-500" title={`Signed by the key ${n.signedBy.pubkey}, under ${n.author.phrase}'s delegation`}>
+              via an app
+            </span>
           )}
           {n.verified ? (
             <span className="font-semibold text-green-600" title="Signature verified in your browser against the author's public key">

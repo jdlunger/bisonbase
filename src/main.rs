@@ -2,7 +2,7 @@ use axum::{
     Json, Router,
     body::Bytes,
     extract::{
-        Path, Query, State,
+        DefaultBodyLimit, Path, Query, State,
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
     },
     http::{HeaderMap, StatusCode, Uri, header},
@@ -15,9 +15,9 @@ use axum::{
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use ed25519_dalek::{Signer, SigningKey};
 use fedcrdt_core::{
-    CBOR, CLAIM_PATH, ClaimData, DocData, DocUpdateData, GrantData, Hash, MAX_READ_TOKEN_MS, Map, NODE_INFO_PATH, NODE_PATH, OWNER_PATH, PeerData, Pubkey,
-    Record, Who, check_prefix, claim_signed_bytes, decode_b58, decode_id, encode_b58, encode_id, node_phrase, path_within, phrase,
-    live_signed_bytes, read_signed_bytes, verify_sig,
+    Acting, CBOR, CLAIM_PATH, ClaimData, DocData, GrantData, Hash, MAX_READ_TOKEN_MS, MAX_RECORD_BYTES, Map, NODE_INFO_PATH, NODE_PATH, OWNER_PATH,
+    PeerData, Pubkey, Record, Who, check_prefix, claim_signed_bytes, decode_b58, decode_id, encode_b58, encode_id, live_signed_bytes, node_phrase,
+    path_user, path_within, phrase, read_signed_bytes, verify_sig,
 };
 use rusqlite::{Connection, OptionalExtension};
 use serde::Deserialize;
@@ -34,10 +34,12 @@ use std::{
 };
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
+use tower_http::cors::CorsLayer;
 
 /// Bump to wipe the database when the schema changes incompatibly.
 /// 6: records identified by hash, nodes. 7: chains table, seq as rowid. 8: private records. 9: records.doc.
-const SCHEMA_VERSION: i64 = 9;
+/// 10: records.principal, doc snapshots.
+const SCHEMA_VERSION: i64 = 10;
 
 /// How far ahead of the node's clock a write's version may be.
 const MAX_CLOCK_SKEW_MS: u64 = 10 * 60 * 1000;
@@ -134,6 +136,9 @@ async fn main() {
         .route("/api/claim", post(claim))
         .route("/receive", post(receive))
         .with_state(app)
+        // Records are signed and reads carry no cookies, so any web app, from any origin, may use the API.
+        .layer(CorsLayer::permissive())
+        .layer(DefaultBodyLimit::max(MAX_RECORD_BYTES * 4))
         .fallback(move |uri: Uri| async move {
             let path = uri.path_and_query().map_or("/", |p| p.as_str());
             Redirect::temporary(&format!("{origin}{path}"))
@@ -176,7 +181,8 @@ fn create_schema(db: &Connection) {
         CREATE TABLE IF NOT EXISTS records (
             seq INTEGER PRIMARY KEY, -- local order of arrival (the rowid): what peers are pushed by
             hash BLOB NOT NULL UNIQUE, -- SHA-256 of `record`
-            author BLOB NOT NULL,
+            author BLOB NOT NULL,  -- who signed it
+            principal BLOB NOT NULL, -- whose it is: the user its `as` names, or else its author
             path TEXT NOT NULL,
             version INTEGER NOT NULL,
             type TEXT NOT NULL,
@@ -185,7 +191,7 @@ fn create_schema(db: &Connection) {
             root BLOB NOT NULL,    -- its chain's first record: follows `edits` back as far as this node has
             record BLOB NOT NULL,  -- the record's deterministic CBOR, signature included
             received_from BLOB,    -- the node that pushed it here, if one did; it isn't pushed back there
-            doc BLOB               -- for a doc update: its doc (the doc chain's first record's hash)
+            doc BLOB               -- for a doc update or snapshot: its doc (the doc chain's first record's hash)
         );
         CREATE INDEX IF NOT EXISTS records_by_root ON records (root, version, hash);
         CREATE INDEX IF NOT EXISTS records_by_doc ON records (doc, seq) WHERE doc IS NOT NULL;
@@ -194,7 +200,7 @@ fn create_schema(db: &Connection) {
         CREATE TABLE IF NOT EXISTS chains (
             root BLOB PRIMARY KEY,
             head BLOB NOT NULL,     -- hash of the current version
-            author BLOB,            -- who wrote the root record; NULL until it arrives here
+            author BLOB,            -- whose the root record is (its principal); NULL until it arrives here
             path TEXT NOT NULL,
             type TEXT NOT NULL,
             version INTEGER NOT NULL,
@@ -204,10 +210,11 @@ fn create_schema(db: &Connection) {
         CREATE INDEX IF NOT EXISTS chains_by_type ON chains (type) WHERE NOT deleted;
         CREATE INDEX IF NOT EXISTS chains_by_path ON chains (path) WHERE NOT deleted;
         CREATE INDEX IF NOT EXISTS chains_by_author ON chains (author) WHERE NOT deleted;
-        -- Each live chain's current version. `author` is the head's; `by` the root's. A chain is private
+        -- Each live chain's current version. `author` is the head's signer, `principal` whose it is; `by`
+        -- whose the root is: who may edit the chain, besides the node's owners. A chain is private
         -- if its head is.
         CREATE VIEW IF NOT EXISTS heads AS
-            SELECT c.root, c.head AS hash, c.author AS by, c.path, c.type, c.version, c.versions, r.author, r.private, r.record
+            SELECT c.root, c.head AS hash, c.author AS by, c.path, c.type, c.version, c.versions, r.author, r.principal, r.private, r.record
             FROM chains c JOIN records r ON r.hash = c.head
             WHERE NOT c.deleted;
         -- This node's own key pair: exactly one row.
@@ -292,6 +299,35 @@ fn may_write(db: &Connection, author: &Pubkey, path: &str) -> bool {
             .any(|(_, r)| GrantData::from_cbor(&r.data).is_ok_and(|g| g.covers(author, path, |c| claimed_by(db, c))))
 }
 
+/// Whether the delegation `a` names lets `key` sign a record of type `kind` at `path` for `a.user`, now:
+/// it's a live "delegate" chain, its current version is by `a.user` for `key`, and it covers that.
+fn delegated(db: &Connection, key: &Pubkey, a: &Acting, path: &str, kind: &str) -> Result<(), String> {
+    let head: Option<Vec<u8>> =
+        db.query_row("SELECT record FROM heads WHERE root = ?1 AND type = 'delegate'", [a.delegation], |r| r.get(0)).optional().unwrap();
+    let head = parse_record(head.ok_or("this node doesn't have that delegation, or it was revoked")?);
+    let d = head.delegate().filter(|_| head.author == a.user).ok_or("that delegation isn't the user's")?;
+    if d.key != *key {
+        return Err("that delegation is for another key".into());
+    }
+    if !d.covers(path, kind, now_ms()) {
+        return Err(format!("the delegation doesn't cover a {kind} at {path}, or it expired"));
+    }
+    Ok(())
+}
+
+/// Whether `rec`, an update or snapshot of the doc `doc`, may be written here: the doc is live, `rec` is
+/// at its current path, and its principal is the doc's author, one of its editors, or an owner.
+fn authorize_doc_write(db: &Connection, rec: &Record, doc: &Hash, owner: bool) -> Result<(), String> {
+    let (by, head, data) = doc_head(db, doc)?;
+    if rec.path != head.path {
+        return Err(format!("this doc's updates go at its path, {}", head.path));
+    }
+    if !owner && !data.may_edit(&by, &rec.principal(), |c| claimed_by(db, c)) {
+        return Err("only the doc's author and editors can edit it".into());
+    }
+    Ok(())
+}
+
 /// Stores `rec` if it's valid and new here. Ok(false): this node already has it. `from`: the node that
 /// pushed it here. Doesn't check who may write what: see `App::authorize`.
 fn store(db: &Connection, rec: &Record, from: Option<Pubkey>) -> Result<bool, String> {
@@ -309,11 +345,13 @@ fn store(db: &Connection, rec: &Record, from: Option<Pubkey>) -> Result<bool, St
         None => hash,
     };
     let tx = db.unchecked_transaction().unwrap();
-    tx.execute("INSERT OR IGNORE INTO users (pubkey) VALUES (?1)", [rec.author]).unwrap();
+    for pk in [rec.author, rec.principal()] {
+        tx.execute("INSERT OR IGNORE INTO users (pubkey) VALUES (?1)", [pk]).unwrap();
+    }
     tx.execute(
-        "INSERT INTO records (hash, author, path, version, type, edits, private, root, record, received_from, doc)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        (hash, rec.author, &rec.path, rec.version as i64, &rec.kind, rec.edits, rec.private, root, rec.to_bytes(), from, rec.doc_update().map(|u| u.doc)),
+        "INSERT INTO records (hash, author, principal, path, version, type, edits, private, root, record, received_from, doc)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        (hash, rec.author, rec.principal(), &rec.path, rec.version as i64, &rec.kind, rec.edits, rec.private, root, rec.to_bytes(), from, rec.doc_ref()),
     )
     .unwrap();
     // Edits of this record that arrived before it were filed under it as their root.
@@ -323,7 +361,7 @@ fn store(db: &Connection, rec: &Record, from: Option<Pubkey>) -> Result<bool, St
     }
     tx.execute(
         "INSERT OR REPLACE INTO chains (root, head, author, path, type, version, versions, deleted)
-         SELECT ?1, h.hash, (SELECT author FROM records WHERE hash = ?1), h.path, h.type, h.version,
+         SELECT ?1, h.hash, (SELECT principal FROM records WHERE hash = ?1), h.path, h.type, h.version,
                 (SELECT count(*) FROM records WHERE root = ?1),
                 EXISTS (SELECT 1 FROM records WHERE root = ?1 AND type = 'tombstone')
          FROM records h WHERE h.root = ?1 ORDER BY h.version DESC, h.hash DESC LIMIT 1",
@@ -341,7 +379,7 @@ impl App {
         if new {
             let (seq, root) =
                 db.query_row("SELECT seq, root FROM records WHERE hash = ?1", [rec.hash()], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
-            let doc = rec.doc_update().map(|u| u.doc);
+            let doc = rec.doc_ref();
             let _ = self.stored.send(Stored { seq, root, doc, path: rec.path.clone(), private: rec.private, bytes: Arc::new(rec.to_bytes()) });
             self.push.notify_one();
         }
@@ -359,6 +397,7 @@ impl App {
             data,
             edits,
             private: false,
+            acting: None,
             signature: [0; 64],
             extra: Map::new(),
         };
@@ -415,8 +454,9 @@ impl App {
         }
     }
 
-    /// Whether `rec`'s author may write it here (see "nodes" in core/src/lib.rs). For records written
-    /// to this node, not those pushed by peers.
+    /// Whether `rec`'s author may write it here (see "nodes" and "user spaces" in core/src/lib.rs). For
+    /// records written to this node, not those pushed by peers. Records signed under a delegation count as
+    /// their principal's, if the delegation lets their author sign them.
     fn authorize(&self, db: &Connection, rec: &Record) -> Result<(), String> {
         if rec.author == self.pk {
             return Ok(());
@@ -427,15 +467,25 @@ impl App {
         if rec.claim().is_some_and(|c| c.user.is_some()) {
             return Err("only the node fills in who claimed a claim".into());
         }
-        let owner = owners(db).contains(&rec.author);
+        if let Some(a) = &rec.acting {
+            delegated(db, &rec.author, a, &rec.path, &rec.kind)?;
+        }
+        let principal = rec.principal();
+        let owner = owners(db).contains(&principal);
         if rec.is_node_record() && !owner {
             return Err(format!("only this node's owners can write under {NODE_PATH}"));
         }
-        if let Some(u) = rec.doc_update() {
-            return self.authorize_doc_update(db, rec, &u, owner);
+        if let Some(u) = path_user(&rec.path)
+            && u != principal
+            && !owner
+        {
+            return Err(format!("{} is {}'s space: only they can write there", rec.path, phrase(&u)));
+        }
+        if let Some(doc) = rec.doc_ref() {
+            return authorize_doc_write(db, rec, &doc, owner);
         }
         let Some(prev_hash) = rec.edits else {
-            return if may_write(db, &rec.author, &rec.path) { Ok(()) } else { Err(format!("writing at {} needs a grant", rec.path)) };
+            return if may_write(db, &principal, &rec.path) { Ok(()) } else { Err(format!("writing at {} needs a grant", rec.path)) };
         };
         let (prev, root): (Record, Hash) = db
             .query_row("SELECT record, root FROM records WHERE hash = ?1", [prev_hash], |r| Ok((parse_record(r.get(0)?), r.get(1)?)))
@@ -448,26 +498,26 @@ impl App {
         if prev.kind == "node" {
             return Err("only the node itself writes its node record".into());
         }
-        if prev.kind == "doc_update" {
-            return Err("doc updates are never edited or deleted; delete the doc instead".into());
+        if prev.kind == "doc_update" || prev.kind == "doc_snapshot" {
+            return Err("doc updates and snapshots are never edited or deleted; delete the doc instead".into());
         }
         if rec.kind != "tombstone" && rec.kind != prev.kind {
             return Err("an edit can't change a record's type".into());
         }
         if let (Some(new), Some(old)) = (rec.doc(), prev.doc())
-            && new.kind != old.kind
+            && (new.format != old.format || new.schema != old.schema || new.keys.is_some() != old.keys.is_some())
         {
-            return Err("an edit can't change a doc's kind".into());
+            return Err("an edit can't change a doc's format, schema, or whether it's encrypted".into());
         }
         if prev.claim().is_some_and(|c| c.user.is_some()) && rec.kind != "tombstone" {
             return Err("that claim was already claimed".into());
         }
         if !owner {
-            let original: Option<Pubkey> = db.query_row("SELECT author FROM records WHERE hash = ?1", [root], |r| r.get(0)).optional().unwrap();
-            if original != Some(rec.author) {
+            let original: Option<Pubkey> = db.query_row("SELECT principal FROM records WHERE hash = ?1", [root], |r| r.get(0)).optional().unwrap();
+            if original != Some(principal) {
                 return Err("only its author or this node's owners can edit or delete it".into());
             }
-            if rec.kind != "tombstone" && rec.path != prev.path && !may_write(db, &rec.author, &rec.path) {
+            if rec.kind != "tombstone" && rec.path != prev.path && !may_write(db, &principal, &rec.path) {
                 return Err(format!("moving it to {} needs a grant there", rec.path));
             }
         }
@@ -476,19 +526,6 @@ impl App {
             if others == 0 && rec.kind == "tombstone" {
                 return Err("a node needs at least one owner".into());
             }
-        }
-        Ok(())
-    }
-
-    /// Whether `rec`, an update to the doc `u.doc`, may be written here: the doc is live, the update is
-    /// at its current path, and its author is the doc's author, one of its editors, or an owner.
-    fn authorize_doc_update(&self, db: &Connection, rec: &Record, u: &DocUpdateData, owner: bool) -> Result<(), String> {
-        let (by, head, doc) = doc_head(db, &u.doc)?;
-        if rec.path != head.path {
-            return Err(format!("this doc's updates go at its path, {}", head.path));
-        }
-        if !owner && !doc.may_edit(&by, &rec.author, |c| claimed_by(db, c)) {
-            return Err("only the doc's author and editors can edit it".into());
         }
         Ok(())
     }
@@ -577,8 +614,8 @@ fn under(p: &str) -> String {
     format!(" AND path >= {p} AND path < {p} || '0' AND (path = {p} OR path >= {p} || '/')")
 }
 
-/// The current version of every live chain matching the query (but doc updates, unless `type` asks for
-/// them), newest first, as a CBOR array of
+/// The current version of every live chain matching the query (but doc updates and snapshots, unless
+/// `type` asks for them), newest first, as a CBOR array of
 /// {record, root: its chain's hash, by: who wrote the chain's first record (if this node has it),
 /// versions: how many versions the chain has}. Private ones only for this node's owners.
 async fn list_records(State(app): S, headers: HeaderMap, Query(q): Query<RecordsQuery>) -> Response {
@@ -613,8 +650,8 @@ async fn list_records(State(app): S, headers: HeaderMap, Query(q): Query<Records
     }
     match q.kind {
         Some(k) => sql += &format!(" AND type = {}", bind(Box::new(k))),
-        // There are lots, and they only mean something together: see `doc_updates`.
-        None => sql += " AND type != 'doc_update'",
+        // There are lots, and they only mean something together, in a doc's stream.
+        None => sql += " AND type NOT IN ('doc_update', 'doc_snapshot')",
     }
     sql += " ORDER BY version DESC";
     let mut stmt = db.prepare(&sql).unwrap();
@@ -689,6 +726,8 @@ struct StreamQuery {
     /// Start after this record (an event ID from an earlier stream), instead of at the beginning. A
     /// reconnecting EventSource's Last-Event-ID takes its place.
     after: Option<i64>,
+    /// For a doc's stream from the beginning: start from its newest snapshot (see `compact`).
+    snapshot: Option<bool>,
 }
 
 /// Which records a stream passes on. Never private ones: the stream has no read token.
@@ -721,6 +760,42 @@ fn stored_after(db: &Connection, f: &StreamFilter, after: i64) -> Vec<(i64, Vec<
     stmt.query_map(rusqlite::params_from_iter(params), |r| Ok((r.get(0)?, r.get(1)?))).unwrap().flatten().collect()
 }
 
+/// A doc's records (as `stored_after` lists them) starting from its newest snapshot by someone who may edit
+/// it: that snapshot, and the rest but other snapshots and the updates it covers. As they are if it has no
+/// such snapshot. Readers who don't trust the snapshot can stream the doc without `snapshot`.
+fn compact(db: &Connection, doc: &Hash, backlog: Vec<(i64, Vec<u8>)>) -> Vec<(i64, Vec<u8>)> {
+    let Ok((by, _, data)) = doc_head(db, doc) else { return backlog };
+    let owners = owners(db);
+    let trusted = |r: &Record| {
+        let p = r.principal();
+        r.acting.as_ref().is_none_or(|a| delegated(db, &r.author, a, &r.path, &r.kind).is_ok())
+            && (owners.contains(&p) || data.may_edit(&by, &p, |c| claimed_by(db, c)))
+    };
+    let hash = |b: &[u8]| -> Hash { Sha256::digest(b).into() };
+    let best = backlog
+        .iter()
+        .filter_map(|(_, b)| {
+            let r = parse_record(b.clone());
+            let s = r.doc_snapshot().filter(|s| s.doc == *doc && trusted(&r))?;
+            Some((r.version, hash(b), s.covers))
+        })
+        .max_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    let Some((_, snapshot, covers)) = best else { return backlog };
+    let covers: HashSet<Hash> = covers.into_iter().collect();
+    backlog
+        .into_iter()
+        .filter(|(_, b)| {
+            let h = hash(b);
+            h == snapshot
+                || match parse_record(b.clone()).kind.as_str() {
+                    "doc_snapshot" => false,
+                    "doc_update" => !covers.contains(&h),
+                    _ => true,
+                }
+        })
+        .collect()
+}
+
 /// Server-sent events: every record matching the query that's here (after `after`), then a "ready"
 /// event (its data: the last record's seq), then each new one as it's stored. Each "record" event's data is the record (base64 CBOR), and
 /// its ID is where to continue from. A stream that falls too far behind is ended; EventSource reconnects
@@ -740,7 +815,11 @@ async fn stream(State(app): S, headers: HeaderMap, Query(q): Query<StreamQuery>)
     // comes through `live`. Some may be in both; seq tells.
     let (backlog, mut live) = {
         let db = app.db.lock().unwrap();
-        (stored_after(&db, &f, after), app.stored.subscribe())
+        let mut backlog = stored_after(&db, &f, after);
+        if let (Some(doc), 0, Some(true)) = (f.doc, after, q.snapshot) {
+            backlog = compact(&db, &doc, backlog);
+        }
+        (backlog, app.stored.subscribe())
     };
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(64);
     let record = |seq: i64, bytes: &[u8]| Ok(Event::default().event("record").id(seq.to_string()).data(BASE64.encode(bytes)));
@@ -798,11 +877,16 @@ struct LiveMsg {
     frame: Arc<Vec<u8>>,
 }
 
+/// `user` signs it. With `as` and `delegation` (base58), they sign for the user `as`, under that
+/// delegation, which has to let them write the doc's updates.
 #[derive(Deserialize)]
 struct Hello {
     user: String,
     expires: u64,
     signature: String,
+    #[serde(rename = "as")]
+    acting: Option<String>,
+    delegation: Option<String>,
 }
 
 impl App {
@@ -817,7 +901,19 @@ impl App {
         }
         verify_sig(&user, &live_signed_bytes(&self.pk, doc, h.expires), &sig)?;
         let db = self.db.lock().unwrap();
-        let (by, _, data) = doc_head(&db, doc)?;
+        let (by, head, data) = doc_head(&db, doc)?;
+        let user = match (h.acting, h.delegation) {
+            (None, None) => user,
+            (Some(u), Some(d)) => {
+                let a = Acting {
+                    user: decode_id(&u).ok_or("the hello's \"as\" isn't an ID")?,
+                    delegation: decode_b58(&d).and_then(|d| d.try_into().ok()).ok_or("the hello's delegation isn't a hash")?,
+                };
+                delegated(&db, &user, &a, &head.path, "doc_update")?;
+                a.user
+            }
+            _ => return Err("a hello with \"as\" needs a delegation too".into()),
+        };
         if !owners(&db).contains(&user) && !data.may_edit(&by, &user, |c| claimed_by(&db, c)) {
             return Err("only the doc's author and editors can join".into());
         }
@@ -1072,7 +1168,7 @@ async fn push_to(app: &App, peer_hash: Hash, peer: &PeerData) -> Result<(), reqw
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fedcrdt_core::{GRANT_PATH, Grantees};
+    use fedcrdt_core::{DelegateData, DocSnapshotData, DocUpdateData, EncKeyData, GRANT_PATH, Grantees, delegate_path, enckey_path, user_path};
 
     /// A fresh node on an in-memory database, started as `main` does: it has a node record, and an
     /// owner record naming an unclaimed claim.
@@ -1102,6 +1198,7 @@ mod tests {
             data,
             edits: edits.map(Record::hash),
             private: false,
+            acting: None,
             signature: [0; 64],
             extra: Map::new(),
         };
@@ -1431,6 +1528,10 @@ mod tests {
         sign(key, path, "doc_update", DocUpdateData { doc: doc.hash(), update: update.to_vec() }.to_cbor(), None, 1)
     }
 
+    fn doc_data(title: &str, editors: Vec<Who>) -> DocData {
+        DocData { title: title.into(), editors, format: "yjs".into(), schema: "bisonbase.markdown".into(), keys: None }
+    }
+
     /// What a stream of `doc` starts with after `after`: its records' types (and for updates, what they
     /// say), and the last one's seq.
     fn streamed(app: &App, doc: &Record, after: i64) -> (Vec<String>, i64) {
@@ -1449,13 +1550,12 @@ mod tests {
 
     #[tokio::test]
     async fn docs() {
-        use fedcrdt_core::{DocData, DocKind};
         let (app, alice, bob) = setup();
         let carol = key(3);
         let grant = GrantData { path: "/doc".into(), grantees: Grantees::Anyone };
         put(&app, &sign(&alice, GRANT_PATH, "grant", grant.to_cbor(), None, 1)).unwrap();
 
-        let doc = sign(&bob, "/doc", "doc", DocData { title: "Plans".into(), editors: vec![], kind: DocKind::Text }.to_cbor(), None, 1);
+        let doc = sign(&bob, "/doc", "doc", doc_data("Plans", vec![]).to_cbor(), None, 1);
         put(&app, &doc).unwrap();
         put(&app, &doc_update(&bob, &doc, "/doc", b"bob")).unwrap();
         put(&app, &doc_update(&alice, &doc, "/doc", b"alice")).expect("owners may edit anything");
@@ -1472,11 +1572,16 @@ mod tests {
         let token = [42u8; 32];
         let claim_rec = sign(&bob, "/doc", "claim", ClaimData { token_hash: Sha256::digest(token).into(), user: None }.to_cbor(), None, 1);
         put(&app, &claim_rec).expect("claims go anywhere one may write");
-        let v2 = sign(&bob, "/doc", "doc", DocData { title: "Plans".into(), editors: vec![Who::Claim(claim_rec.hash())], kind: DocKind::Text }.to_cbor(), Some(&doc), 2);
+        let v2 = sign(&bob, "/doc", "doc", doc_data("Plans", vec![Who::Claim(claim_rec.hash())]).to_cbor(), Some(&doc), 2);
         put(&app, &v2).unwrap();
-        let as_list = sign(&bob, "/doc", "doc", DocData { title: "Plans".into(), editors: vec![], kind: DocKind::List }.to_cbor(), Some(&v2), 3);
-        let err = put(&app, &as_list).unwrap_err();
-        assert!(err.contains("kind"), "{err}");
+        for changed in [
+            DocData { schema: "bisonbase.list".into(), ..doc_data("Plans", vec![]) },
+            DocData { format: "automerge".into(), ..doc_data("Plans", vec![]) },
+            DocData { keys: Some(vec![]), ..doc_data("Plans", vec![]) },
+        ] {
+            let err = put(&app, &sign(&bob, "/doc", "doc", changed.to_cbor(), Some(&v2), 3)).unwrap_err();
+            assert!(err.contains("format, schema"), "{err}");
+        }
         let app = Arc::new(app);
         let sig = carol.sign(&claim_signed_bytes(&app.pk, &token)).to_bytes();
         let c = Claim { token: encode_b58(&token), user: encode_id(&id(&carol)), signature: encode_b58(&sig) };
@@ -1521,12 +1626,11 @@ mod tests {
 
     #[tokio::test]
     async fn streams_and_live_rooms() {
-        use fedcrdt_core::{DocData, DocKind};
         let (app, alice, bob) = setup();
         let carol = key(3);
         let grant = GrantData { path: "/doc".into(), grantees: Grantees::Anyone };
         put(&app, &sign(&alice, GRANT_PATH, "grant", grant.to_cbor(), None, 1)).unwrap();
-        let doc = sign(&bob, "/doc", "doc", DocData { title: "".into(), editors: vec![Who::User(id(&carol))], kind: DocKind::Text }.to_cbor(), None, 1);
+        let doc = sign(&bob, "/doc", "doc", doc_data("", vec![Who::User(id(&carol))]).to_cbor(), None, 1);
         put(&app, &doc).unwrap();
 
         // What a stream of the doc, and one of /post, would pass on as records are stored.
@@ -1555,5 +1659,147 @@ mod tests {
         assert!(err.contains("doesn't match"), "signed for another doc: {err}");
         let err = app.live_hello(&doc.hash(), &hello(&carol, &doc.hash(), now_ms() - 1)).unwrap_err();
         assert!(err.contains("expired"), "{err}");
+    }
+
+    /// `key`'s record `r`, re-signed for `user` under `delegation`.
+    fn acting(key: &SigningKey, r: Record, user: &SigningKey, delegation: &Record) -> Record {
+        let mut r = Record { acting: Some(Acting { user: id(user), delegation: delegation.hash() }), ..r };
+        r.signature = key.sign(&r.signed_bytes()).to_bytes();
+        r
+    }
+
+    fn grant_anyone(app: &App, owner: &SigningKey, path: &str) {
+        put(app, &sign(owner, GRANT_PATH, "grant", GrantData { path: path.into(), grantees: Grantees::Anyone }.to_cbor(), None, 1)).unwrap();
+    }
+
+    #[test]
+    fn app_types_and_user_spaces() {
+        let (app, alice, bob) = setup();
+        let carol = key(3);
+        grant_anyone(&app, &alice, "/todo");
+        grant_anyone(&app, &alice, "/u");
+
+        let item = sign(&bob, "/todo/1", "todo.item", "milk".into(), None, 1);
+        put(&app, &item).expect("any app type, given a grant");
+        let err = put(&app, &sign(&carol, "/todo/1", "todo.item", "eggs".into(), Some(&item), 2)).unwrap_err();
+        assert!(err.contains("only its author"), "{err}");
+        put(&app, &sign(&bob, "/todo/1", "todo.item", "oat milk".into(), Some(&item), 2)).unwrap();
+        let err = put(&app, &sign(&bob, "/todo/1", "todo.thing", "x".into(), Some(&item), 3)).unwrap_err();
+        assert!(err.contains("type"), "{err}");
+        assert!(put(&app, &sign(&bob, "/todo/2", "todo", "x".into(), None, 1)).unwrap_err().contains("unknown record type"));
+
+        let space = user_path(&id(&bob));
+        put(&app, &sign(&bob, &enckey_path(&id(&bob)), "enckey", EncKeyData { key: [5; 32] }.to_cbor(), None, 1)).unwrap();
+        put(&app, &post(&bob, &format!("{space}/notes"), "mine", None, 1)).unwrap();
+        let err = put(&app, &post(&carol, &format!("{space}/notes"), "in bob's space", None, 1)).unwrap_err();
+        assert!(err.contains("space"), "{err}");
+        put(&app, &post(&alice, &format!("{space}/notes"), "an owner's", None, 1)).expect("owners may write anywhere");
+
+        // Still only with a grant: owners decide who stores what on their node.
+        let other = node();
+        let err = put(&other, &sign(&bob, &enckey_path(&id(&bob)), "enckey", EncKeyData { key: [5; 32] }.to_cbor(), None, 1)).unwrap_err();
+        assert!(err.contains("needs a grant"), "{err}");
+    }
+
+    #[test]
+    fn delegations() {
+        let (app, alice, bob) = setup();
+        let (carol, todo_app, other_key) = (key(3), key(9), key(10));
+        grant_anyone(&app, &alice, "/todo");
+        grant_anyone(&app, &alice, "/u");
+        grant_anyone(&app, &alice, "/doc");
+        let data = DelegateData {
+            key: id(&todo_app),
+            name: "Todo".into(),
+            paths: Some(vec!["/todo".into(), "/doc".into()]),
+            types: Some(vec!["todo.item".into(), "doc_update".into()]),
+            expires: None,
+        };
+        let deleg = sign(&bob, &delegate_path(&id(&bob)), "delegate", data.to_cbor(), None, 1);
+        put(&app, &deleg).unwrap();
+
+        let item = acting(&todo_app, sign(&todo_app, "/todo/1", "todo.item", "milk".into(), None, 1), &bob, &deleg);
+        put(&app, &item).expect("the app signs for bob");
+        let by: Pubkey = app.db.lock().unwrap().query_row("SELECT author FROM chains WHERE root = ?1", [item.hash()], |r| r.get(0)).unwrap();
+        assert_eq!(by, id(&bob), "it's bob's");
+        put(&app, &sign(&bob, "/todo/1", "todo.item", "oat milk".into(), Some(&item), 2)).expect("so bob may edit it himself");
+
+        let err = put(&app, &acting(&todo_app, post(&todo_app, "/todo/2", "hi", None, 1), &bob, &deleg)).unwrap_err();
+        assert!(err.contains("doesn't cover"), "{err}");
+        let err = put(&app, &acting(&todo_app, sign(&todo_app, "/elsewhere", "todo.item", "x".into(), None, 1), &bob, &deleg)).unwrap_err();
+        assert!(err.contains("doesn't cover"), "{err}");
+        let err = put(&app, &acting(&other_key, sign(&other_key, "/todo/3", "todo.item", "x".into(), None, 1), &bob, &deleg)).unwrap_err();
+        assert!(err.contains("another key"), "{err}");
+        let err = put(&app, &acting(&todo_app, sign(&todo_app, "/todo/4", "todo.item", "x".into(), None, 1), &carol, &deleg)).unwrap_err();
+        assert!(err.contains("isn't the user's"), "{err}");
+        let err = put(&app, &acting(&todo_app, post(&todo_app, &format!("{}/x", user_path(&id(&bob))), "x", None, 1), &bob, &deleg)).unwrap_err();
+        assert!(err.contains("doesn't cover"), "{err}");
+
+        // A doc of bob's, which the app edits for him.
+        let doc = sign(&bob, "/doc", "doc", doc_data("", vec![]).to_cbor(), None, 1);
+        put(&app, &doc).unwrap();
+        put(&app, &acting(&todo_app, doc_update(&todo_app, &doc, "/doc", b"x"), &bob, &deleg)).expect("as bob, an editor");
+        let hello = |doc: &Hash, user: Option<&SigningKey>, deleg: &Record| {
+            let expires = now_ms() + 60_000;
+            let sig = todo_app.sign(&live_signed_bytes(&app.pk, doc, expires)).to_bytes();
+            let mut h = json!({ "user": encode_id(&id(&todo_app)), "expires": expires, "signature": encode_b58(&sig) });
+            if let Some(u) = user {
+                h["as"] = encode_id(&id(u)).into();
+                h["delegation"] = encode_b58(&deleg.hash()).into();
+            }
+            h.to_string()
+        };
+        assert_eq!(app.live_hello(&doc.hash(), &hello(&doc.hash(), Some(&bob), &deleg)), Ok(id(&bob)), "joins as bob");
+        assert!(app.live_hello(&doc.hash(), &hello(&doc.hash(), None, &deleg)).unwrap_err().contains("author and editors"));
+        assert!(app.live_hello(&doc.hash(), &hello(&doc.hash(), Some(&carol), &deleg)).unwrap_err().contains("isn't the user's"));
+
+        // Expired, then revoked.
+        let expired = DelegateData { expires: Some(now_ms() - 1), ..data.clone() };
+        let old = sign(&bob, &delegate_path(&id(&bob)), "delegate", expired.to_cbor(), None, 2);
+        put(&app, &old).unwrap();
+        let err = put(&app, &acting(&todo_app, sign(&todo_app, "/todo/5", "todo.item", "x".into(), None, 1), &bob, &old)).unwrap_err();
+        assert!(err.contains("expired"), "{err}");
+        put(&app, &tombstone(&bob, &deleg, 2)).unwrap();
+        let err = put(&app, &acting(&todo_app, sign(&todo_app, "/todo/6", "todo.item", "x".into(), None, 1), &bob, &deleg)).unwrap_err();
+        assert!(err.contains("revoked"), "{err}");
+        assert!(app.live_hello(&doc.hash(), &hello(&doc.hash(), Some(&bob), &deleg)).unwrap_err().contains("revoked"));
+    }
+
+    #[test]
+    fn snapshots() {
+        let (app, alice, bob) = setup();
+        let (carol, dave) = (key(3), key(4));
+        grant_anyone(&app, &alice, "/doc");
+        let doc = sign(&bob, "/doc", "doc", doc_data("", vec![Who::User(id(&carol))]).to_cbor(), None, 1);
+        put(&app, &doc).unwrap();
+        let u1 = doc_update(&bob, &doc, "/doc", b"u1");
+        let u2 = doc_update(&carol, &doc, "/doc", b"u2");
+        let u3 = doc_update(&bob, &doc, "/doc", b"u3");
+        for u in [&u1, &u2, &u3] {
+            put(&app, u).unwrap();
+        }
+        let snapshot = |k: &SigningKey, covers: &[&Record], version: u64| {
+            let data = DocSnapshotData { doc: doc.hash(), state: b"state".to_vec(), covers: covers.iter().map(|r| r.hash()).collect() };
+            sign(k, "/doc", "doc_snapshot", data.to_cbor(), None, version)
+        };
+        let s1 = snapshot(&carol, &[&u1, &u2], 5);
+        put(&app, &s1).expect("an editor's snapshot");
+        let older = snapshot(&bob, &[&u1], 4);
+        put(&app, &older).unwrap();
+        let err = put(&app, &snapshot(&dave, &[&u1], 9)).unwrap_err();
+        assert!(err.contains("author and editors"), "{err}");
+        // A non-editor's newer snapshot, pushed by a peer, is stored but never served in place of updates.
+        let sneaky = snapshot(&dave, &[&u1, &u2, &u3], 9);
+        pushed(&app, &sneaky);
+        let u4 = doc_update(&bob, &doc, "/doc", b"u4");
+        put(&app, &u4).unwrap();
+        let err = put(&app, &tombstone(&carol, &s1, 6)).unwrap_err();
+        assert!(err.contains("never edited or deleted"), "{err}");
+
+        let db = app.db.lock().unwrap();
+        let f = StreamFilter { doc: Some(doc.hash()), prefix: None };
+        let hashes = |rows: Vec<(i64, Vec<u8>)>| -> Vec<Hash> { rows.iter().map(|(_, b)| Sha256::digest(b).into()).collect() };
+        assert_eq!(hashes(stored_after(&db, &f, 0)).len(), 8, "everything, without compacting");
+        assert_eq!(hashes(compact(&db, &doc.hash(), stored_after(&db, &f, 0))), [doc.hash(), u3.hash(), s1.hash(), u4.hash()]);
     }
 }

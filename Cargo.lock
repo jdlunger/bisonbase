@@ -472,6 +472,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tokio-stream",
+ "tower-http",
 ]
 
 [[package]]
@@ -489,6 +490,7 @@ name = "fedcrdt-wasm"
 version = "0.1.0"
 dependencies = [
  "fedcrdt-core",
+ "js-sys",
  "serde",
  "serde-wasm-bindgen",
  "serde_bytes",

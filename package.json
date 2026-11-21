@@ -12,7 +12,8 @@
     "dev:peer": "npm run -s wasm:dev && concurrently -k -n peer,peerweb -c magenta,blue \"DB=peer.db PORT=8081 ORIGIN=http://localhost:5174 cargo run\" \"API=http://localhost:8081 vite --port 5174 --strictPort\"",
     "dev:peer:fresh": "DB=peer.db cargo run -q -- --drop-db && npm run dev:peer",
     "build": "npm run wasm && tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:client": "npm run -s wasm:dev && client/test/run.sh"
   },
   "dependencies": {
     "@codemirror/commands": "^6.11.1",

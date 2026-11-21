@@ -11,48 +11,39 @@ import { marked } from "marked";
 import DOMPurify from "dompurify";
 import {
   type Post,
-  type Rec,
   type User,
+  SCHEMAS,
   addDocEditor,
   amOwner,
   b58,
-  docHasOpenClaims,
-  getChain,
   inviteToDoc,
   isHash,
-  joinLive,
-  loadClaims,
+  joinDocLive,
   mayEditDoc,
-  putDocUpdate,
+  myEncKeys,
+  mySigner,
+  node,
   removeDocEditor,
   renameDoc,
-  streamRecords,
-  streamedRecord,
+  sealForEditors,
   userPhrase,
+  viewPost,
 } from "./api.ts";
+import { type DocStatus, type DocSync, type Store, decodeId, openDoc, unb58 } from "../../client/src/index.ts";
+import { yjs } from "../../client/src/yjs.ts";
 import { ClaimLink } from "./Identity.tsx";
 import { ListView } from "./List.tsx";
 import { PartyLink, PathLinks, UserLink } from "./NoteList.tsx";
 import { Link, recordPath } from "./router.tsx";
 import { kvDel, kvGet, kvSet } from "./store.ts";
-import { type Run, input, link, secondary, useLoad } from "./ui.ts";
+import { type Run, input, link, secondary } from "./ui.ts";
 
-// A shared doc: its "doc" record (title, editors, kind) and its content, a Yjs CRDT built from
-// "doc_update" records (see the end of api.ts): markdown text, or a list (see List.tsx). We stream the doc's records from the node, apply the updates by its
-// author and editors, and write our own edits as updates: batched, so typing doesn't sign a record per
-// key. Editors also join the doc's live room, to see each other's cursors (Yjs awareness), which
-// nothing stores.
+// A shared doc: its "doc" record (title, editors, schema) and its content, a Yjs CRDT kept in sync with
+// the node by `openDoc` (client/src/docs.ts), which also keeps it on this device, sends our edits, and
+// decrypts and encrypts it if it's encrypted. What we show depends on its schema: markdown text, or a list
+// (see List.tsx). Editors also join the doc's live room, to see each other's cursors (Yjs awareness),
+// which nothing stores.
 
-/** The origins we tag updates from the node, and from what this device kept, with: they aren't ours to send. */
-const REMOTE = Symbol("remote");
-const CACHED = Symbol("cached");
-/** Keep the doc's content on this device once it's been still this long. */
-const SAVE_STATE_MS = 500;
-/** Send our edits once typing pauses this long, */
-const FLUSH_IDLE_MS = 250;
-/** or at the latest this long after the first unsent one. */
-const FLUSH_MAX_MS = 1500;
-const RETRY_MS = 3000;
 const RECONNECT_MS = 2000;
 
 /** Live room frames from the node (see `live` in src/main.rs): kind, connection (u32), sender's ID, payload. */
@@ -61,9 +52,6 @@ const LIVE_JOINED = 1;
 const LIVE_LEFT = 2;
 
 type Mode = "write" | "split" | "preview";
-
-/** How our edits stand: all sent, waiting to send, sending, or failing to send (why). */
-type SaveState = { unsent: boolean; sending: boolean; error: string };
 
 /** How someone shows in the live room: their phrase, and a color from their ID. */
 type Presence = { pubkey: string; name: string; color: string; colorLight: string };
@@ -79,27 +67,19 @@ function presence(pubkey: string): Presence {
  * connection, and which connection each remote awareness client came from. */
 type Live = { awareness: Awareness; users: Map<number, string>; clients: Map<number, number> };
 
+/** This device's IndexedDB (store.ts), as `openDoc` keeps things in it. */
+const store: Store = { get: kvGet, set: kvSet, del: kvDel };
+
 /** A doc's content and how it syncs with the node: set up for one doc (its hash) and one of us (`me`, or
- * null signed out), torn down on leaving.
- *
- * This device keeps (see store.ts) the doc's last known content, shown before the node answers or when it
- * can't, and the edits we haven't sent, sent when it can: whether the node's unreachable, or we leave first. */
-function useDocSync(hash: string, me: string | null, onDocChange: (doc: Post | null, deleted: boolean) => void) {
-  const [sync, setSync] = useState<{ ydoc: Y.Doc; live: Live } | null>(null);
-  const [ready, setReady] = useState(false);
-  const [save, setSave] = useState<SaveState>({ unsent: false, sending: false, error: "" });
-  const [syncError, setSyncError] = useState("");
-  /** Updates we got but aren't applying: their authors may not edit this doc (as far as we know). */
-  const [ignored, setIgnored] = useState(0);
-  const docRef = useRef<Post | null>(null);
-  const reloadRef = useRef<() => Promise<void>>(async () => {});
-  const onDocChangeRef = useRef(onDocChange);
-  onDocChangeRef.current = onDocChange;
+ * null signed out), torn down on leaving. */
+function useDocSync(hash: string, me: string | null) {
+  const [sync, setSync] = useState<{ doc: DocSync<Y.Doc>; live: Live } | null>(null);
+  const [status, setStatus] = useState<DocStatus | null>(null);
 
   useEffect(() => {
     if (!isHash(hash)) return;
-    const ydoc = new Y.Doc();
-    const live: Live = { awareness: new Awareness(ydoc), users: new Map(), clients: new Map() };
+    const doc = openDoc({ node, hash, adapter: yjs, signer: mySigner(), encryption: myEncKeys(), store, onStatus: setStatus });
+    const live: Live = { awareness: new Awareness(doc.content), users: new Map(), clients: new Map() };
     // Name remote cursors by who the live room says sent them, not by what they say. Registered
     // before the editor's own listener, so it sees the names already fixed.
     live.awareness.on("change", ({ added, updated }: { added: number[]; updated: number[] }, origin: unknown) => {
@@ -111,180 +91,16 @@ function useDocSync(hash: string, me: string | null, onDocChange: (doc: Post | n
         if (state) state.user = presence(user);
       }
     });
-    const stateKey = `doc:${hash}`;
-    /** Unsent edits are ours alone: they're sent signed by us. */
-    const outboxKey = me && `outbox:${hash}:${me}`;
-    let stopped = false;
-    let flushTimer: ReturnType<typeof setTimeout> | undefined;
-    let stateTimer: ReturnType<typeof setTimeout> | undefined;
-    /** Updates from the node not applied yet, because we don't know their authors as editors (yet). */
-    let pending: Rec[] = [];
-    /** Whether the doc record may have changed since we last loaded it; whether new updates came. */
-    let docDirty = true;
-    let fresh = false;
-    let caughtUp = false;
-    /** Our edits not sent yet, and when the first of them was made; and the ones being sent. */
-    const outbox: Uint8Array[] = [];
-    let firstUnsent = 0;
-    let inflight: Uint8Array | null = null;
-    docRef.current = null;
-    setReady(false);
-    setIgnored(0);
-    setSyncError("");
-    setSave({ unsent: false, sending: false, error: "" });
-
-    /** Keeps what we haven't sent (for sure) on this device. */
-    const keepOutbox = () => {
-      if (!outboxKey) return;
-      const all = inflight ? [inflight, ...outbox] : outbox;
-      if (all.length) kvSet(outboxKey, Y.mergeUpdates(all));
-      else kvDel(outboxKey);
-    };
-    const keepState = () => kvSet(stateKey, Y.encodeStateAsUpdate(ydoc));
-
-    /** Loads what this device kept. Whether it had the doc's content. */
-    const restore = async () => {
-      const [state, unsent] = await Promise.all([kvGet<Uint8Array>(stateKey), outboxKey ? kvGet<Uint8Array>(outboxKey) : undefined]);
-      if (stopped) return false;
-      if (state) Y.applyUpdate(ydoc, state, CACHED);
-      if (unsent) {
-        Y.applyUpdate(ydoc, unsent, CACHED);
-        outbox.push(unsent);
-        firstUnsent ||= Date.now();
-        setSave((s) => ({ ...s, unsent: true }));
-        schedule();
-      }
-      return !!state;
-    };
-
-    const loadDoc = async () => {
-      const chain = await getChain(hash);
-      const current = chain.current?.rec.type === "doc" ? chain.current : null;
-      if (stopped) return;
-      docRef.current = chain.deleted ? null : current;
-      onDocChangeRef.current(current, !!chain.deleted);
-    };
-    reloadRef.current = loadDoc;
-
-    /** Applies the pending updates whose authors may edit the doc; keeps the rest for if that changes. */
-    const apply = () => {
-      const doc = docRef.current;
-      if (!doc) return;
-      pending = pending.filter((u) => {
-        if (!u.verified || !u.docUpdate || b58(u.docUpdate.doc) !== hash) return false;
-        if (!mayEditDoc(doc, b58(u.author))) return true;
-        Y.applyUpdate(ydoc, u.docUpdate.update, REMOTE);
-        return false;
-      });
-      setIgnored(pending.length);
-    };
-
-    /** Catches up with what the stream brought: the doc record if it changed, then the updates. One at a time. */
-    let queue = Promise.resolve();
-    const process = () =>
-      (queue = queue.then(async () => {
-        try {
-          if (docDirty) {
-            docDirty = false;
-            await loadDoc();
-          }
-          // Someone we don't know may have claimed an invite since we loaded who claimed what.
-          const doc = docRef.current;
-          if (fresh && doc && docHasOpenClaims(doc) && pending.some((u) => !mayEditDoc(doc, b58(u.author)))) {
-            await loadClaims();
-            await loadDoc();
-          }
-          fresh = false;
-          apply();
-          if (outbox.length) schedule();
-        } catch (e) {
-          docDirty = true;
-          setSyncError((e as Error).message);
-        }
-      }));
-
-    // What this device kept is enough to show, until the stream catches up (or if it can't).
-    Promise.all([restore(), process()]).then(([had]) => had && !stopped && docRef.current && setReady(true));
-
-    const es = streamRecords({ doc: hash });
-    es.addEventListener("record", (e) => {
-      const rec = streamedRecord((e as MessageEvent<string>).data);
-      if (rec.type === "doc_update") {
-        pending.push(rec);
-        fresh = true;
-      } else docDirty = true; // a new version of the doc, or its deletion
-      if (caughtUp) process();
-    });
-    es.addEventListener("ready", () => {
-      caughtUp = true;
-      process().then(() => !stopped && setReady(true));
-    });
-    es.onopen = () => setSyncError("");
-    es.onerror = () => setSyncError("can't reach the node; reconnecting…");
-
-    const schedule = (ms?: number) => {
-      clearTimeout(flushTimer);
-      flushTimer = setTimeout(flush, ms ?? Math.max(0, Math.min(FLUSH_IDLE_MS, firstUnsent + FLUSH_MAX_MS - Date.now())));
-    };
-
-    /** Sends our unsent edits as one update record. */
-    const flush = async () => {
-      const doc = docRef.current;
-      if (inflight || !outbox.length || !doc) return;
-      inflight = Y.mergeUpdates(outbox.splice(0));
-      firstUnsent = 0;
-      setSave((s) => ({ ...s, sending: true }));
-      let error = "";
-      try {
-        await putDocUpdate(doc, inflight);
-      } catch (e) {
-        error = (e as Error).message;
-        outbox.unshift(inflight);
-      }
-      inflight = null;
-      keepOutbox();
-      setSave({ unsent: outbox.length > 0, sending: false, error });
-      if (outbox.length && !stopped) schedule(error ? RETRY_MS : undefined);
-    };
-
-    ydoc.on("update", (u: Uint8Array, origin: unknown) => {
-      if (origin === CACHED) return;
-      clearTimeout(stateTimer);
-      stateTimer = setTimeout(keepState, SAVE_STATE_MS);
-      if (origin === REMOTE) return;
-      outbox.push(u);
-      keepOutbox();
-      if (!firstUnsent) firstUnsent = Date.now();
-      setSave((s) => ({ ...s, unsent: true }));
-      schedule();
-    });
-
-    setSync({ ydoc, live });
-
+    setSync({ doc, live });
     return () => {
-      stopped = true;
-      es.close();
-      clearTimeout(flushTimer);
-      if (stateTimer) {
-        clearTimeout(stateTimer);
-        keepState();
-      }
-      // Leaving within the app: send what's left now, rather than next time. It's kept here until it's gone.
-      const left = outbox.splice(0);
-      if (left.length && docRef.current) {
-        const merged = Y.mergeUpdates(left);
-        putDocUpdate(docRef.current, merged).then(keepOutbox, () => {
-          outbox.unshift(merged);
-          keepOutbox();
-        });
-      }
       live.awareness.destroy();
-      ydoc.destroy();
+      doc.close();
       setSync(null);
+      setStatus(null);
     };
   }, [hash, me]);
 
-  return { sync, ready, save, syncError, ignored, reload: () => reloadRef.current() };
+  return { sync, status };
 }
 
 /** While `me` may edit the doc: its live room, passing our awareness (cursor) to the other editors there,
@@ -315,7 +131,7 @@ function useLiveRoom(hash: string, live: Live | null, me: User | null, editable:
 
     const connect = async () => {
       try {
-        const live = await joinLive(hash);
+        const live = await joinDocLive(hash);
         if (stopped) return live.ws.close();
         ws = live.ws;
         ws.onopen = () => {
@@ -433,8 +249,7 @@ function Preview({ ytext }: { ytext: Y.Text }) {
   );
 }
 
-function Status(props: { save: SaveState; syncError: string; ignored: number; editable: boolean; here: Presence[] }) {
-  const { save, syncError, ignored, editable, here } = props;
+function Status({ status, here }: { status: DocStatus; here: Presence[] }) {
   const parts: React.ReactNode[] = [];
   if (here.length) {
     parts.push(
@@ -448,17 +263,23 @@ function Status(props: { save: SaveState; syncError: string; ignored: number; ed
       </span>,
     );
   }
-  if (save.error) {
+  if (status.saveError) {
     parts.push(
-      <span className="text-amber-700" title={save.error}>
+      <span className="text-amber-700" title={status.saveError}>
         Not sent yet: kept on this device, and sent once the node takes it
       </span>,
     );
-  } else if (save.sending) parts.push("Saving…");
-  else if (save.unsent) parts.push("Unsaved changes");
-  else if (editable) parts.push("All changes saved");
-  if (syncError) parts.push(<span className="text-red-700">Couldn't sync: {syncError}</span>);
-  if (ignored) parts.push(<span title="Signed by people this doc doesn't name as editors">{ignored} update{ignored > 1 && "s"} by non-editors ignored</span>);
+  } else if (status.sending) parts.push("Saving…");
+  else if (status.unsent) parts.push("Unsaved changes");
+  else if (status.editable) parts.push("All changes saved");
+  if (status.syncError) parts.push(<span className="text-red-700">Couldn't sync: {status.syncError}</span>);
+  if (status.ignored) {
+    parts.push(
+      <span title="Signed by people this doc doesn't name as editors, or that couldn't be decrypted">
+        {status.ignored} update{status.ignored > 1 && "s"} ignored
+      </span>,
+    );
+  }
   return (
     <p className="text-xs text-gray-500">
       {parts.map((p, i) => (
@@ -472,7 +293,8 @@ function Status(props: { save: SaveState; syncError: string; ignored: number; ed
 }
 
 /** Who may edit `doc`, and (for its author and the node's owners) adding and removing editors. */
-function Editors({ doc, me, manage, busy, run }: { doc: Post; me: User | null; manage: boolean; busy: boolean; run: Run }) {
+function Editors(props: { doc: Post; docKey: Uint8Array | null; me: User | null; manage: boolean; busy: boolean; run: Run }) {
+  const { doc, docKey, me, manage, busy, run } = props;
   const [id, setId] = useState("");
   const [invite, setInvite] = useState<string | null>(null);
   const editors = doc.doc!.editors;
@@ -510,7 +332,7 @@ function Editors({ doc, me, manage, busy, run }: { doc: Post; me: User | null; m
             onSubmit={(e) => {
               e.preventDefault();
               run(async () => {
-                await addDocEditor(doc, id);
+                await addDocEditor(doc, id, docKey);
                 setId("");
               })();
             }}
@@ -520,10 +342,13 @@ function Editors({ doc, me, manage, busy, run }: { doc: Post; me: User | null; m
               Add
             </button>
           </form>
-          <button className={secondary} disabled={busy} onClick={run(async () => setInvite(await inviteToDoc(doc)))}>
+          <button className={secondary} disabled={busy} onClick={run(async () => setInvite(await inviteToDoc(doc, docKey)))}>
             Make an invite link
           </button>
           {invite && <ClaimLink link={invite} />}
+          {invite && doc.doc!.encrypted && (
+            <p className="text-xs text-amber-800">This link carries the doc's key: whoever has it can read the doc.</p>
+          )}
         </>
       )}
     </section>
@@ -555,23 +380,42 @@ function Title({ doc, manage, busy, run }: { doc: Post; manage: boolean; busy: b
 /** /d/<hash>: a shared doc, by its chain's hash. */
 export function DocPage({ hash, me, busy, run, tick }: { hash: string; me: User | null; busy: boolean; run: Run; tick: number }) {
   const valid = isHash(hash);
-  const [doc, setDoc] = useState<{ post: Post | null; deleted: boolean } | null>(null);
   const [mode, setMode] = useState<Mode>("split");
-  useEffect(() => setDoc(null), [hash]);
-  const { sync, ready, save, syncError, ignored, reload } = useDocSync(hash, me?.pubkey ?? null, (post, deleted) => setDoc({ post, deleted }));
-  const post = doc?.post && !doc.deleted ? doc.post : null;
-  const editable = !!me && !!post && mayEditDoc(post, me.pubkey);
+  const { sync, status } = useDocSync(hash, me?.pubkey ?? null);
+  const info = status?.doc;
+  const post = useMemo(
+    () => info && viewPost(info.rec, { root: unb58(info.root)!, by: info.by ? decodeId(info.by) : undefined, versions: 1 }),
+    [info],
+  );
+  const editable = !!status?.editable && !!me && !!post && mayEditDoc(post, me.pubkey);
   useLiveRoom(hash, sync?.live ?? null, me, editable);
   const here = useHere(sync?.live ?? null);
-  // After our own actions (renaming, editors), see the new version now rather than on the next poll.
-  const { error } = useLoad(valid && tick ? reload : null, [hash], tick);
+  // After our own actions (renaming, editors), see the new version now rather than when the stream says.
+  useEffect(() => {
+    if (tick) sync?.doc.reload();
+  }, [tick]);
+  const manage = !!me && !!post && (post.by?.pubkey === me.pubkey || amOwner());
+  const docKey = sync?.doc.docKey() ?? null;
+  // An encrypted doc's key goes to editors who don't have it yet, once they've published an encryption key.
+  useEffect(() => {
+    if (manage && post?.doc?.encrypted && docKey) {
+      sealForEditors(post, docKey).then(
+        (changed) => {
+          if (changed) sync?.doc.reload();
+        },
+        (e) => console.warn("Couldn't share this doc's key with its editors:", e),
+      );
+    }
+  }, [post?.hash, manage, !!docKey]);
 
   if (!valid) return <p className="text-red-700"><code className="break-all">{hash}</code> isn't a doc hash (32 bytes of base58).</p>;
-  if (!doc) return <p className="text-gray-500">{syncError ? `Couldn't load this doc: ${syncError}` : "Loading…"}</p>;
+  if (!status || (!status.doc && !status.deleted && !status.ready)) {
+    return <p className="text-gray-500">{status?.syncError ? `Couldn't load this doc: ${status.syncError}` : "Loading…"}</p>;
+  }
   if (!post) {
     return (
       <p className="rounded-md bg-gray-50 p-3 text-sm text-gray-600 ring-1 ring-gray-200">
-        {doc.deleted ? "This was deleted." : "That isn't a doc or a list."}{" "}
+        {status.deleted ? "This was deleted." : "That isn't a doc or a list."}{" "}
         <Link href={recordPath(hash)} className={link}>
           See its record
         </Link>
@@ -579,8 +423,9 @@ export function DocPage({ hash, me, busy, run, tick }: { hash: string; me: User 
       </p>
     );
   }
-  const manage = !!me && (post.by?.pubkey === me.pubkey || amOwner());
-  const list = post.doc!.kind === "list";
+  const { schema, format } = post.doc!;
+  const known = format === "yjs" && (schema === SCHEMAS.markdown || schema === SCHEMAS.list);
+  const list = schema === SCHEMAS.list;
   const tab = (m: Mode, label: string) => (
     <button
       className={`cursor-pointer px-2.5 py-1 ${mode === m ? "bg-gray-900 text-white" : "bg-white hover:bg-gray-50"}`}
@@ -600,34 +445,45 @@ export function DocPage({ hash, me, busy, run, tick }: { hash: string; me: User 
           <Link href={recordPath(post.root)} className={`font-mono ${link}`} title="The doc record and its versions">
             #{post.root.slice(0, 8)}
           </Link>
-          {!editable && <span>{me ? "· You can read it, but not edit it." : "· Sign in to edit, if you're an editor."}</span>}
+          {post.doc!.encrypted && <span title="Only its editors can read it. Its title isn't encrypted.">· 🔒 encrypted</span>}
+          {!editable && !status.locked && <span>{me ? "· You can read it, but not edit it." : "· Sign in to edit, if you're an editor."}</span>}
         </p>
       </div>
-      {error && <p className="text-sm text-red-700">{error}</p>}
 
-      <div className="flex items-center justify-between gap-2">
-        <Status save={save} syncError={syncError} ignored={ignored} editable={editable} here={here} />
-        {!list && (
-          <div className="flex overflow-hidden rounded-md text-xs font-medium ring-1 ring-gray-300">
-            {tab("write", "Write")}
-            {tab("split", "Split")}
-            {tab("preview", "Preview")}
-          </div>
-        )}
-      </div>
-
-      {!sync || !ready ? (
-        <p className="text-gray-500">Loading…</p>
-      ) : list ? (
-        <ListView ydoc={sync.ydoc} editable={editable} />
+      {status.locked ? (
+        <p className="rounded-md bg-gray-50 p-3 text-sm text-gray-600 ring-1 ring-gray-200">
+          🔒 This doc is encrypted, and its key hasn't been shared with {me ? "you" : "you (sign in, if you're an editor)"}.
+        </p>
+      ) : !known ? (
+        <p className="rounded-md bg-gray-50 p-3 text-sm text-gray-600 ring-1 ring-gray-200">
+          This doc holds <code className="font-mono">{schema}</code> ({format}), from an app this page doesn't know.
+        </p>
       ) : (
-        <div className={`grid gap-4 ${mode === "split" ? "md:grid-cols-2" : ""}`}>
-          {mode !== "preview" && <Editor ytext={sync.ydoc.getText("md")} awareness={sync.live.awareness} editable={editable} />}
-          {mode !== "write" && <Preview ytext={sync.ydoc.getText("md")} />}
-        </div>
+        <>
+          <div className="flex items-center justify-between gap-2">
+            <Status status={{ ...status, editable }} here={here} />
+            {!list && (
+              <div className="flex overflow-hidden rounded-md text-xs font-medium ring-1 ring-gray-300">
+                {tab("write", "Write")}
+                {tab("split", "Split")}
+                {tab("preview", "Preview")}
+              </div>
+            )}
+          </div>
+          {!sync || !status.ready ? (
+            <p className="text-gray-500">Loading…</p>
+          ) : list ? (
+            <ListView ydoc={sync.doc.content} editable={editable} />
+          ) : (
+            <div className={`grid gap-4 ${mode === "split" ? "md:grid-cols-2" : ""}`}>
+              {mode !== "preview" && <Editor ytext={sync.doc.content.getText("md")} awareness={sync.live.awareness} editable={editable} />}
+              {mode !== "write" && <Preview ytext={sync.doc.content.getText("md")} />}
+            </div>
+          )}
+        </>
       )}
 
-      <Editors doc={post} me={me} manage={manage} busy={busy} run={run} />
+      <Editors doc={post} docKey={docKey} me={me} manage={manage} busy={busy} run={run} />
     </div>
   );
 }

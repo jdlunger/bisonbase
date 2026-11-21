@@ -20,6 +20,12 @@ When modifying schema, to drop DB on each run:
 npm run dev:fresh
 ```
 
+Tests: `cargo test` (core and node), and `npm run test:client` (the client library against a real node).
+
+## Building apps on it
+
+Any app can keep its data on a node, as records of its own types (namespaced, e.g. `todo.item`) or as CRDT docs in any format and schema (e.g. Yjs, `myapp.board`), through the client library in `client/`. Apps on other origins sign with their own key, which the user lets sign for them at `/connect`. Docs can be encrypted, so that nodes only ever see ciphertext. See [client/README.md](client/README.md).
+
 ## Future Ideas
 
  - Link share flow: "share" record signed by user with a random token (hidden, not federated), and when someone opens that token, the node signs a "claim" record

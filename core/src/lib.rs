@@ -73,7 +73,7 @@ pub fn node_phrase(pk: &Pubkey) -> String {
 // bytes a signature covers can always be rebuilt from the decoded value. Fields and values we don't
 // recognize are ignored, not rejected.
 
-pub use dcbor::{CBOR, CBORCase, Map};
+pub use dcbor::{CBOR, CBORCase, Map, Simple};
 
 fn bytes<const N: usize>(v: &CBOR) -> Option<[u8; N]> {
     v.as_byte_string()?.try_into().ok()
@@ -105,17 +105,23 @@ fn as_map<'a>(v: &'a CBOR, what: &str) -> Result<&'a Map, String> {
 //                         any number of records share a path
 //   version    uint       ms since the epoch, by the author's clock
 //   type       text       what `data` holds: "post" (data: text), "tombstone" (data: null, a delete),
-//                         "claim" (see `ClaimData`), "doc" / "doc_update" (see "shared documents"),
-//                         or one of the node types below
+//                         "claim" (see `ClaimData`), "doc" / "doc_update" / "doc_snapshot" (see
+//                         "shared documents"), "delegate" / "enckey" (see "user spaces"), one of the
+//                         node types below, or an app's own type (see "app types")
 //   data       any        the content, per `type`
 //   edits      bytes(32)? the hash of the version this one edits (or, for a tombstone, deletes): the
 //                         newest one its author saw. Edits keep the type but may change the path
 //   private    bool       if true, only the node's owners may read it, and it's never federated. Edits
 //                         may change it; a chain is private if its current version is
+//   as         map?       {user: bytes(32), delegation: bytes(32)}: the author signs for `user`, under
+//                         the "delegate" chain (by its first record's hash) where `user` let the
+//                         author's key do so (see "user spaces"). The record then counts as `user`'s:
+//                         its principal. Without it, the author is the principal
 //   signature  bytes(64)  author's Ed25519 signature over `RECORD_CONTEXT || CBOR(the record
 //                         without this field)`
 //
-// Any other fields are kept (the signature covers them) but otherwise ignored.
+// Any other fields are kept (the signature covers them) but otherwise ignored. A record is at most
+// MAX_RECORD_BYTES.
 //
 // A record is identified by its hash: SHA-256 of its CBOR, signature included. Records never change;
 // an edit is a new record. A record and its edits form a chain, named by its first record's hash.
@@ -126,6 +132,9 @@ fn as_map<'a>(v: &'a CBOR, what: &str) -> Result<&'a Map, String> {
 pub const RECORD_CONTEXT: &[u8] = b"bisonbase-record-v2\n";
 
 pub const MAX_PATH_BYTES: usize = 1024;
+
+/// The largest record, as CBOR, signature included.
+pub const MAX_RECORD_BYTES: usize = 1024 * 1024;
 
 pub type Hash = [u8; 32];
 
@@ -138,12 +147,175 @@ pub struct Record {
     pub data: CBOR,
     pub edits: Option<Hash>,
     pub private: bool,
+    pub acting: Option<Acting>,
     pub signature: [u8; 64],
     /// Fields this version doesn't know about.
     pub extra: Map,
 }
 
-const RECORD_FIELDS: [&str; 8] = ["author", "path", "version", "type", "data", "edits", "private", "signature"];
+/// A record's `as`: its author signs for `user`, under `user`'s "delegate" chain `delegation`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Acting {
+    pub user: Pubkey,
+    pub delegation: Hash,
+}
+
+impl Acting {
+    pub fn from_cbor(v: &CBOR) -> Result<Self, String> {
+        let m = as_map(v, "as")?;
+        Ok(Acting { user: field(m, "user", bytes)?, delegation: field(m, "delegation", bytes)? })
+    }
+
+    pub fn to_cbor(&self) -> CBOR {
+        let mut m = Map::new();
+        m.insert("user", CBOR::to_byte_string(self.user));
+        m.insert("delegation", CBOR::to_byte_string(self.delegation));
+        m.into()
+    }
+}
+
+const RECORD_FIELDS: [&str; 9] = ["author", "path", "version", "type", "data", "edits", "private", "as", "signature"];
+
+// ---- app types ----
+//
+// Apps write records of their own types, with any data: nodes check nothing about it but its size. An
+// app type's name is namespaced: it has a "." (e.g. "todo.item", "com.example.board"), which no type
+// nodes know ever has. Doc schemas (see "shared documents") are named the same way.
+
+/// Names of app types, doc schemas and formats: 1 to MAX_NAME_BYTES of a-z, 0-9, ".", "-" and "_".
+pub const MAX_NAME_BYTES: usize = 64;
+
+pub fn check_name(name: &str, what: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > MAX_NAME_BYTES {
+        return Err(format!("{what} must be 1 to {MAX_NAME_BYTES} bytes"));
+    }
+    if !name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b)) {
+        return Err(format!("{what} may only have a-z, 0-9, \".\", \"-\" and \"_\""));
+    }
+    Ok(())
+}
+
+/// Whether `kind` is an app's type: namespaced, with a ".".
+pub fn is_app_type(kind: &str) -> bool {
+    kind.contains('.')
+}
+
+/// Checks a namespaced name: an app type or a doc schema.
+pub fn check_app_name(name: &str, what: &str) -> Result<(), String> {
+    check_name(name, what)?;
+    if !is_app_type(name) || name.split('.').any(str::is_empty) {
+        return Err(format!("{what} must be namespaced, with a \".\" between names (e.g. \"myapp.thing\")"));
+    }
+    Ok(())
+}
+
+// ---- user spaces ----
+//
+// Each user has a space, /u/<their ID>: only they (or the node's owners) may write there, given a grant
+// covering it, as anywhere. Two of their records live at fixed paths in it, and they always sign those
+// themselves, never under `as`:
+//
+//   /u/<ID>/delegate  type "delegate" (see `DelegateData`): lets another key, e.g. an app's, sign records
+//                     for them, with `as`. A chain per key; deleting it revokes it. Readers then stop
+//                     trusting anything that key signed for them, as it may have leaked
+//   /u/<ID>/key       type "enckey" (see `EncKeyData`): their X25519 public key, for sealing encrypted
+//                     docs' keys to them
+
+pub const USER_SPACE: &str = "/u";
+
+/// A user's space: /u/<their ID>.
+pub fn user_path(pk: &Pubkey) -> String {
+    format!("{USER_SPACE}/{}", encode_id(pk))
+}
+
+/// Whose space `path` is in, if it's in one.
+pub fn path_user(path: &str) -> Option<Pubkey> {
+    let rest = path.strip_prefix(USER_SPACE)?.strip_prefix('/')?;
+    decode_id(rest.split('/').next()?)
+}
+
+pub fn delegate_path(pk: &Pubkey) -> String {
+    format!("{}/delegate", user_path(pk))
+}
+
+pub fn enckey_path(pk: &Pubkey) -> String {
+    format!("{}/key", user_path(pk))
+}
+
+/// A "delegate" record's data: lets `key` sign records for its author, at or under one of `paths`, of one
+/// of `types` (either missing: any), until `expires` (ms since the epoch; missing: no end). `name` says
+/// who `key` is, e.g. an app's name. Never for records under /node, nor for the user's own
+/// delegate and enckey records.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DelegateData {
+    pub key: Pubkey,
+    pub name: String,
+    pub paths: Option<Vec<String>>,
+    pub types: Option<Vec<String>>,
+    pub expires: Option<u64>,
+}
+
+impl DelegateData {
+    pub fn from_cbor(v: &CBOR) -> Result<Self, String> {
+        let m = as_map(v, "a delegation's data")?;
+        let d = DelegateData {
+            key: field(m, "key", bytes)?,
+            name: field(m, "name", text)?,
+            paths: opt_field(m, "paths", text_list)?,
+            types: opt_field(m, "types", text_list)?,
+            expires: opt_field(m, "expires", |v| u64::try_from(v.clone()).ok())?,
+        };
+        if d.name.trim() != d.name || d.name.len() > 200 {
+            return Err("a delegation's name must be trimmed, and at most 200 bytes".into());
+        }
+        for p in d.paths.iter().flatten() {
+            check_prefix(p)?;
+        }
+        Ok(d)
+    }
+
+    pub fn to_cbor(&self) -> CBOR {
+        let mut m = Map::new();
+        m.insert("key", CBOR::to_byte_string(self.key));
+        m.insert("name", self.name.as_str());
+        if let Some(p) = &self.paths {
+            m.insert("paths", p.clone());
+        }
+        if let Some(t) = &self.types {
+            m.insert("types", t.clone());
+        }
+        if let Some(e) = self.expires {
+            m.insert("expires", e);
+        }
+        m.into()
+    }
+
+    /// Whether this lets its key sign a record of type `kind` at `path`, at time `at` (ms since the epoch).
+    /// Tombstones go wherever the key may write.
+    pub fn covers(&self, path: &str, kind: &str, at: u64) -> bool {
+        self.expires.is_none_or(|e| at <= e)
+            && (kind == "tombstone" || self.types.as_ref().is_none_or(|t| t.iter().any(|t| t == kind)))
+            && self.paths.as_ref().is_none_or(|p| p.iter().any(|p| path_within(path, p)))
+    }
+}
+
+/// An "enckey" record's data: its author's X25519 public key.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EncKeyData {
+    pub key: [u8; 32],
+}
+
+impl EncKeyData {
+    pub fn from_cbor(v: &CBOR) -> Result<Self, String> {
+        Ok(EncKeyData { key: field(as_map(v, "an enckey's data")?, "key", bytes)? })
+    }
+
+    pub fn to_cbor(&self) -> CBOR {
+        let mut m = Map::new();
+        m.insert("key", CBOR::to_byte_string(self.key));
+        m.into()
+    }
+}
 
 // ---- nodes ----
 //
@@ -394,62 +566,70 @@ impl PeerData {
 // ---- shared documents ----
 //
 // A document is a "doc" chain, named by its first record's hash. Its data holds the title, who may
-// edit it besides its author, and what kind of doc it is; only the author (or the node's owners) edits
-// that, as with any chain, and never the kind. The content is a Yjs CRDT, built from "doc_update"
-// records: each a signed batch of Yjs updates naming its doc. What the Yjs doc holds depends on the
-// kind (see `DocKind`); nodes never look inside. Updates merge in any order and any number of times, so they arrive however federation brings
-// them. They're never edited or deleted; deleting the doc deletes them all.
+// edit it besides its author, and what it holds: its `format`, the CRDT library its content is in (e.g.
+// "yjs", "automerge"), and its `schema`, what an app keeps in that (namespaced, e.g. "bisonbase.markdown").
+// Only the author (or the node's owners) edits the doc record, as with any chain, and never its format,
+// schema, or whether it's encrypted. Nodes never look inside the content: it's built from "doc_update"
+// records, each a signed batch of the format's updates naming its doc. Updates merge in any order and
+// any number of times, so they arrive however federation brings them. They're never edited or deleted;
+// deleting the doc deletes them all.
 //
-// A node takes an update from the doc's author, its editors and the node's owners, for a live doc,
-// at the doc's current path. Readers check the authors themselves (see `DocData::may_edit`), as peers
-// pass along records without checking who may write them. Neither is ever private, for now.
+// A "doc_snapshot" is the doc's whole content as of some updates, which it names (`covers`): readers
+// can start from it, then apply just the updates it doesn't cover. Snapshots are written like updates,
+// and trusted like them: an editor's snapshot could leave out what others wrote, but an editor's update
+// could delete it too. Nodes keep every update all the same.
+//
+// An encrypted doc has `keys`: its content key, sealed to each user who may read it (its author and
+// editors), with their "enckey". Updates and snapshots then hold that key's ciphertext. The title isn't
+// encrypted. See client/src/crypto.ts.
+//
+// A node takes updates and snapshots from the doc's author, its editors and the node's owners, for a live
+// doc, at the doc's current path. Readers check the authors themselves (see `DocData::may_edit`), as peers
+// pass along records without checking who may write them. None of them is ever private: encrypt instead.
 
-/// What a doc holds, and so what its Yjs doc holds.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum DocKind {
-    /// Markdown: a Y.Text "md".
-    Text,
-    /// A list, e.g. for shopping: a Y.Map "items" of id → Y.Map {text, done, pos}, `pos` a fractional
-    /// index to order them by.
-    List,
+/// A doc's content key, sealed to `user`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SealedKey {
+    pub user: Pubkey,
+    pub sealed: Vec<u8>,
 }
 
-impl DocKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            DocKind::Text => "text",
-            DocKind::List => "list",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Self> {
-        Some(match s {
-            "text" => DocKind::Text,
-            "list" => DocKind::List,
-            _ => return None,
-        })
-    }
-}
-
-/// A "doc" record's data: its title, who may edit it besides its author, and its kind ("text" if missing).
+/// A "doc" record's data: its title, who may edit it besides its author, its content's format and
+/// schema, and if it's encrypted, its key sealed to each reader.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DocData {
     pub title: String,
     pub editors: Vec<Who>,
-    pub kind: DocKind,
+    pub format: String,
+    pub schema: String,
+    pub keys: Option<Vec<SealedKey>>,
 }
 
 impl DocData {
     pub fn from_cbor(v: &CBOR) -> Result<Self, String> {
         let m = as_map(v, "a doc's data")?;
+        let keys = opt_field(m, "keys", |v| Some(v.as_array()?.to_vec()))?
+            .map(|a| {
+                a.iter()
+                    .map(|k| {
+                        let k = as_map(k, "a sealed key")?;
+                        Ok(SealedKey { user: field(k, "user", bytes)?, sealed: field(k, "sealed", |v| v.as_byte_string().map(<[u8]>::to_vec))? })
+                    })
+                    .collect::<Result<Vec<_>, String>>()
+            })
+            .transpose()?;
         let d = DocData {
             title: field(m, "title", text)?,
             editors: field(m, "editors", |v| Some(v.as_array()?.to_vec()))?.iter().map(Who::from_cbor).collect::<Result<_, _>>()?,
-            kind: opt_field(m, "kind", |v| DocKind::parse(v.as_text()?))?.unwrap_or(DocKind::Text),
+            format: field(m, "format", text)?,
+            schema: field(m, "schema", text)?,
+            keys,
         };
         if d.title.trim() != d.title {
             return Err("a doc's title must be trimmed".into());
         }
+        check_name(&d.format, "a doc's format")?;
+        check_app_name(&d.schema, "a doc's schema")?;
         Ok(d)
     }
 
@@ -457,7 +637,20 @@ impl DocData {
         let mut m = Map::new();
         m.insert("title", self.title.as_str());
         m.insert("editors", self.editors.iter().map(Who::to_cbor).collect::<Vec<_>>());
-        m.insert("kind", self.kind.as_str());
+        m.insert("format", self.format.as_str());
+        m.insert("schema", self.schema.as_str());
+        if let Some(k) = &self.keys {
+            let k: Vec<CBOR> = k
+                .iter()
+                .map(|k| {
+                    let mut m = Map::new();
+                    m.insert("user", CBOR::to_byte_string(k.user));
+                    m.insert("sealed", CBOR::to_byte_string(&k.sealed));
+                    m.into()
+                })
+                .collect();
+            m.insert("keys", k);
+        }
         m.into()
     }
 
@@ -468,7 +661,43 @@ impl DocData {
     }
 }
 
-/// A "doc_update" record's data: the doc (its chain's first record's hash), and a Yjs update to its text.
+/// A "doc_snapshot" record's data: the doc (its chain's first record's hash), its whole content
+/// (`state`, in its format), and the updates that has in it (by hash).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DocSnapshotData {
+    pub doc: Hash,
+    pub state: Vec<u8>,
+    pub covers: Vec<Hash>,
+}
+
+impl DocSnapshotData {
+    pub fn from_cbor(v: &CBOR) -> Result<Self, String> {
+        let m = as_map(v, "a doc snapshot's data")?;
+        let covers = field(m, "covers", |v| v.as_byte_string().map(<[u8]>::to_vec))?;
+        if covers.len() % 32 != 0 {
+            return Err("a snapshot's covers must be 32-byte hashes, one after another".into());
+        }
+        let d = DocSnapshotData {
+            doc: field(m, "doc", bytes)?,
+            state: field(m, "state", |v| v.as_byte_string().map(<[u8]>::to_vec))?,
+            covers: covers.chunks(32).map(|c| c.try_into().unwrap()).collect(),
+        };
+        if d.state.is_empty() {
+            return Err("a doc snapshot can't be empty".into());
+        }
+        Ok(d)
+    }
+
+    pub fn to_cbor(&self) -> CBOR {
+        let mut m = Map::new();
+        m.insert("doc", CBOR::to_byte_string(self.doc));
+        m.insert("state", CBOR::to_byte_string(&self.state));
+        m.insert("covers", CBOR::to_byte_string(self.covers.concat()));
+        m.into()
+    }
+}
+
+/// A "doc_update" record's data: the doc (its chain's first record's hash), and an update to its content.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DocUpdateData {
     pub doc: Hash,
@@ -556,7 +785,15 @@ impl Record {
             m.insert("edits", CBOR::to_byte_string(e));
         }
         m.insert("private", self.private);
+        if let Some(a) = &self.acting {
+            m.insert("as", a.to_cbor());
+        }
         m
+    }
+
+    /// Whose record it is: the user it's signed for (see `as`), or else its author.
+    pub fn principal(&self) -> Pubkey {
+        self.acting.as_ref().map_or(self.author, |a| a.user)
     }
 
     /// A node record's URL.
@@ -583,6 +820,26 @@ impl Record {
     /// A doc update's data.
     pub fn doc_update(&self) -> Option<DocUpdateData> {
         (self.kind == "doc_update").then(|| DocUpdateData::from_cbor(&self.data).ok()).flatten()
+    }
+
+    /// A doc snapshot's data.
+    pub fn doc_snapshot(&self) -> Option<DocSnapshotData> {
+        (self.kind == "doc_snapshot").then(|| DocSnapshotData::from_cbor(&self.data).ok()).flatten()
+    }
+
+    /// For a doc update or snapshot: its doc (the doc chain's first record's hash).
+    pub fn doc_ref(&self) -> Option<Hash> {
+        self.doc_update().map(|u| u.doc).or_else(|| self.doc_snapshot().map(|s| s.doc))
+    }
+
+    /// A delegation's data.
+    pub fn delegate(&self) -> Option<DelegateData> {
+        (self.kind == "delegate").then(|| DelegateData::from_cbor(&self.data).ok()).flatten()
+    }
+
+    /// An enckey record's data.
+    pub fn enckey(&self) -> Option<EncKeyData> {
+        (self.kind == "enckey").then(|| EncKeyData::from_cbor(&self.data).ok()).flatten()
     }
 
     /// Whether it's one of a node's own records, which are never federated.
@@ -627,6 +884,7 @@ impl Record {
             data: field(m, "data", |v| Some(v.clone()))?,
             edits: opt_field(m, "edits", bytes)?,
             private: field(m, "private", CBOR::as_bool)?,
+            acting: m.get::<_, CBOR>("as").map(|v| Acting::from_cbor(&v)).transpose()?,
             signature: field(m, "signature", bytes)?,
             extra,
         })
@@ -640,11 +898,38 @@ impl Record {
     /// the author's signature. Who may write what is up to each node (see "nodes" above).
     pub fn check(&self) -> Result<(), String> {
         check_path(&self.path)?;
+        let size = self.to_bytes().len();
+        if size > MAX_RECORD_BYTES {
+            return Err(format!("a record can be at most {MAX_RECORD_BYTES} bytes, not {size}"));
+        }
         match node_type_path(&self.kind) {
             Some(p) if self.path != p => return Err(format!("a {} record belongs at {p}", self.kind)),
             None if !["tombstone", "claim"].contains(&self.kind.as_str()) && self.is_node_record() => {
                 return Err(format!("{NODE_PATH} is for the node's own records, not {:?}", self.kind));
             }
+            _ => {}
+        }
+        let principal = self.principal();
+        if let Some(a) = &self.acting {
+            if a.user == self.author {
+                return Err("a record signed for its own author doesn't need \"as\"".into());
+            }
+            if self.is_node_record() || ["delegate", "enckey"].contains(&self.kind.as_str()) {
+                return Err(format!("a {} record is never signed under a delegation", self.kind));
+            }
+            if [delegate_path(&a.user), enckey_path(&a.user)].iter().any(|p| path_within(&self.path, p)) {
+                return Err("a user's delegations and enckey are only theirs to change".into());
+            }
+        }
+        match self.kind.as_str() {
+            "delegate" if self.path != delegate_path(&principal) => {
+                return Err(format!("a delegation belongs at its author's {}", delegate_path(&principal)));
+            }
+            "enckey" if self.path != enckey_path(&principal) => {
+                return Err(format!("an enckey belongs at its author's {}", enckey_path(&principal)));
+            }
+            "doc" | "doc_update" | "doc_snapshot" if self.private => return Err(format!("a {} can't be private", self.kind)),
+            "doc_update" | "doc_snapshot" if self.edits.is_some() => return Err(format!("a {} is never edited", self.kind)),
             _ => {}
         }
         match self.kind.as_str() {
@@ -668,15 +953,23 @@ impl Record {
             "claim" => {
                 ClaimData::from_cbor(&self.data)?;
             }
-            "doc" | "doc_update" if self.private => return Err(format!("a {} can't be private", self.kind)),
             "doc" => {
                 DocData::from_cbor(&self.data).map_err(|e| format!("doc: {e}"))?;
             }
-            "doc_update" if self.edits.is_some() => return Err("doc updates are never edited".into()),
             "doc_update" => {
                 DocUpdateData::from_cbor(&self.data)?;
             }
-            _ => return Err(format!("unknown record type {:?}", self.kind)),
+            "doc_snapshot" => {
+                DocSnapshotData::from_cbor(&self.data)?;
+            }
+            "delegate" => {
+                DelegateData::from_cbor(&self.data).map_err(|e| format!("delegate: {e}"))?;
+            }
+            "enckey" => {
+                EncKeyData::from_cbor(&self.data)?;
+            }
+            k if is_app_type(k) => check_app_name(k, "an app type")?,
+            _ => return Err(format!("unknown record type {:?} (an app's own types have a \".\", e.g. \"myapp.thing\")", self.kind)),
         }
         verify_sig(&self.author, &self.signed_bytes(), &self.signature)
     }
@@ -696,9 +989,15 @@ mod tests {
             data,
             edits,
             private: false,
+            acting: None,
             signature: [0; 64],
             extra: Map::new(),
         };
+        r.signature = key.sign(&r.signed_bytes()).to_bytes();
+        r
+    }
+
+    fn resign(key: &SigningKey, mut r: Record) -> Record {
         r.signature = key.sign(&r.signed_bytes()).to_bytes();
         r
     }
@@ -787,10 +1086,14 @@ mod tests {
         assert_eq!(r.claim(), Some(claimed));
     }
 
+    fn doc_data(editors: Vec<Who>) -> DocData {
+        DocData { title: "Notes".into(), editors, format: "yjs".into(), schema: "bisonbase.list".into(), keys: None }
+    }
+
     #[test]
     fn docs() {
         let key = SigningKey::from_bytes(&[1; 32]);
-        let d = DocData { title: "Notes".into(), editors: vec![Who::User([2; 32]), Who::Claim([9; 32])], kind: DocKind::List };
+        let d = doc_data(vec![Who::User([2; 32]), Who::Claim([9; 32])]);
         assert_eq!(DocData::from_cbor(&d.to_cbor()).unwrap(), d);
         let r = signed(&key, "/doc", "doc", d.to_cbor(), None);
         r.check().unwrap();
@@ -800,25 +1103,99 @@ mod tests {
         assert!(d.may_edit(&author, &author, none) && d.may_edit(&author, &[2; 32], none) && !d.may_edit(&author, &[3; 32], none));
         assert!(d.may_edit(&author, &[3; 32], |c: &Hash| (*c == [9; 32]).then_some([3; 32])), "via a claim");
         assert!(signed(&key, "/doc", "doc", DocData { title: " x".into(), ..d.clone() }.to_cbor(), None).check().is_err());
-        let mut m = d.to_cbor().as_map().unwrap().clone();
-        m.insert("kind", "spreadsheet");
-        assert!(DocData::from_cbor(&m.clone().into()).is_err(), "unknown kinds are refused");
-        let mut m = Map::new();
-        m.insert("title", "old");
-        m.insert("editors", Vec::<CBOR>::new());
-        assert_eq!(DocData::from_cbor(&m.into()).unwrap().kind, DocKind::Text, "no kind: text");
+        assert!(DocData::from_cbor(&DocData { schema: "list".into(), ..d.clone() }.to_cbor()).is_err(), "schemas are namespaced");
+        assert!(DocData::from_cbor(&DocData { format: "Y JS".into(), ..d.clone() }.to_cbor()).is_err());
+        DocData::from_cbor(&DocData { format: "automerge".into(), schema: "com.example.board".into(), ..d.clone() }.to_cbor())
+            .expect("any format, any schema");
+        let enc = DocData { keys: Some(vec![SealedKey { user: author, sealed: vec![1, 2, 3] }]), ..d.clone() };
+        assert_eq!(DocData::from_cbor(&enc.to_cbor()).unwrap(), enc);
 
         let u = DocUpdateData { doc: r.hash(), update: vec![1, 2, 3] };
         assert_eq!(DocUpdateData::from_cbor(&u.to_cbor()).unwrap(), u);
         let ur = signed(&key, "/doc", "doc_update", u.to_cbor(), None);
         ur.check().unwrap();
         assert_eq!(ur.doc_update(), Some(u.clone()));
+        assert_eq!(ur.doc_ref(), Some(r.hash()));
         assert!(signed(&key, "/doc", "doc_update", DocUpdateData { update: vec![], ..u.clone() }.to_cbor(), None).check().is_err());
         assert!(signed(&key, "/doc", "doc_update", u.to_cbor(), Some(ur.hash())).check().is_err(), "never edited");
-        let mut p = ur.clone();
-        p.private = true;
-        p.signature = key.sign(&p.signed_bytes()).to_bytes();
+        let p = resign(&key, Record { private: true, ..ur.clone() });
         assert!(p.check().is_err(), "never private");
+
+        let s = DocSnapshotData { doc: r.hash(), state: vec![7], covers: vec![ur.hash(), [5; 32]] };
+        assert_eq!(DocSnapshotData::from_cbor(&s.to_cbor()).unwrap(), s);
+        let sr = signed(&key, "/doc", "doc_snapshot", s.to_cbor(), None);
+        sr.check().unwrap();
+        assert_eq!(sr.doc_ref(), Some(r.hash()));
+        assert!(signed(&key, "/doc", "doc_snapshot", s.to_cbor(), Some(sr.hash())).check().is_err(), "never edited");
+        let mut m = s.to_cbor().as_map().unwrap().clone();
+        m.insert("covers", CBOR::to_byte_string([1u8; 33]));
+        assert!(DocSnapshotData::from_cbor(&m.into()).is_err(), "covers are whole hashes");
+    }
+
+    #[test]
+    fn app_types() {
+        let key = SigningKey::from_bytes(&[1; 32]);
+        let mut m = Map::new();
+        m.insert("title", "buy milk");
+        m.insert("done", false);
+        signed(&key, "/todo", "todo.item", m.clone().into(), None).check().expect("any data");
+        signed(&key, "/todo", "com.example.todo-item_2", CBOR::null(), None).check().unwrap();
+        for bad in ["todo", "Todo.Item", "todo item.x", ".", &format!("{}.x", "a".repeat(64))] {
+            assert!(signed(&key, "/todo", bad, CBOR::null(), None).check().is_err(), "{bad:?}");
+        }
+        let big = signed(&key, "/todo", "todo.blob", CBOR::to_byte_string(vec![0u8; MAX_RECORD_BYTES]), None);
+        assert!(big.check().unwrap_err().contains("at most"));
+    }
+
+    #[test]
+    fn user_spaces_and_delegation() {
+        let user = SigningKey::from_bytes(&[1; 32]);
+        let app = SigningKey::from_bytes(&[2; 32]);
+        let (u, a) = (user.verifying_key().to_bytes(), app.verifying_key().to_bytes());
+        assert_eq!(path_user(&format!("{}/notes/x", user_path(&u))), Some(u));
+        assert_eq!(path_user(&user_path(&u)), Some(u));
+        assert_eq!(path_user("/u"), None);
+        assert_eq!(path_user("/doc"), None);
+
+        let d = DelegateData { key: a, name: "Todo app".into(), paths: Some(vec!["/todo".into()]), types: Some(vec!["todo.item".into()]), expires: Some(100) };
+        assert_eq!(DelegateData::from_cbor(&d.to_cbor()).unwrap(), d);
+        let dr = signed(&user, &delegate_path(&u), "delegate", d.to_cbor(), None);
+        dr.check().unwrap();
+        assert_eq!(dr.delegate(), Some(d.clone()));
+        assert!(signed(&user, "/delegate", "delegate", d.to_cbor(), None).check().is_err(), "at its author's path");
+        assert!(signed(&app, &delegate_path(&u), "delegate", d.to_cbor(), None).check().is_err(), "in someone else's space");
+        assert!(d.covers("/todo/x", "todo.item", 100) && d.covers("/todo", "tombstone", 1));
+        assert!(!d.covers("/todo/x", "todo.item", 101) && !d.covers("/other", "todo.item", 1) && !d.covers("/todo", "post", 1));
+        let any = DelegateData { paths: None, types: None, expires: None, ..d.clone() };
+        assert!(any.covers("/anything", "post", u64::MAX));
+
+        let e = signed(&user, &enckey_path(&u), "enckey", EncKeyData { key: [3; 32] }.to_cbor(), None);
+        e.check().unwrap();
+        assert_eq!(e.enckey(), Some(EncKeyData { key: [3; 32] }));
+
+        // The app signs for the user.
+        let acting = Some(Acting { user: u, delegation: dr.hash() });
+        let mut item = Map::new();
+        item.insert("title", "x");
+        let r = resign(&app, Record { acting: acting.clone(), ..signed(&app, "/todo/1", "todo.item", item.into(), None) });
+        let back = Record::from_bytes(&r.to_bytes()).unwrap();
+        assert_eq!(back, r);
+        back.check().unwrap();
+        assert_eq!(back.principal(), u);
+        assert_eq!(signed(&app, "/x", "post", "hi".into(), None).principal(), a);
+        // Never for its own author, node records, or the user's delegations and enckey.
+        let own = resign(&user, Record { acting: acting.clone(), ..signed(&user, "/todo/1", "post", "hi".into(), None) });
+        assert!(own.check().is_err());
+        for (path, kind, data) in [
+            (delegate_path(&u), "delegate", d.to_cbor()),
+            (enckey_path(&u), "enckey", EncKeyData { key: [4; 32] }.to_cbor()),
+            (GRANT_PATH.to_string(), "grant", GrantData { path: "/".into(), grantees: Grantees::Anyone }.to_cbor()),
+        ] {
+            let r = resign(&app, Record { acting: acting.clone(), ..signed(&app, &path, kind, data, None) });
+            assert!(r.check().is_err(), "{kind}");
+        }
+        let revoke = resign(&app, Record { acting: acting.clone(), ..signed(&app, &delegate_path(&u), "tombstone", CBOR::null(), Some(dr.hash())) });
+        assert!(revoke.check().is_err(), "an app can't touch its delegation");
     }
 
     #[test]
