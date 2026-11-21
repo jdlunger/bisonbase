@@ -1,5 +1,5 @@
 use axum::{
-    Json, Router,
+    Extension, Json, Router,
     body::Bytes,
     extract::{
         DefaultBodyLimit, Path, Query, Request, State,
@@ -50,6 +50,15 @@ const PUSH_BATCH: i64 = 100;
 
 /// The largest message a live room passes on.
 const MAX_LIVE_MSG: usize = 64 * 1024;
+
+/// How long a live room waits for a connection's hello.
+const LIVE_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// In private mode, how often open streams and live rooms check that whoever opened them still has access.
+const ACCESS_RECHECK: Duration = Duration::from_secs(30);
+
+/// The largest body `/api/auth` takes: an access token, and maybe a claim token.
+const MAX_AUTH_BYTES: usize = 4 * 1024;
 
 struct App {
     db: Mutex<Connection>,
@@ -170,7 +179,7 @@ fn router(app: Arc<App>, serve_web: bool) -> Router {
         .route("/api/node", get(node_info))
         .route("/api/nodes", get(nodes))
         .route("/api/claim", post(claim))
-        .route("/api/auth", post(auth).delete(sign_out))
+        .route("/api/auth", post(auth).delete(sign_out).layer(DefaultBodyLimit::max(MAX_AUTH_BYTES)))
         .route("/receive", post(receive))
         .with_state(app.clone())
         // Records are signed and reads carry no cookies, so any web app, from any origin, may use the API.
@@ -184,7 +193,23 @@ fn router(app: Arc<App>, serve_web: bool) -> Router {
             Redirect::temporary(&format!("{origin}{path}")).into_response()
         })
         // Outermost, so it sees every request, the fallback's too.
-        .layer(middleware::from_fn_with_state(app, gate))
+        .layer(middleware::from_fn_with_state(app.clone(), gate))
+        .layer(middleware::from_fn_with_state(app, security_headers))
+}
+
+/// Headers for every response: never framed (so no clickjacking, e.g. of /connect), no content sniffing,
+/// no referrers, and over HTTPS, HSTS.
+async fn security_headers(State(app): S, req: Request, next: Next) -> Response {
+    let mut res = next.run(req).await;
+    let h = res.headers_mut();
+    h.insert(header::X_FRAME_OPTIONS, header::HeaderValue::from_static("DENY"));
+    h.insert(header::CONTENT_SECURITY_POLICY, header::HeaderValue::from_static("frame-ancestors 'none'"));
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, header::HeaderValue::from_static("nosniff"));
+    h.insert(header::REFERRER_POLICY, header::HeaderValue::from_static("no-referrer"));
+    if app.origin.starts_with("https:") {
+        h.insert(header::STRICT_TRANSPORT_SECURITY, header::HeaderValue::from_static("max-age=31536000"));
+    }
+    res
 }
 
 /// Serves HTTPS for `domain` on port 443, getting and renewing its certificate from Let's Encrypt (through
@@ -947,7 +972,7 @@ fn compact(db: &Connection, doc: &Hash, backlog: Vec<(i64, Vec<u8>)>) -> Vec<(i6
 /// event (its data: the last record's seq), then each new one as it's stored. Each "record" event's data is the record (base64 CBOR), and
 /// its ID is where to continue from. A stream that falls too far behind is ended; EventSource reconnects
 /// and picks up where it left off.
-async fn stream(State(app): S, headers: HeaderMap, Query(q): Query<StreamQuery>) -> Response {
+async fn stream(State(app): S, access: Option<Extension<Access>>, headers: HeaderMap, Query(q): Query<StreamQuery>) -> Response {
     let doc = match q.doc.as_deref().map(|d| decode_b58(d).and_then(|h| Hash::try_from(h).ok())) {
         Some(None) => return err(StatusCode::BAD_REQUEST, "doc isn't 32 bytes of base58"),
         d => d.flatten(),
@@ -970,7 +995,9 @@ async fn stream(State(app): S, headers: HeaderMap, Query(q): Query<StreamQuery>)
     };
     let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(64);
     let record = |seq: i64, bytes: &[u8]| Ok(Event::default().event("record").id(seq.to_string()).data(BASE64.encode(bytes)));
+    let lapsed = lapsed(app.clone(), access.map(|a| a.0));
     tokio::spawn(async move {
+        tokio::pin!(lapsed);
         let mut last = after;
         for (seq, bytes) in backlog {
             if tx.send(record(seq, &bytes)).await.is_err() {
@@ -985,6 +1012,7 @@ async fn stream(State(app): S, headers: HeaderMap, Query(q): Query<StreamQuery>)
         loop {
             tokio::select! {
                 _ = tx.closed() => return,
+                _ = &mut lapsed => return,
                 s = live.recv() => match s {
                     Ok(s) if s.seq > last && f.matches(&s) => {
                         last = s.seq;
@@ -1069,16 +1097,16 @@ impl App {
 }
 
 /// Joins the live room of the doc whose chain starts with the record with this hash (base58).
-async fn live(State(app): S, Path(hash): Path<String>, ws: WebSocketUpgrade) -> Response {
+async fn live(State(app): S, access: Option<Extension<Access>>, Path(hash): Path<String>, ws: WebSocketUpgrade) -> Response {
     let Some(doc) = decode_b58(&hash).and_then(|h| Hash::try_from(h).ok()) else {
         return err(StatusCode::BAD_REQUEST, "hash isn't 32 bytes of base58");
     };
-    ws.max_message_size(MAX_LIVE_MSG).on_upgrade(move |socket| live_conn(app, doc, socket))
+    ws.max_message_size(MAX_LIVE_MSG).on_upgrade(move |socket| live_conn(app, access.map(|a| a.0), doc, socket))
 }
 
-async fn live_conn(app: Arc<App>, doc: Hash, mut ws: WebSocket) {
-    let hello = match ws.recv().await {
-        Some(Ok(Message::Text(t))) => app.live_hello(&doc, &t),
+async fn live_conn(app: Arc<App>, access: Option<Access>, doc: Hash, mut ws: WebSocket) {
+    let hello = match tokio::time::timeout(LIVE_HELLO_TIMEOUT, ws.recv()).await {
+        Ok(Some(Ok(Message::Text(t)))) => app.live_hello(&doc, &t),
         _ => return,
     };
     let user = match hello {
@@ -1098,8 +1126,11 @@ async fn live_conn(app: Arc<App>, doc: Hash, mut ws: WebSocket) {
         (tx, rx)
     };
     let _ = tx.send(frame(LIVE_JOINED, &[]));
+    let lapsed = lapsed(app.clone(), access);
+    tokio::pin!(lapsed);
     loop {
         tokio::select! {
+            _ = &mut lapsed => break,
             m = ws.recv() => match m {
                 Some(Ok(Message::Binary(b))) => {
                     let _ = tx.send(frame(LIVE_UPDATE, &b));
@@ -1214,21 +1245,48 @@ impl App {
     }
 
     /// Who the request's access cookie (see `auth`) is from, if it's valid and they have access.
-    fn let_in(&self, headers: &HeaderMap) -> Option<Pubkey> {
-        let (user, expires, sig) = cookie(headers, ACCESS_COOKIE).and_then(parse_token)?;
-        let now = now_ms();
-        if expires < now || expires > now + MAX_ACCESS_TOKEN_MS {
+    fn let_in(&self, headers: &HeaderMap) -> Option<Access> {
+        let (user, expires, sig) = cookie(headers, self.access_cookie()).and_then(parse_token)?;
+        if expires > now_ms() + MAX_ACCESS_TOKEN_MS {
             return None;
         }
         verify_sig(&user, &access_signed_bytes(&self.origin, expires), &sig).ok()?;
-        has_access(&self.db.lock().unwrap(), &user).then_some(user)
+        let access = Access { user, expires };
+        self.still_in(&access).then_some(access)
+    }
+
+    /// Whether `a` still lets its user in: it hasn't expired, and they still have access.
+    fn still_in(&self, a: &Access) -> bool {
+        a.expires >= now_ms() && has_access(&self.db.lock().unwrap(), &a.user)
+    }
+
+    /// The access cookie's name. Over HTTPS, `__Host-`, so that no other (sub)domain can set it.
+    fn access_cookie(&self) -> &'static str {
+        if self.origin.starts_with("https:") { "__Host-bb_access" } else { "bb_access" }
+    }
+}
+
+/// Who a private node let a request in for (see `gate`), and until when: a request extension.
+#[derive(Clone, Copy)]
+struct Access {
+    user: Pubkey,
+    expires: u64,
+}
+
+/// Resolves once `access` lapses (it expires, or its user's access is removed); never without one, as
+/// outside private mode. Ends streams and live rooms that outlive someone's access.
+async fn lapsed(app: Arc<App>, access: Option<Access>) {
+    let Some(a) = access else { return std::future::pending().await };
+    let mut tick = tokio::time::interval(ACCESS_RECHECK);
+    loop {
+        tick.tick().await;
+        if !app.still_in(&a) {
+            return;
+        }
     }
 }
 
 // ---- private mode ----
-
-/// The cookie that holds an access token: `<ID>.<expires>.<signature>`, as read tokens are written.
-const ACCESS_COOKIE: &str = "bb_access";
 
 /// The value of the cookie `name`, if the request has it.
 fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
@@ -1243,9 +1301,13 @@ fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 /// In private mode, lets through only requests with a valid access cookie from someone with access. Others
 /// get the sign-in page (`gate_page`) for page loads, its own files, and `/api/auth`; anything else is a
 /// bare 404, so that they can't tell what this is.
-async fn gate(State(app): S, req: Request, next: Next) -> Response {
+async fn gate(State(app): S, mut req: Request, next: Next) -> Response {
     let path = req.uri().path();
-    if !app.private || path == "/api/auth" || GATE_FILES.contains(path.trim_start_matches('/')) || app.let_in(req.headers()).is_some() {
+    if !app.private || path == "/api/auth" || GATE_FILES.contains(path.trim_start_matches('/')) {
+        return next.run(req).await;
+    }
+    if let Some(access) = app.let_in(req.headers()) {
+        req.extensions_mut().insert(access);
         return next.run(req).await;
     }
     let page = req.method() == Method::GET
@@ -1296,13 +1358,14 @@ async fn auth(State(app): S, Json(a): Json<Auth>) -> Response {
     let token = format!("{}.{}.{}", encode_id(&user), a.expires, encode_b58(&sig));
     let max_age = (a.expires - now) / 1000;
     let secure = if app.origin.starts_with("https:") { "; Secure" } else { "" };
-    let cookie = format!("{ACCESS_COOKIE}={token}; Path=/; Max-Age={max_age}; HttpOnly; SameSite=Lax{secure}");
+    let cookie = format!("{}={token}; Path=/; Max-Age={max_age}; HttpOnly; SameSite=Lax{secure}", app.access_cookie());
     (StatusCode::NO_CONTENT, [(header::SET_COOKIE, cookie)]).into_response()
 }
 
 /// Signs out of a private node: clears the access cookie.
-async fn sign_out() -> Response {
-    let cookie = format!("{ACCESS_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax");
+async fn sign_out(State(app): S) -> Response {
+    let secure = if app.origin.starts_with("https:") { "; Secure" } else { "" };
+    let cookie = format!("{}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax{secure}", app.access_cookie());
     (StatusCode::NO_CONTENT, [(header::SET_COOKIE, cookie)]).into_response()
 }
 
@@ -2210,6 +2273,27 @@ mod tests {
         let alice = key(1);
         assert_eq!(sign_in(&router, &alice, Some(token)).await.0, StatusCode::NO_CONTENT);
         assert_eq!(owners(&app.db.lock().unwrap()), [id(&alice)]);
+    }
+
+    #[tokio::test]
+    async fn hardening() {
+        let (app, router, alice, bob, _) = private_node();
+        let res = send(&router, Method::GET, "/nope", &[], None).await;
+        assert_eq!(res.headers().get(header::X_FRAME_OPTIONS).unwrap(), "DENY", "even the gate's answers");
+        assert_eq!(res.headers().get(header::X_CONTENT_TYPE_OPTIONS).unwrap(), "nosniff");
+
+        let mut big = access_token(&alice, "http://web.test", None);
+        big["claim"] = json!("x".repeat(MAX_AUTH_BYTES));
+        assert_eq!(send(&router, Method::POST, "/api/auth", &[], Some(big)).await.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // What streams and live rooms check: access that lapses, by removal or expiry.
+        let access = sign(&alice, ACCESS_PATH, "access", Who::User(id(&bob)).to_cbor(), None, 1);
+        put(&app, &access).unwrap();
+        let bobs = Access { user: id(&bob), expires: now_ms() + 60_000 };
+        assert!(app.still_in(&bobs));
+        assert!(!app.still_in(&Access { expires: now_ms() - 1, ..bobs }), "expired");
+        put(&app, &tombstone(&alice, &access, 2)).unwrap();
+        assert!(!app.still_in(&bobs), "removed");
     }
 
     #[tokio::test]
