@@ -111,9 +111,16 @@ async fn main() {
         return;
     }
     let port = std::env::var("PORT").unwrap_or("8080".into());
-    // Where other nodes reach this one, and where the SPA is served (for links).
-    let public_url = std::env::var("PUBLIC_URL").unwrap_or(format!("http://localhost:{port}"));
-    let origin = std::env::var("ORIGIN").unwrap_or("http://localhost:5173".into());
+    // With a domain, the node serves HTTPS on it, with certificates from Let's Encrypt (see `serve_https`).
+    let domain = std::env::var("DOMAIN").ok();
+    // Where other nodes reach this one.
+    let public_url = std::env::var("PUBLIC_URL").unwrap_or(match &domain {
+        Some(d) => format!("https://{d}"),
+        None => format!("http://localhost:{port}"),
+    });
+    // Where the web app is served (for links). By default the node serves it itself; in dev, Vite does.
+    let origin = std::env::var("ORIGIN").unwrap_or(public_url.clone());
+    let serve_web = origin == public_url;
 
     let db = Connection::open(&db_path).unwrap();
     db.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;").unwrap();
@@ -140,13 +147,85 @@ async fn main() {
         .layer(CorsLayer::permissive())
         .layer(DefaultBodyLimit::max(MAX_RECORD_BYTES * 4))
         .fallback(move |uri: Uri| async move {
+            if serve_web {
+                return web(uri.path());
+            }
             let path = uri.path_and_query().map_or("/", |p| p.as_str());
-            Redirect::temporary(&format!("{origin}{path}"))
+            Redirect::temporary(&format!("{origin}{path}")).into_response()
         });
 
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await.unwrap();
     println!("listening {public_url}");
-    axum::serve(listener, router).await.unwrap();
+    match domain {
+        Some(domain) => serve_https(router, domain).await,
+        None => {
+            let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await.unwrap();
+            axum::serve(listener, router).await.unwrap();
+        }
+    }
+}
+
+/// Serves HTTPS for `domain` on port 443, getting and renewing its certificate from Let's Encrypt (through
+/// TLS-ALPN-01, on that same port), and redirects port 80 to it. Certificates are kept in `CERTS` (default
+/// `certs`), so restarts don't ask for new ones. `ACME_STAGING=1` uses Let's Encrypt's staging directory,
+/// whose certificates browsers don't trust but whose rate limits are loose: for trying a setup out.
+/// `ACME_EMAIL`, if set, is given to Let's Encrypt as a contact.
+async fn serve_https(router: Router, domain: String) {
+    use tokio_stream::StreamExt;
+    let mut acme = rustls_acme::AcmeConfig::new([domain.clone()])
+        .contact(std::env::var("ACME_EMAIL").ok().map(|e| format!("mailto:{e}")))
+        .cache(rustls_acme::caches::DirCache::new(std::env::var("CERTS").unwrap_or("certs".into())))
+        .directory_lets_encrypt(std::env::var("ACME_STAGING").is_err())
+        .state();
+    let acceptor = acme.axum_acceptor(acme.default_rustls_config());
+    tokio::spawn(async move {
+        while let Some(event) = acme.next().await {
+            match event {
+                Ok(ok) => println!("acme: {ok:?}"),
+                Err(e) => eprintln!("acme: {e}"),
+            }
+        }
+    });
+
+    let to_https = Router::new().fallback(move |uri: Uri| async move {
+        let path = uri.path_and_query().map_or("/", |p| p.as_str());
+        Redirect::permanent(&format!("https://{domain}{path}"))
+    });
+    let http = bind(80).await;
+    tokio::spawn(async move { axum::serve(http, to_https).await.unwrap() });
+
+    axum_server::from_tcp(bind(443).await.into_std().unwrap()).unwrap().acceptor(acceptor).serve(router.into_make_service()).await.unwrap();
+}
+
+/// Listens on `port` on every address: IPv6 and IPv4 where the host has IPv6, else IPv4 only.
+async fn bind(port: u16) -> tokio::net::TcpListener {
+    match tokio::net::TcpListener::bind(("::", port)).await {
+        Ok(l) => l,
+        Err(_) => tokio::net::TcpListener::bind(("0.0.0.0", port)).await.unwrap(),
+    }
+}
+
+/// The web app's built files (`npm run build`). Release builds compile them in; debug builds read them from
+/// disk, so a missing `web/dist` only matters once a page is asked for.
+#[derive(rust_embed::Embed)]
+#[folder = "web/dist"]
+#[allow_missing = true]
+struct Web;
+
+/// Serves the web app: the file at `path`, or else the app's page, as every route is the same SPA.
+fn web(path: &str) -> Response {
+    let path = path.trim_start_matches('/');
+    let (path, file) = match Web::get(path) {
+        Some(file) => (path, file),
+        // A missing script or style is an error, not a route.
+        None if path.starts_with("assets/") => return StatusCode::NOT_FOUND.into_response(),
+        None => match Web::get("index.html") {
+            Some(file) => ("index.html", file),
+            None => return (StatusCode::NOT_FOUND, "web app not built: run `npm run build`").into_response(),
+        },
+    };
+    // Vite names built assets by their content hash, so they never change; everything else might.
+    let cache = if path.starts_with("assets/") { "public, max-age=31536000, immutable" } else { "no-cache" };
+    ([(header::CONTENT_TYPE, file.metadata.mimetype()), (header::CACHE_CONTROL, cache)], file.data).into_response()
 }
 
 fn random<const N: usize>() -> [u8; N] {
