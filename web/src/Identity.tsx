@@ -6,6 +6,7 @@ import {
   type Post,
   type User,
   type Written,
+  addAccess,
   addOwner,
   amOwner,
   getPosts,
@@ -215,8 +216,8 @@ function PeerForm({ busy, run }: { busy: boolean; run: Run }) {
   );
 }
 
-/** Lets an owner (us) add an owner. */
-function AddOwnerForm({ busy, run }: { busy: boolean; run: Run }) {
+/** Lets an owner (us) add an owner, or (`add` addAccess) let someone into this private node. */
+function AddWhoForm({ add, label, busy, run }: { add: (c: Choice) => Promise<Written>; label: string; busy: boolean; run: Run }) {
   const [who, setWho] = useState<Choice>({ kind: "user", id: "" });
   const [saved, setSaved] = useState<Written | null>(null);
   return (
@@ -227,10 +228,10 @@ function AddOwnerForm({ busy, run }: { busy: boolean; run: Run }) {
         disabled={busy || !ready(who)}
         onClick={run(async () => {
           setSaved(null);
-          setSaved(await addOwner(who));
+          setSaved(await add(who));
         })}
       >
-        Add owner
+        {label}
       </button>
       <Saved saved={saved} />
     </div>
@@ -314,7 +315,7 @@ export function Identity({
 }
 
 /** On this node's page: its owners, grants, claims and peers (its /node records), and forms to add them if we own it. */
-export function NodeAdmin({ me, busy, run, tick }: { me: User | null; busy: boolean; run: Run; tick: number }) {
+export function NodeAdmin({ node, me, busy, run, tick }: { node: NodeInfo | null; me: User | null; busy: boolean; run: Run; tick: number }) {
   const { data } = useLoad(() => getPosts({ prefix: "/node" }), [], tick);
   const owner = !!me && amOwner();
   const items = { me, busy, run };
@@ -343,13 +344,25 @@ export function NodeAdmin({ me, busy, run, tick }: { me: User | null; busy: bool
   };
   return (
     <>
-      {section("Owners", "owner", <AddOwnerForm busy={busy} run={run} />, "They can write anything, anywhere on this node, and edit or delete any record.")}
+      {section(
+        "Owners",
+        "owner",
+        <AddWhoForm add={addOwner} label="Add owner" busy={busy} run={run} />,
+        "They can write anything, anywhere on this node, and edit or delete any record.",
+      )}
+      {node?.private &&
+        section(
+          "Access",
+          "access",
+          <AddWhoForm add={addAccess} label="Let in" busy={busy} run={run} />,
+          "This node is private: only its owners and these users can get in. Everyone else gets a blank sign-in page.",
+        )}
       {section("Grants", "grant", <GrantForm busy={busy} run={run} />, "Who else may write where.")}
       {section(
         "Claims",
         "claim",
         null,
-        "One-time links, for owners and grants to name someone not known yet. Make one by checking \"claim link\" above.",
+        "One-time links, for owners, access and grants to name someone not known yet. Make one by checking \"claim link\" above.",
       )}
       {section(
         "Peers",

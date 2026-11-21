@@ -83,6 +83,7 @@ const knownTypes: Record<string, number> = {
   tombstone: 2,
   node: 6,
   owner: 6,
+  access: 6,
   peer: 6,
   claim: 6,
   delegate: 6,
@@ -202,6 +203,13 @@ function Content({ post: n, me }: { post: Post; me: User | null }) {
     return (
       <p className="mt-1">
         👑 Owned by <PartyLink party={n.owner} me={me} />
+      </p>
+    );
+  }
+  if (n.access) {
+    return (
+      <p className="mt-1">
+        🚪 Lets in <PartyLink party={n.access} me={me} />
       </p>
     );
   }

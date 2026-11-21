@@ -2,10 +2,11 @@ use axum::{
     Json, Router,
     body::Bytes,
     extract::{
-        DefaultBodyLimit, Path, Query, State,
+        DefaultBodyLimit, Path, Query, Request, State,
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderMap, StatusCode, Uri, header},
+    http::{HeaderMap, Method, StatusCode, Uri, header},
+    middleware::{self, Next},
     response::{
         IntoResponse, Redirect, Response,
         sse::{Event, KeepAlive, Sse},
@@ -15,9 +16,9 @@ use axum::{
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use ed25519_dalek::{Signer, SigningKey};
 use fedcrdt_core::{
-    Acting, CBOR, CLAIM_PATH, ClaimData, DocData, GrantData, Hash, MAX_READ_TOKEN_MS, MAX_RECORD_BYTES, Map, NODE_INFO_PATH, NODE_PATH, OWNER_PATH,
-    PeerData, Pubkey, Record, Who, check_prefix, claim_signed_bytes, decode_b58, decode_id, encode_b58, encode_id, live_signed_bytes, node_phrase,
-    path_user, path_within, phrase, read_signed_bytes, verify_sig,
+    Acting, CBOR, CLAIM_PATH, ClaimData, DocData, GrantData, Hash, MAX_ACCESS_TOKEN_MS, MAX_READ_TOKEN_MS, MAX_RECORD_BYTES, Map, NODE_INFO_PATH,
+    NODE_PATH, OWNER_PATH, PeerData, Pubkey, Record, Who, access_signed_bytes, check_prefix, claim_signed_bytes, decode_b58, decode_id,
+    encode_b58, encode_id, live_signed_bytes, node_phrase, path_user, path_within, phrase, read_signed_bytes, verify_sig,
 };
 use rusqlite::{Connection, OptionalExtension};
 use serde::Deserialize;
@@ -55,6 +56,10 @@ struct App {
     /// This node's own key; its public half is `pk`.
     key: SigningKey,
     pk: Pubkey,
+    /// Where the web app is served: links to it, and what access tokens name.
+    origin: String,
+    /// Private mode (`--private`): only owners and those with access get in (see `gate`).
+    private: bool,
     /// Wakes the push task when a record is stored.
     push: tokio::sync::Notify,
     http: reqwest::Client,
@@ -67,12 +72,14 @@ struct App {
 }
 
 impl App {
-    fn new(db: Connection, key: SigningKey) -> App {
+    fn new(db: Connection, key: SigningKey, origin: String, private: bool) -> App {
         let pk = key.verifying_key().to_bytes();
         App {
             db: Mutex::new(db),
             key,
             pk,
+            origin,
+            private,
             push: Default::default(),
             http: reqwest::Client::new(),
             stored: broadcast::channel(1024).0,
@@ -103,7 +110,11 @@ async fn main() {
     let db_path = dir.join(std::env::var("DB").unwrap_or("bb.db".into())).to_string_lossy().into_owned();
     // `--drop-db` deletes the database and exits; it doesn't start the node, so that dev-mode
     // restarts (which re-run the same command) can't wipe it again. See `npm run dev:fresh`.
-    if std::env::args().skip(1).any(|a| a == "--drop-db") {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(a) = args.iter().find(|a| !["--drop-db", "--private"].contains(&a.as_str())) {
+        panic!("unknown argument {a}: expected --drop-db or --private");
+    }
+    if args.iter().any(|a| a == "--drop-db") {
         for f in [db_path.clone(), format!("{db_path}-wal"), format!("{db_path}-shm"), format!("{db_path}-journal")] {
             match std::fs::remove_file(&f) {
                 Ok(()) => println!("deleted {f}"),
@@ -130,11 +141,26 @@ async fn main() {
     create_schema(&db);
 
     let key = node_key(&db);
-    let app = Arc::new(App::new(db, key));
-    app.init(&public_url, &origin);
+    let private = args.iter().any(|a| a == "--private");
+    let app = Arc::new(App::new(db, key, origin, private));
+    app.init(&public_url);
     tokio::spawn(push_loop(app.clone()));
+    let router = router(app, serve_web);
 
-    let router = Router::new()
+    println!("listening {public_url}{}", if private { " (private)" } else { "" });
+    match domain {
+        Some(domain) => serve_https(router, domain, dir.join("certs")).await,
+        None => {
+            let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await.unwrap();
+            axum::serve(listener, router).await.unwrap();
+        }
+    }
+}
+
+/// The API, and the web app if `serve_web` (else a redirect to it, at `app.origin`).
+fn router(app: Arc<App>, serve_web: bool) -> Router {
+    let origin = app.origin.clone();
+    Router::new()
         .route("/api/users", get(users))
         .route("/api/users/{pubkey}", get(user))
         .route("/api/records", get(list_records).post(put_record))
@@ -144,8 +170,9 @@ async fn main() {
         .route("/api/node", get(node_info))
         .route("/api/nodes", get(nodes))
         .route("/api/claim", post(claim))
+        .route("/api/auth", post(auth).delete(sign_out))
         .route("/receive", post(receive))
-        .with_state(app)
+        .with_state(app.clone())
         // Records are signed and reads carry no cookies, so any web app, from any origin, may use the API.
         .layer(CorsLayer::permissive())
         .layer(DefaultBodyLimit::max(MAX_RECORD_BYTES * 4))
@@ -155,16 +182,9 @@ async fn main() {
             }
             let path = uri.path_and_query().map_or("/", |p| p.as_str());
             Redirect::temporary(&format!("{origin}{path}")).into_response()
-        });
-
-    println!("listening {public_url}");
-    match domain {
-        Some(domain) => serve_https(router, domain, dir.join("certs")).await,
-        None => {
-            let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{port}")).await.unwrap();
-            axum::serve(listener, router).await.unwrap();
-        }
-    }
+        })
+        // Outermost, so it sees every request, the fallback's too.
+        .layer(middleware::from_fn_with_state(app, gate))
 }
 
 /// Serves HTTPS for `domain` on port 443, getting and renewing its certificate from Let's Encrypt (through
@@ -227,6 +247,40 @@ fn web(path: &str) -> Response {
     // Vite names built assets by their content hash, so they never change; everything else might.
     let cache = if path.starts_with("assets/") { "public, max-age=31536000, immutable" } else { "no-cache" };
     ([(header::CONTENT_TYPE, file.metadata.mimetype()), (header::CACHE_CONTROL, cache)], file.data).into_response()
+}
+
+/// The sign-in page's own files (`web/gate.html` and what it loads), from Vite's manifest: all a private
+/// node shows to those it doesn't let in.
+static GATE_FILES: std::sync::LazyLock<HashSet<String>> = std::sync::LazyLock::new(|| {
+    let mut files = HashSet::new();
+    let Some(manifest) = Web::get(".vite/manifest.json").and_then(|f| serde_json::from_slice::<Value>(&f.data).ok()) else {
+        return files;
+    };
+    let mut todo = vec!["gate.html".to_string()];
+    let mut seen = HashSet::new();
+    while let Some(key) = todo.pop() {
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        let Some(chunk) = manifest.get(&key) else { continue };
+        let strings = |k: &str| chunk.get(k).and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).map(String::from);
+        files.extend(chunk.get("file").and_then(Value::as_str).map(String::from));
+        files.extend(strings("css"));
+        files.extend(strings("assets"));
+        todo.extend(strings("imports"));
+    }
+    files.remove("gate.html");
+    files
+});
+
+/// The sign-in page, as a private node answers page loads from those it doesn't let in. 401, so that the
+/// service worker (web/public/sw.js) doesn't keep it as the app.
+fn gate_page() -> Response {
+    let no_store = [(header::CACHE_CONTROL, "no-store")];
+    match Web::get("gate.html") {
+        Some(f) => (StatusCode::UNAUTHORIZED, no_store, [(header::CONTENT_TYPE, "text/html; charset=utf-8")], f.data).into_response(),
+        None => (StatusCode::UNAUTHORIZED, no_store, "web app not built: run `npm run build`").into_response(),
+    }
 }
 
 fn random<const N: usize>() -> [u8; N] {
@@ -379,6 +433,12 @@ fn may_write(db: &Connection, author: &Pubkey, path: &str) -> bool {
             .any(|(_, r)| GrantData::from_cbor(&r.data).is_ok_and(|g| g.covers(author, path, |c| claimed_by(db, c))))
 }
 
+/// Whether `user` may get into this node in private mode: they're an owner, or an access record names them.
+fn has_access(db: &Connection, user: &Pubkey) -> bool {
+    owners(db).contains(user)
+        || heads_of(db, "access").iter().any(|(_, r)| r.access().and_then(|w| w.resolve(|c| claimed_by(db, c))).as_ref() == Some(user))
+}
+
 /// Whether the delegation `a` names lets `key` sign a record of type `kind` at `path` for `a.user`, now:
 /// it's a live "delegate" chain, its current version is by `a.user` for `key`, and it covers that.
 fn delegated(db: &Connection, key: &Pubkey, a: &Acting, path: &str, kind: &str) -> Result<(), String> {
@@ -503,7 +563,8 @@ impl App {
     /// Keeps the node record's URL current. On a fresh database, writes a claim and an owner record naming
     /// it, for whoever claims it first; while that's unclaimed, gives it a new token on each start and
     /// prints the link (the node only keeps the token's hash).
-    fn init(&self, public_url: &str, origin: &str) {
+    fn init(&self, public_url: &str) {
+        let origin = &self.origin;
         let db = self.db.lock().unwrap();
         let mut m = Map::new();
         m.insert("url", public_url);
@@ -616,13 +677,7 @@ impl App {
     fn owner_reading(&self, db: &Connection, headers: &HeaderMap) -> Result<bool, Response> {
         let Some(v) = headers.get(header::AUTHORIZATION) else { return Ok(false) };
         let bad = |e: &str| err(StatusCode::UNAUTHORIZED, format!("read token: {e}"));
-        let mut parts = v.to_str().ok().and_then(|v| v.strip_prefix("Bisonbase ")).unwrap_or_default().split('.');
-        let (Some(user), Some(expires), Some(sig), None) = (
-            parts.next().and_then(decode_id),
-            parts.next().and_then(|e| e.parse::<u64>().ok()),
-            parts.next().and_then(decode_b58).and_then(|s| <[u8; 64]>::try_from(s).ok()),
-            parts.next(),
-        ) else {
+        let Some((user, expires, sig)) = v.to_str().ok().and_then(|v| v.strip_prefix("Bisonbase ")).and_then(parse_token) else {
             return Err(bad("expected \"Bisonbase <ID>.<expires>.<signature>\""));
         };
         let now = now_ms();
@@ -642,6 +697,18 @@ impl App {
         keys.insert(self.pk);
         keys
     }
+}
+
+/// A signed token's parts, as read and access tokens write them: `<ID>.<expires>.<signature>`, base58 but
+/// for the expiry (ms since the epoch).
+fn parse_token(s: &str) -> Option<(Pubkey, u64, [u8; 64])> {
+    let mut parts = s.split('.');
+    let token = (
+        parts.next().and_then(decode_id)?,
+        parts.next()?.parse().ok()?,
+        parts.next().and_then(decode_b58).and_then(|s| s.try_into().ok())?,
+    );
+    parts.next().is_none().then_some(token)
 }
 
 fn user_json(pk: &Pubkey, node: bool) -> Value {
@@ -1070,6 +1137,7 @@ async fn node_info(State(app): S) -> Response {
         "pubkey": encode_id(&app.pk),
         "phrase": node_phrase(&app.pk),
         "owners": owners.iter().map(encode_id).collect::<Vec<_>>(),
+        "private": app.private,
     });
     ([(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")], Json(body)).into_response()
 }
@@ -1104,27 +1172,138 @@ async fn claim(State(app): S, Json(c): Json<Claim>) -> Response {
     if let Err(e) = verify_sig(&user, &claim_signed_bytes(&app.pk, &token), &sig) {
         return err(StatusCode::BAD_REQUEST, format!("claim: {e}"));
     }
-    let token_hash: Hash = Sha256::digest(&token).into();
     let db = app.db.lock().unwrap();
-    let mut stmt = db.prepare("SELECT hash, root, record FROM heads WHERE type = 'claim'").unwrap();
-    let found = stmt
-        .query_map([], |r| Ok((r.get::<_, Hash>(0)?, r.get::<_, Hash>(1)?, r.get::<_, Vec<u8>>(2)?)))
-        .unwrap()
-        .flatten()
-        .find_map(|(h, root, b)| {
-            let r = parse_record(b);
-            Some((h, root, r.claim().filter(|c| c.token_hash == token_hash)?, r.path))
-        });
-    let Some((head, root, data, path)) = found else {
+    let Some(found) = find_claim(&db, &token) else {
         return err(StatusCode::NOT_FOUND, "This claim link isn't for this node, or its claim was deleted.");
     };
-    if data.user.is_some() {
+    if found.data.user.is_some() {
         return err(StatusCode::FORBIDDEN, "This claim link was already used.");
     }
-    db.execute("INSERT OR IGNORE INTO users (pubkey) VALUES (?1)", [user]).unwrap();
-    app.write(&db, &path, "claim", ClaimData { user: Some(user), ..data }.to_cbor(), Some(head));
-    println!("claim {} claimed by {} ({})", encode_b58(&root), encode_id(&user), phrase(&user));
+    let root = found.root;
+    app.redeem(&db, found, &user);
     Json(json!({ "claim": encode_b58(&root) })).into_response()
+}
+
+/// A live claim, found by its token.
+struct FoundClaim {
+    head: Hash,
+    root: Hash,
+    path: String,
+    data: ClaimData,
+}
+
+/// The live claim whose token this is, if this node has one.
+fn find_claim(db: &Connection, token: &[u8]) -> Option<FoundClaim> {
+    let token_hash: Hash = Sha256::digest(token).into();
+    let mut stmt = db.prepare("SELECT hash, root, record FROM heads WHERE type = 'claim'").unwrap();
+    stmt.query_map([], |r| Ok((r.get::<_, Hash>(0)?, r.get::<_, Hash>(1)?, r.get::<_, Vec<u8>>(2)?)))
+        .unwrap()
+        .flatten()
+        .find_map(|(head, root, b)| {
+            let r = parse_record(b);
+            Some(FoundClaim { head, root, data: r.claim().filter(|c| c.token_hash == token_hash)?, path: r.path })
+        })
+}
+
+impl App {
+    /// Has `user` claim the unclaimed claim `c`: writes its new version naming them.
+    fn redeem(&self, db: &Connection, c: FoundClaim, user: &Pubkey) {
+        db.execute("INSERT OR IGNORE INTO users (pubkey) VALUES (?1)", [user]).unwrap();
+        self.write(db, &c.path, "claim", ClaimData { user: Some(*user), ..c.data }.to_cbor(), Some(c.head));
+        println!("claim {} claimed by {} ({})", encode_b58(&c.root), encode_id(user), phrase(user));
+    }
+
+    /// Who the request's access cookie (see `auth`) is from, if it's valid and they have access.
+    fn let_in(&self, headers: &HeaderMap) -> Option<Pubkey> {
+        let (user, expires, sig) = cookie(headers, ACCESS_COOKIE).and_then(parse_token)?;
+        let now = now_ms();
+        if expires < now || expires > now + MAX_ACCESS_TOKEN_MS {
+            return None;
+        }
+        verify_sig(&user, &access_signed_bytes(&self.origin, expires), &sig).ok()?;
+        has_access(&self.db.lock().unwrap(), &user).then_some(user)
+    }
+}
+
+// ---- private mode ----
+
+/// The cookie that holds an access token: `<ID>.<expires>.<signature>`, as read tokens are written.
+const ACCESS_COOKIE: &str = "bb_access";
+
+/// The value of the cookie `name`, if the request has it.
+fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .find_map(|c| c.trim().strip_prefix(name)?.strip_prefix('='))
+}
+
+/// In private mode, lets through only requests with a valid access cookie from someone with access. Others
+/// get the sign-in page (`gate_page`) for page loads, its own files, and `/api/auth`; anything else is a
+/// bare 404, so that they can't tell what this is.
+async fn gate(State(app): S, req: Request, next: Next) -> Response {
+    let path = req.uri().path();
+    if !app.private || path == "/api/auth" || GATE_FILES.contains(path.trim_start_matches('/')) || app.let_in(req.headers()).is_some() {
+        return next.run(req).await;
+    }
+    let page = req.method() == Method::GET
+        && req.headers().get(header::ACCEPT).and_then(|v| v.to_str().ok()).is_some_and(|a| a.contains("text/html"));
+    if page { gate_page() } else { StatusCode::NOT_FOUND.into_response() }
+}
+
+/// An access token, to sign in to a private node: the user's ID and signature over `access_signed_bytes`
+/// (base58), and its expiry (ms since the epoch). With `claim`, the token from a claim link (base58): the
+/// claim is claimed for the user first, if it'd let them in (or they already have access).
+#[derive(Deserialize)]
+struct Auth {
+    user: String,
+    expires: u64,
+    signature: String,
+    claim: Option<String>,
+}
+
+/// Signs in to a private node: if the token checks out and its user has access, sets it as the access
+/// cookie, until it expires. Only on private nodes.
+async fn auth(State(app): S, Json(a): Json<Auth>) -> Response {
+    if !app.private {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let (Some(user), Some(sig)) = (decode_id(&a.user), decode_b58(&a.signature).and_then(|s| <[u8; 64]>::try_from(s).ok())) else {
+        return err(StatusCode::BAD_REQUEST, "malformed access token");
+    };
+    let now = now_ms();
+    if a.expires < now || a.expires > now + MAX_ACCESS_TOKEN_MS {
+        return err(StatusCode::BAD_REQUEST, "access token expired, or expires too far ahead; check your clock");
+    }
+    if let Err(e) = verify_sig(&user, &access_signed_bytes(&app.origin, a.expires), &sig) {
+        return err(StatusCode::BAD_REQUEST, format!("access token: {e}"));
+    }
+    let db = app.db.lock().unwrap();
+    // A claim that'd let them in, or any claim if they're in already. Others stay unclaimed, for whoever
+    // the link was meant for; a bad link just doesn't help.
+    if let Some(found) = a.claim.as_deref().and_then(decode_b58).and_then(|t| find_claim(&db, &t))
+        && found.data.user.is_none()
+        && (has_access(&db, &user)
+            || ["owner", "access"].iter().any(|k| heads_of(&db, k).iter().any(|(_, r)| matches!(r.owner().or(r.access()), Some(Who::Claim(c)) if c == found.root))))
+    {
+        app.redeem(&db, found, &user);
+    }
+    if !has_access(&db, &user) {
+        return err(StatusCode::FORBIDDEN, "no access");
+    }
+    let token = format!("{}.{}.{}", encode_id(&user), a.expires, encode_b58(&sig));
+    let max_age = (a.expires - now) / 1000;
+    let secure = if app.origin.starts_with("https:") { "; Secure" } else { "" };
+    let cookie = format!("{ACCESS_COOKIE}={token}; Path=/; Max-Age={max_age}; HttpOnly; SameSite=Lax{secure}");
+    (StatusCode::NO_CONTENT, [(header::SET_COOKIE, cookie)]).into_response()
+}
+
+/// Signs out of a private node: clears the access cookie.
+async fn sign_out() -> Response {
+    let cookie = format!("{ACCESS_COOKIE}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax");
+    (StatusCode::NO_CONTENT, [(header::SET_COOKIE, cookie)]).into_response()
 }
 
 /// A CBOR array of stored records (each already dCBOR).
@@ -1248,16 +1427,21 @@ async fn push_to(app: &App, peer_hash: Hash, peer: &PeerData) -> Result<(), reqw
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fedcrdt_core::{DelegateData, DocSnapshotData, DocUpdateData, EncKeyData, GRANT_PATH, Grantees, delegate_path, enckey_path, user_path};
+    use fedcrdt_core::{ACCESS_PATH, DelegateData, DocSnapshotData, DocUpdateData, EncKeyData, GRANT_PATH, Grantees, delegate_path, enckey_path, user_path};
 
     /// A fresh node on an in-memory database, started as `main` does: it has a node record, and an
     /// owner record naming an unclaimed claim.
     fn node() -> App {
+        node_in_mode(false)
+    }
+
+    /// `node()`, in private mode or not.
+    fn node_in_mode(private: bool) -> App {
         let db = Connection::open_in_memory().unwrap();
         create_schema(&db);
         let key = node_key(&db);
-        let app = App::new(db, key);
-        app.init("http://node.test", "http://web.test");
+        let app = App::new(db, key, "http://web.test".into(), private);
+        app.init("http://node.test");
         app
     }
 
@@ -1881,5 +2065,158 @@ mod tests {
         let hashes = |rows: Vec<(i64, Vec<u8>)>| -> Vec<Hash> { rows.iter().map(|(_, b)| Sha256::digest(b).into()).collect() };
         assert_eq!(hashes(stored_after(&db, &f, 0)).len(), 8, "everything, without compacting");
         assert_eq!(hashes(compact(&db, &doc.hash(), stored_after(&db, &f, 0))), [doc.hash(), u3.hash(), s1.hash(), u4.hash()]);
+    }
+
+    // ---- private mode ----
+
+    /// A private node with an owner, alice, serving the web app; and alice, bob and carol.
+    fn private_node() -> (Arc<App>, Router, SigningKey, SigningKey, SigningKey) {
+        let app = Arc::new(node_in_mode(true));
+        let alice = key(1);
+        app.write(&app.db.lock().unwrap(), OWNER_PATH, "owner", Who::User(id(&alice)).to_cbor(), None);
+        (app.clone(), router(app, true), alice, key(2), key(3))
+    }
+
+    /// Sends a request through the whole router, with these headers and (JSON) body.
+    async fn send(router: &Router, method: Method, path: &str, headers: &[(header::HeaderName, &str)], json: Option<Value>) -> Response {
+        use tower::ServiceExt;
+        let mut req = axum::http::Request::builder().method(method).uri(path);
+        for (k, v) in headers {
+            req = req.header(k, *v);
+        }
+        let body = match json {
+            Some(j) => {
+                req = req.header(header::CONTENT_TYPE, "application/json");
+                axum::body::Body::from(j.to_string())
+            }
+            None => axum::body::Body::empty(),
+        };
+        router.clone().oneshot(req.body(body).unwrap()).await.unwrap()
+    }
+
+    /// `key`'s access token for a node whose web app is at `origin`, good for an hour, as `/api/auth` takes it.
+    fn access_token(key: &SigningKey, origin: &str, claim: Option<&str>) -> Value {
+        let expires = now_ms() + 60 * 60 * 1000;
+        let sig = key.sign(&access_signed_bytes(origin, expires)).to_bytes();
+        json!({ "user": encode_id(&id(key)), "expires": expires, "signature": encode_b58(&sig), "claim": claim })
+    }
+
+    /// Signs in as `key`: the response, and the cookie header to send back, if it set one.
+    async fn sign_in(router: &Router, key: &SigningKey, claim: Option<&str>) -> (StatusCode, Option<String>) {
+        let res = send(router, Method::POST, "/api/auth", &[], Some(access_token(key, "http://web.test", claim))).await;
+        let cookie = res.headers().get(header::SET_COOKIE).map(|c| c.to_str().unwrap().split(';').next().unwrap().to_string());
+        (res.status(), cookie)
+    }
+
+    async fn status_with(router: &Router, path: &str, cookie: &str) -> StatusCode {
+        send(router, Method::GET, path, &[(header::COOKIE, cookie)], None).await.status()
+    }
+
+    #[tokio::test]
+    async fn private_mode_hides_everything_but_sign_in() {
+        let (_, router, ..) = private_node();
+        let page = send(&router, Method::GET, "/some/page", &[(header::ACCEPT, "text/html,*/*")], None).await;
+        assert_eq!(page.status(), StatusCode::UNAUTHORIZED, "page loads get the sign-in page");
+        assert_eq!(page.headers().get(header::CACHE_CONTROL).unwrap(), "no-store");
+        for path in ["/", "/api/node", "/api/records", "/api/users", "/api/stream", "/sw.js", "/assets/index.js", "/nope"] {
+            let res = send(&router, Method::GET, path, &[], None).await;
+            assert_eq!(res.status(), StatusCode::NOT_FOUND, "{path}");
+            assert!(body(res).await.is_empty(), "{path} says nothing");
+        }
+        for path in ["/api/records", "/api/claim", "/receive"] {
+            assert_eq!(send(&router, Method::POST, path, &[], Some(json!({}))).await.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+        assert_eq!(status_with(&router, "/api/node", "bb_access=junk").await, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn owners_and_access_holders_get_in() {
+        let (app, router, alice, bob, _) = private_node();
+        let (status, cookie) = sign_in(&router, &bob, None).await;
+        assert_eq!((status, cookie), (StatusCode::FORBIDDEN, None), "no access yet");
+
+        let (status, alice_cookie) = sign_in(&router, &alice, None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let alice_cookie = alice_cookie.expect("an owner gets a cookie");
+        assert_eq!(status_with(&router, "/api/node", &alice_cookie).await, StatusCode::OK);
+        assert_eq!(status_with(&router, "/api/records", &alice_cookie).await, StatusCode::OK);
+
+        let access = sign(&alice, ACCESS_PATH, "access", Who::User(id(&bob)).to_cbor(), None, 1);
+        put(&app, &access).unwrap();
+        let (status, bob_cookie) = sign_in(&router, &bob, None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let bob_cookie = bob_cookie.unwrap();
+        assert_eq!(status_with(&router, "/api/node", &bob_cookie).await, StatusCode::OK);
+
+        // Revoking access shuts the cookie out on the next request: there's no session to end.
+        put(&app, &tombstone(&alice, &access, 2)).unwrap();
+        assert_eq!(status_with(&router, "/api/node", &bob_cookie).await, StatusCode::NOT_FOUND);
+        assert_eq!(status_with(&router, "/api/node", &alice_cookie).await, StatusCode::OK);
+
+        // Only owners write access records.
+        let err = put(&app, &sign(&bob, ACCESS_PATH, "access", Who::User(id(&bob)).to_cbor(), None, 3)).unwrap_err();
+        assert!(err.contains("owners"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn access_tokens_are_checked() {
+        let (_, router, alice, ..) = private_node();
+        let auth = |token: Value| send(&router, Method::POST, "/api/auth", &[], Some(token));
+        assert_eq!(auth(access_token(&alice, "http://elsewhere.test", None)).await.status(), StatusCode::BAD_REQUEST, "another origin's");
+        let mut forged = access_token(&alice, "http://web.test", None);
+        forged["expires"] = json!(forged["expires"].as_u64().unwrap() + 1);
+        assert_eq!(auth(forged).await.status(), StatusCode::BAD_REQUEST, "signature doesn't match");
+        let expires = now_ms() + MAX_ACCESS_TOKEN_MS + 60_000;
+        let sig = alice.sign(&access_signed_bytes("http://web.test", expires)).to_bytes();
+        let too_long = json!({ "user": encode_id(&id(&alice)), "expires": expires, "signature": encode_b58(&sig) });
+        assert_eq!(auth(too_long).await.status(), StatusCode::BAD_REQUEST, "expires too far ahead");
+
+        let (_, cookie) = sign_in(&router, &alice, None).await;
+        let cookie = cookie.unwrap();
+        assert_eq!(status_with(&router, "/api/node", &format!("other=1; {cookie}")).await, StatusCode::OK, "found among others");
+        let res = send(&router, Method::DELETE, "/api/auth", &[], None).await;
+        assert!(res.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap().contains("Max-Age=0"), "signing out clears it");
+    }
+
+    #[tokio::test]
+    async fn claim_links_let_in() {
+        let (app, router, alice, bob, carol) = private_node();
+        let (claim, link) = app.new_claim(&app.db.lock().unwrap(), "http://web.test", None);
+        let token = link.split_once('#').unwrap().1.to_string();
+        // A claim that doesn't give access stays unclaimed: it's for whoever it was meant for.
+        let (status, _) = sign_in(&router, &bob, Some(&token)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(claimed_by(&app.db.lock().unwrap(), &claim), None);
+
+        put(&app, &sign(&alice, ACCESS_PATH, "access", Who::Claim(claim).to_cbor(), None, 1)).unwrap();
+        let (status, cookie) = sign_in(&router, &bob, Some(&token)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(claimed_by(&app.db.lock().unwrap(), &claim), Some(id(&bob)));
+        assert_eq!(status_with(&router, "/api/node", &cookie.unwrap()).await, StatusCode::OK);
+        // It works once.
+        assert_eq!(sign_in(&router, &carol, Some(&token)).await.0, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn first_owner_claims_a_private_node() {
+        let app = Arc::new(node_in_mode(true));
+        let router = router(app.clone(), true);
+        let (_, link) = {
+            let db = app.db.lock().unwrap();
+            let (_, head) = heads_of(&db, "claim").pop().unwrap();
+            app.new_claim(&db, "http://web.test", Some(head.hash()))
+        };
+        let token = link.split_once('#').unwrap().1;
+        let alice = key(1);
+        assert_eq!(sign_in(&router, &alice, Some(token)).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(owners(&app.db.lock().unwrap()), [id(&alice)]);
+    }
+
+    #[tokio::test]
+    async fn public_mode_has_no_gate() {
+        let app = Arc::new(node());
+        let router = router(app, true);
+        assert_eq!(send(&router, Method::GET, "/api/node", &[], None).await.status(), StatusCode::OK);
+        assert_eq!(sign_in(&router, &key(1), None).await.0, StatusCode::NOT_FOUND);
     }
 }

@@ -11,6 +11,8 @@
     "dev:fresh": "DB=bb1.db cargo run -q -- --drop-db && npm run dev",
     "dev:peer": "npm run -s wasm:dev && concurrently -k -n peer,peerweb -c magenta,blue \"DB=bb2.db PORT=8081 ORIGIN=http://localhost:5174 cargo run\" \"API=http://localhost:8081 vite --port 5174 --strictPort\"",
     "dev:peer:fresh": "DB=bb2.db cargo run -q -- --drop-db && npm run dev:peer",
+    "dev:private": "npm run -s wasm:dev && tsc -b && vite build && DB=bbp.db cargo run -- --private",
+    "dev:private:fresh": "DB=bbp.db cargo run -q -- --drop-db && npm run dev:private",
     "build": "npm run wasm && tsc -b && vite build",
     "build:release": "npm run build && cargo build --release",
     "build:linux-x64": "npm run build && cargo zigbuild --release --target x86_64-unknown-linux-musl",

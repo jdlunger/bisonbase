@@ -37,6 +37,12 @@ certificates (untrusted, but no rate limits) for trying a setup out. Binding 80 
 
 Without `DOMAIN`, it serves plain HTTP on `PORT` (default 8080), for running behind another proxy (set `PUBLIC_URL`).
 
+### Private mode
+
+`./fedcrdt --private` only lets in the node's owners and the users its access records (`/node/access`) name: a user, or a claim link for someone new. Everyone else gets a blank page with a passkey sign-in button, and a bare 404 for everything else (the app's files, the API, pushes from peers). Signing in sets a cookie holding a signed access token (30 days); it's checked on every request, so removing someone's access record shuts them out at once.
+
+To try it locally, `npm run dev:private` (or `dev:private:fresh`) builds the web app and runs a private node serving it on http://localhost:8080 (database `bbp.db`). In `npm run dev`, Vite serves the app, so only the API is gated there.
+
 ## Building apps on it
 
 Any app can keep its data on a node, as records of its own types (namespaced, e.g. `todo.item`) or as CRDT docs in any format and schema (e.g. Yjs, `myapp.board`), through the client library in `client/`. Apps on other origins sign with their own key, which the user lets sign for them at `/connect`. Docs can be encrypted, so that nodes only ever see ciphertext. See [client/README.md](client/README.md).

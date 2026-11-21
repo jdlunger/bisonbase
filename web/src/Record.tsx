@@ -123,7 +123,7 @@ export function UserPage({ pubkey, node, me, busy, run, tick }: { pubkey: string
   return (
     <>
       <Identity pubkey={pubkey} node={node} me={me} grants={data?.grants ?? null} busy={busy} run={run} />
-      {isThisNode && <NodeAdmin me={me} busy={busy} run={run} tick={tick} />}
+      {isThisNode && <NodeAdmin node={node} me={me} busy={busy} run={run} tick={tick} />}
       <h2 className="mt-10 text-xl font-semibold">Written</h2>
       {error && <ErrorBox>Couldn't load records: {error}</ErrorBox>}
       {data === null ? (

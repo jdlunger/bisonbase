@@ -3,7 +3,7 @@
 
 use fedcrdt_core::{
     Acting, CBOR, CBORCase, ClaimData, DelegateData, DocData, DocSnapshotData, DocUpdateData, EncKeyData, GrantData, Grantees, Map, PeerData, Record,
-    SealedKey, Who, check_path, check_prefix, claim_signed_bytes, decode_b58, decode_id, delegate_path, encode_b58, enckey_path, is_app_type,
+    SealedKey, Who, access_signed_bytes, check_path, check_prefix, claim_signed_bytes, decode_b58, decode_id, delegate_path, encode_b58, enckey_path, is_app_type,
     live_signed_bytes, node_phrase, path_user, path_within, phrase, read_signed_bytes, two_words, user_path,
 };
 use js_sys::{Array, BigInt, Object, Reflect, Uint8Array};
@@ -78,6 +78,8 @@ export type Rec = {
   nodeUrl?: string;
   /** An owner record's user. */
   owner?: Who;
+  /** An access record's user. */
+  access?: Who;
   doc?: DocData;
   docUpdate?: DocUpdateData;
   docSnapshot?: DocSnapshotData;
@@ -157,6 +159,8 @@ struct RecJs {
     node_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     owner: Option<WhoJs>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    access: Option<WhoJs>,
     #[serde(skip_serializing_if = "Option::is_none")]
     doc: Option<DocJs>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -304,6 +308,7 @@ fn rec_js(r: &Record) -> RecJs {
         claim: r.claim().map(|c| ClaimJs { token_hash: buf(&c.token_hash), user: c.user.map(|u| buf(&u)) }),
         node_url: r.node_url(),
         owner: r.owner().as_ref().map(WhoJs::from),
+        access: r.access().as_ref().map(WhoJs::from),
         doc: r.doc().map(|d| DocJs {
             title: d.title,
             editors: d.editors.iter().map(WhoJs::from).collect(),
@@ -504,7 +509,7 @@ fn data_cbor(kind: &str, data: JsValue) -> Result<CBOR> {
             let c: ClaimJs = de(data)?;
             ClaimData { token_hash: fixed(&c.token_hash, "tokenHash")?, user: c.user.map(|u| fixed(&u, "user")).transpose()? }.to_cbor()
         }
-        "owner" => de::<WhoJs>(data)?.to()?.to_cbor(),
+        "owner" | "access" => de::<WhoJs>(data)?.to()?.to_cbor(),
         "doc" => {
             let d: DocJs = de(data)?;
             let keys = d
@@ -571,6 +576,13 @@ pub fn claim_signed_bytes_js(node: &[u8], token: &[u8]) -> Result<Vec<u8>> {
 #[wasm_bindgen(js_name = readSignedBytes)]
 pub fn read_signed_bytes_js(node: &[u8], expires: u64) -> Result<Vec<u8>> {
     Ok(read_signed_bytes(&fixed(node, "node")?, expires))
+}
+
+/// The bytes a user signs to be let into the private node whose web app is at `origin` until `expires`
+/// (ms since the epoch).
+#[wasm_bindgen(js_name = accessSignedBytes)]
+pub fn access_signed_bytes_js(origin: &str, expires: u64) -> Vec<u8> {
+    access_signed_bytes(origin, expires)
 }
 
 /// The bytes an editor signs to join the live room of `doc` on `node` until `expires` (ms since the epoch).

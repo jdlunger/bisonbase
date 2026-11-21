@@ -25,6 +25,7 @@ import {
   putPost,
   recentPasskeys,
   redeemClaim,
+  renewAccess,
   restoreKeys,
   setRemember,
   userPhrase,
@@ -82,8 +83,11 @@ function Shell({ initialError }: { initialError: string | null }) {
     setPasskey(current);
     setRecent(others.map((p) => ({ ...p, phrase: userPhrase(p.pubkey) })));
     if (!m) setDraft(null);
-    // So others can share encrypted docs with us; quietly skipped where this node doesn't let us.
-    else ensureEncKey();
+    else {
+      // So others can share encrypted docs with us; quietly skipped where this node doesn't let us.
+      ensureEncKey();
+      renewAccess();
+    }
   }, []);
 
   useEffect(() => {
@@ -200,7 +204,7 @@ function Shell({ initialError }: { initialError: string | null }) {
   );
 }
 
-/** /claim#<token>: a claim link. Shows what it grants (from the owner and grant records naming its claim),
+/** /claim#<token>: a claim link. Shows what it grants (from the owner, access, grant and doc records naming its claim),
  * and claims it for whoever's signed in. An invite to an encrypted doc is /claim#<token>.<the doc's key>:
  * claiming it keeps the key on this device, until the doc's author seals it to us. */
 function Claim({ me, busy, run, tick }: { me: User | null; busy: boolean; run: Run; tick: number }) {
@@ -215,7 +219,7 @@ function Claim({ me, busy, run, tick }: { me: User | null; busy: boolean; run: R
   if (!token) return box(<p>This link is missing its token. Use the whole link.</p>);
   if (error) return box(<p className="text-red-700">{error}</p>);
   if (!data) return box(<p className="text-gray-500">Loading…</p>);
-  const { claim, owner, grants, docs } = data;
+  const { claim, owner, access, grants, docs } = data;
   if (!claim) return box(<p>This link isn't for this node, or its claim was deleted.</p>);
   const by = claim.claim?.claimedBy;
   if (by) {
@@ -234,6 +238,7 @@ function Claim({ me, busy, run, tick }: { me: User | null; busy: boolean; run: R
       <p>It works once, and gives whoever claims it:</p>
       <ul className="list-disc pl-6 text-sm">
         {owner && <li>👑 Ownership of this node: writing anywhere, editing or deleting anything, adding owners, grants and peers</li>}
+        {access && !owner && <li>🚪 Getting into this private node</li>}
         {grants.map((g) => (
           <li key={g}>
             🔑 Writing at or under <code className="font-mono">{g}</code>
@@ -248,7 +253,7 @@ function Claim({ me, busy, run, tick }: { me: User | null; busy: boolean; run: R
             </Link>
           </li>
         ))}
-        {!owner && !grants.length && !docs.length && <li>Nothing yet (no owner, grant or doc record names it)</li>}
+        {!owner && !access && !grants.length && !docs.length && <li>Nothing yet (no owner, access, grant or doc record names it)</li>}
       </ul>
       {me ? (
         <button

@@ -325,6 +325,7 @@ impl EncKeyData {
 //   /node/owner  type "owner", data a `Who`: one per owner
 //   /node/grant  type "grant" (see `GrantData`): lets users write at or under a path
 //   /node/peer   type "peer" (see `PeerData`): has the node push records to another node
+//   /node/access type "access", data a `Who`: on a private node, lets them in (see "private nodes")
 //
 // Owners write all of these (except /node/info) and may write anything, anywhere. Others need a grant
 // covering the path, except to edit or delete their own records. A node checks all of that when a
@@ -343,6 +344,7 @@ pub const NODE_INFO_PATH: &str = "/node/info";
 pub const OWNER_PATH: &str = "/node/owner";
 pub const GRANT_PATH: &str = "/node/grant";
 pub const PEER_PATH: &str = "/node/peer";
+pub const ACCESS_PATH: &str = "/node/access";
 /// Where the node's own claims go, and owners' by default. Others' claims may go anywhere they may write.
 pub const CLAIM_PATH: &str = "/node/claim";
 
@@ -373,6 +375,29 @@ pub fn read_signed_bytes(node: &Pubkey, expires: u64) -> Vec<u8> {
     m.insert("node", CBOR::to_byte_string(node));
     m.insert("expires", expires);
     [READ_CONTEXT, &CBOR::from(m).to_cbor_data()].concat()
+}
+
+// ---- private nodes ----
+//
+// A node run in private mode (`--private`) only lets in its owners and the users its access records name:
+// to everyone else it's a blank page with a sign-in button. Browsers can't add a header to page loads,
+// asset loads, event streams or WebSockets, so a user who has access signs `access_signed_bytes` and the
+// node keeps that token as a cookie. Still no sessions: each request's token is checked, and access looked
+// up, again. The token names the web app's origin, not the node's key, so that the sign-in page needn't
+// say which node it is.
+
+pub const ACCESS_CONTEXT: &[u8] = b"bisonbase-access-v1\n";
+
+/// How far ahead of the node's clock an access token's expiry may be.
+pub const MAX_ACCESS_TOKEN_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+
+/// The bytes a user signs to be let into the private node whose web app is at `origin` until `expires`
+/// (ms since the epoch).
+pub fn access_signed_bytes(origin: &str, expires: u64) -> Vec<u8> {
+    let mut m = Map::new();
+    m.insert("origin", origin);
+    m.insert("expires", expires);
+    [ACCESS_CONTEXT, &CBOR::from(m).to_cbor_data()].concat()
 }
 
 // ---- live presence in a doc ----
@@ -769,6 +794,7 @@ fn node_type_path(kind: &str) -> Option<&'static str> {
         "owner" => OWNER_PATH,
         "grant" => GRANT_PATH,
         "peer" => PEER_PATH,
+        "access" => ACCESS_PATH,
         _ => return None,
     })
 }
@@ -805,6 +831,11 @@ impl Record {
     /// An owner record's user.
     pub fn owner(&self) -> Option<Who> {
         (self.kind == "owner").then(|| Who::from_cbor(&self.data).ok()).flatten()
+    }
+
+    /// An access record's user.
+    pub fn access(&self) -> Option<Who> {
+        (self.kind == "access").then(|| Who::from_cbor(&self.data).ok()).flatten()
     }
 
     /// A claim record's data.
@@ -944,8 +975,8 @@ impl Record {
                 GrantData::from_cbor(&self.data).map_err(|e| format!("grant: {e}"))?;
             }
             "node" => check_url(&field(as_map(&self.data, "a node record's data")?, "url", text)?)?,
-            "owner" => {
-                Who::from_cbor(&self.data).map_err(|e| format!("owner: {e}"))?;
+            "owner" | "access" => {
+                Who::from_cbor(&self.data).map_err(|e| format!("{}: {e}", self.kind))?;
             }
             "peer" => {
                 PeerData::from_cbor(&self.data)?;

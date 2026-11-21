@@ -32,6 +32,19 @@ import {
   twoWords,
   unb58,
 } from "../../client/src/index.ts";
+import {
+  type PasskeyIds,
+  b64,
+  createPasskey,
+  deriveBits,
+  identityKey,
+  prfFromPasskey,
+  random,
+  signIn,
+  signOut,
+  takeHandoff,
+  unb64,
+} from "./passkey.ts";
 
 export { type Rec, b58, pathWithin };
 
@@ -78,7 +91,7 @@ const nodes = new Set<string>();
 export const isNode = (pubkey: string) => nodes.has(pubkey);
 
 /** The node this page talks to, and who owns it. */
-export type NodeInfo = { pubkey: string; phrase: string; owners: string[] };
+export type NodeInfo = { pubkey: string; phrase: string; owners: string[]; private: boolean };
 let thisNode: NodeInfo | null = null;
 export const getNode = (url = "") => api<NodeInfo>(`${url}/api/node`);
 
@@ -111,23 +124,14 @@ export function userPhrase(pubkey: string) {
   return phrase(pk, nodes.has(pubkey));
 }
 
-// ---- bytes ----
-
-const enc = new TextEncoder();
-const b64 = (b: ArrayBuffer | Uint8Array) =>
-  btoa(String.fromCharCode(...new Uint8Array(b))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-const unb64 = (s: string) =>
-  Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
-const random = (n: number) => crypto.getRandomValues(new Uint8Array(n));
 
 // ---- keys ----
 //
 // Everything hangs off one secret: the passkey's PRF output for a fixed salt. Only that passkey
-// can produce it. From it we derive (HKDF) an Ed25519 keypair, whose public key is the user's ID.
-// There is no sign-in: having the keys loaded is all; the
-// node has no sessions and never sees the secret or the private keys.
+// can produce it. From it we derive (HKDF) an Ed25519 keypair, whose public key is the user's ID (see
+// passkey.ts). There is no sign-in: having the keys loaded is all; the node has no sessions and never sees
+// the secret or the private keys. (A private node does want an access token: see `renewAccess`.)
 
-const PRF_SALT = enc.encode("bisonbase keys v1");
 /** The credential ID of the passkey whose saved keys to load on startup. */
 const CURRENT_KEY = "bisonbase-keys";
 const RECENT_PASSKEYS_KEY = "bisonbase-recent-passkeys";
@@ -136,31 +140,13 @@ const RECENT_PASSKEYS_KEY = "bisonbase-recent-passkeys";
 export type Passkey = {
   /** base64url credential ID. */
   credId: string;
-  /** Its two_word name (see passkeyName), recomputed from its user handle; null if unknown. */
+  /** Its two_word name (see passkeyName in passkey.ts), recomputed from its user handle; null if unknown. */
   name: string | null;
   /** The ID (public key) of the keys it derives. */
   pubkey: string;
   lastUsed: number;
 };
 
-type PasskeyIds = Pick<Passkey, "credId" | "name">;
-
-/** user.id length for passkeys whose name is derived from it. */
-const NAMED_USER_ID_LEN = 32;
-
-/**
- * A passkey's two_word name, derived from its random user.id. The name in the passkey picker includes it,
- * and since the user.id comes back on every use (as the user handle), we can show the same name here.
- * Null for passkeys whose name we can't reconstruct.
- */
-function passkeyName(userId: Uint8Array): string | null {
-  if (userId.length === NAMED_USER_ID_LEN) return twoWords(userId);
-  // Passkeys from the old server-side version: user.id was a v4 UUID, named "user-" + its first 8 hex digits.
-  if (userId.length === 16 && userId[6] >> 4 === 4 && userId[8] >> 6 === 2) {
-    return `user-${[...userId.slice(0, 4)].map((b) => b.toString(16).padStart(2, "0")).join("")}`;
-  }
-  return null;
-}
 
 type Keys = {
   secret: Uint8Array<ArrayBuffer>;
@@ -185,32 +171,14 @@ export const myEncKeys = () => keys?.enc ?? null;
 /** The passkey the loaded keys came from, if known. */
 export const myPasskey = () => keys?.passkey ?? null;
 
-/** PKCS#8 wrapper for a raw 32-byte Ed25519 seed, which is how WebCrypto wants it. */
-const ED25519_PKCS8_PREFIX = Uint8Array.from([
-  0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
-]);
 
 /** `passkey` is the passkey the secret came from, if known. */
 async function deriveKeys(secret: Uint8Array<ArrayBuffer>, passkey: PasskeyIds | null): Promise<Keys> {
-  const ikm = await crypto.subtle.importKey("raw", secret, "HKDF", false, ["deriveBits"]);
-  const hkdf = (info: string) => ({ name: "HKDF", hash: "SHA-256", salt: new Uint8Array(), info: enc.encode(info) });
-
-  const seed = new Uint8Array(await crypto.subtle.deriveBits(hkdf("bisonbase/identity/ed25519"), ikm, 256));
-  const pkcs8 = new Uint8Array([...ED25519_PKCS8_PREFIX, ...seed]);
-  // Import once extractable just to read the public key out of the JWK, then keep a non-extractable copy.
-  const jwk = await crypto.subtle.exportKey(
-    "jwk",
-    await crypto.subtle.importKey("pkcs8", pkcs8, "Ed25519", true, ["sign"]),
-  );
-  const signKey = await crypto.subtle.importKey("pkcs8", pkcs8, "Ed25519", false, ["sign"]);
-  seed.fill(0);
-  pkcs8.fill(0);
-
-  const encSeed = new Uint8Array(await crypto.subtle.deriveBits(hkdf("bisonbase/encryption/x25519"), ikm, 256));
+  const { signKey, pk } = await identityKey(secret);
+  const encSeed = await deriveBits(secret, "bisonbase/encryption/x25519");
   const encKeys = await encKeysFromSeed(encSeed);
   encSeed.fill(0);
 
-  const pk = unb64(jwk.x!);
   const pubkey = b58(pk);
   return { secret, pubkey, pk, signer: keySigner(signKey, pk), enc: encKeys, passkey: passkey && { ...passkey, pubkey, lastUsed: Date.now() } };
 }
@@ -340,8 +308,11 @@ async function loadSaved(credId: string): Promise<boolean> {
   return true;
 }
 
-/** Loads the keys saved to load on startup, if any. No prompt. */
+/** Loads the keys the private node's sign-in page just derived (see `handOff`), else those saved to load
+ * on startup, if any. No prompt. */
 export async function restoreKeys() {
+  const handoff = takeHandoff();
+  if (handoff) return loadKeys(await deriveKeys(handoff.secret, handoff.ids));
   let credId: string | null = null;
   try {
     credId = localStorage.getItem(CURRENT_KEY);
@@ -355,34 +326,6 @@ export async function loadPasskey(credId: string) {
 }
 
 // ---- passkey ceremonies (entirely client-side) ----
-
-const prfExtension = () => ({ prf: { eval: { first: PRF_SALT } } }) as AuthenticationExtensionsClientInputs;
-const prfOutput = (cred: PublicKeyCredential) =>
-  (cred.getClientExtensionResults() as any).prf?.results?.first as ArrayBuffer | undefined;
-
-const NO_PRF =
-  "This passkey (or browser) doesn't support the PRF extension, so it can't derive your keys. Try another browser, or a passkey stored in a different place.";
-
-/** Asks a passkey for its PRF secret (one prompt). `credId` restricts it to that passkey. */
-async function prfFromPasskey(credId?: BufferSource) {
-  const cred = (await navigator.credentials.get({
-    publicKey: {
-      challenge: random(32), // nobody verifies this assertion; we only want the PRF output
-      rpId: location.hostname,
-      userVerification: "preferred",
-      allowCredentials: credId ? [{ type: "public-key", id: credId }] : [],
-      extensions: prfExtension(),
-    },
-  })) as PublicKeyCredential;
-  const out = prfOutput(cred);
-  if (!out) throw new Error(NO_PRF);
-  const userHandle = (cred.response as AuthenticatorAssertionResponse).userHandle;
-  const ids: PasskeyIds = {
-    credId: b64(cred.rawId),
-    name: userHandle ? passkeyName(new Uint8Array(userHandle)) : null,
-  };
-  return { secret: new Uint8Array(out), ids };
-}
 
 /** Derives keys from an existing passkey (one prompt). `credId` (base64url) asks for that specific passkey. */
 export async function deriveFromExistingPasskey(credId?: string) {
@@ -398,35 +341,32 @@ export async function deriveFromExistingPasskey(credId?: string) {
 
 /** Creates a passkey, then derives keys from it: one or two prompts. */
 export async function deriveFromNewPasskey() {
-  // The two_word part of the name is derived from the random user.id, so we can recompute it on every use.
-  const userId = random(NAMED_USER_ID_LEN);
-  const words = passkeyName(userId)!;
-  const name = `bisonbase ${new Date().toISOString().slice(0, 10)} ${words}`;
-  const cred = (await navigator.credentials.create({
-    publicKey: {
-      challenge: random(32), // nobody verifies the attestation either
-      rp: { id: location.hostname, name: "bisonbase" },
-      user: { id: userId, name, displayName: name },
-      pubKeyCredParams: [-8, -7, -257].map((alg) => ({ type: "public-key" as const, alg })),
-      authenticatorSelection: { residentKey: "required", requireResidentKey: true, userVerification: "preferred" },
-      // Some authenticators return the PRF output right away, saving the second prompt.
-      extensions: prfExtension(),
-    },
-  })) as PublicKeyCredential;
-  const secret = prfOutput(cred);
-  if (!secret && (cred.getClientExtensionResults() as any).prf?.enabled === false) {
-    throw new Error(`The passkey was created, but it can't be used: ${NO_PRF}`);
-  }
-  const secretBytes = secret ? new Uint8Array(secret) : (await prfFromPasskey(cred.rawId)).secret;
-  loadKeys(await deriveKeys(secretBytes, { credId: b64(cred.rawId), name: words }));
+  const { secret, ids } = await createPasskey();
+  loadKeys(await deriveKeys(secret, ids));
 }
 
-/** Unloads the keys, deleting their saved copy. Other passkeys' saved keys stay. */
-export function forgetKeys() {
+/** Unloads the keys, deleting their saved copy. Other passkeys' saved keys stay. On a private node, also
+ * signs out of it, back to its sign-in page. */
+export async function forgetKeys() {
   setRemember(false);
   keys = null;
   // What the service worker kept (public/sw.js) may include private records we read as an owner.
-  caches?.delete(OFFLINE_CACHE).catch(() => {});
+  await caches?.delete(OFFLINE_CACHE).catch(() => {});
+  if (thisNode?.private) {
+    await signOut();
+    location.reload();
+  }
+}
+
+/** Who we last signed in to this private node as, this page load. */
+let accessFor: string | null = null;
+
+/** On a private node, signs in again with the loaded keys, once per page load and keys, so that the
+ * access cookie (30 days) keeps up while the app is used. Quietly does nothing if they have no access. */
+export async function renewAccess() {
+  if (!keys || !thisNode?.private || accessFor === keys.pubkey) return;
+  accessFor = keys.pubkey;
+  await signIn(sign, keys.pubkey).catch((e) => console.warn("Couldn't renew access:", e));
 }
 
 /** The service worker's cache: the app and the API's latest answers, for when the node can't be reached. */
@@ -473,6 +413,8 @@ export type Post = {
   nodeUrl?: string;
   /** For an owner record: who. */
   owner?: Party;
+  /** For an access record: who may get into this node, if it's private. */
+  access?: Party;
   /** For a doc: its title, who may edit it besides its author (`by`), what it holds, and whether it's encrypted. */
   doc?: { title: string; editors: Party[]; format: string; schema: string; encrypted: boolean };
   /** For a delegation: the key it lets sign for its author, what it's called, and what it covers. */
@@ -512,6 +454,7 @@ export function viewPost(rec: Rec, chain?: { root: Uint8Array; by?: Uint8Array; 
     claim: rec.claim && { claimedBy: rec.claim.user ? toUser(rec.claim.user) : null },
     nodeUrl: rec.nodeUrl,
     owner: rec.owner && toParty(rec.owner),
+    access: rec.access && toParty(rec.access),
     doc: rec.doc && {
       title: rec.doc.title,
       editors: rec.doc.editors.map(toParty),
@@ -592,6 +535,7 @@ async function putRec(draft: NewRecord) {
 
 export const OWNER_PATH = "/node/owner";
 export const GRANT_PATH = "/node/grant";
+export const ACCESS_PATH = "/node/access";
 export const PEER_PATH = "/node/peer";
 export const CLAIM_PATH = "/node/claim";
 
@@ -646,8 +590,15 @@ export async function addOwner(c: Choice): Promise<Written> {
   return { hash: await putRec({ path: OWNER_PATH, version: nextVersion(), type: "owner", data: who }), link };
 }
 
+/** Lets `c` into this node, if it's private. Owners only. */
+export async function addAccess(c: Choice): Promise<Written> {
+  if (!keys) throw new Error("Sign in first.");
+  const { who, link } = await choose(c);
+  return { hash: await putRec({ path: ACCESS_PATH, version: nextVersion(), type: "access", data: who }), link };
+}
+
 /** What a claim link's token is for: its claim (null if this node has none with that token), and the
- * owner, grant and doc records that name it. */
+ * owner, access, grant and doc records that name it. */
 export async function findClaim(token: string) {
   const t = unb58(token);
   if (!t) throw new Error("This claim link is broken: its token isn't base58.");
@@ -658,6 +609,7 @@ export async function findClaim(token: string) {
   return {
     claim,
     owner: records.some((p) => p.verified && names(p.owner)),
+    access: records.some((p) => p.verified && names(p.access)),
     grants: records.filter((p) => p.verified && p.grant?.grantees !== "anyone" && p.grant?.grantees.some(names)).map((p) => p.grant!.path),
     docs: docs.filter((p) => p.verified && p.doc?.editors.some(names)),
   };
